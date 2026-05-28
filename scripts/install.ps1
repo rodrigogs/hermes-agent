@@ -1622,8 +1622,15 @@ Delete the contents (or this file) to use the default personality.
 
 function Install-NodeDeps {
     if (-not $HasNode) {
-        Write-Info "Skipping Node.js dependencies (Node not installed)"
-        return
+        # Cross-process driver mode (Hermes-Setup.exe runs each -Stage NAME
+        # in a fresh powershell.exe) means $script:HasNode set by Stage-Node
+        # in the previous process isn't visible here. Re-probe rather than
+        # trust the stale global — Stage-Node already ran successfully or
+        # the bootstrap would've aborted, so npm is reachable.
+        if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+            Write-Info "Skipping Node.js dependencies (Node not installed)"
+            return
+        }
     }
 
     # Resolve npm explicitly to npm.cmd, NOT npm.ps1.  Node.js on Windows
@@ -1891,27 +1898,29 @@ function Install-Desktop {
     # the SAME `npm install` Install-NodeDeps does for browser tools,
     # but at the root rather than the browser-tools workspace, so all
     # apps/* workspaces resolve.
-    Write-Info "Installing desktop workspace dependencies (this includes Electron ~150MB)..."
-    $installLog = "$env:TEMP\hermes-npm-desktop-install-$(Get-Random).log"
+    Write-Info "Installing desktop workspace dependencies (this includes Electron ~150MB, takes 1-3min)..."
     Push-Location $InstallDir
     $prevEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        & $npmExe install --silent 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $installLog
+        # Drop --silent so npm emits its full progress + error trail.
+        # When this fails on a non-dev box (e.g. native-module build
+        # without VS Build Tools, ETARGET on a transitive, etc.), the
+        # actual reason needs to reach the Tauri installer's log; with
+        # --silent it was completely suppressed and the user just saw
+        # "exit 1" with no actionable detail.
+        #
+        # The streaming sink in bootstrap.rs's run_install_script
+        # captures every stdout/stderr line as it's emitted, so we don't
+        # need a side TEMP log file — the installer's bootstrap log
+        # IS the artifact a support engineer reads.
+        & $npmExe install 2>&1 | ForEach-Object { "$_" }
         $code = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
         if ($code -ne 0) {
-            $errText = Get-Content $installLog -Raw -ErrorAction SilentlyContinue
-            if ($errText) {
-                $snippet = if ($errText.Length -gt 1200) { $errText.Substring(0, 1200) + "..." } else { $errText }
-                Write-Info "  npm install output:"
-                foreach ($line in $snippet -split "`n") { Write-Host "    $line" -ForegroundColor DarkGray }
-                Write-Info "  Full log: $installLog"
-            }
-            throw "desktop workspace npm install failed (exit $code)"
+            throw "desktop workspace npm install failed (exit $code) -- see lines above for cause"
         }
         Write-Success "Desktop workspace dependencies installed"
-        Remove-Item -Force $installLog -ErrorAction SilentlyContinue
     } catch {
         if ($prevEAP) { $ErrorActionPreference = $prevEAP }
         Pop-Location
