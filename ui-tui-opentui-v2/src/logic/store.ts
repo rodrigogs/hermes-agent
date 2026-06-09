@@ -310,6 +310,18 @@ export function createSessionStore() {
   // queue here and replay after the snapshot is reconciled (opencode sync-v2).
   let buffering: GatewayEvent[] | null = null
 
+  // Anti-flood for `gateway.stderr`: a crashing child can emit a torrent of
+  // stderr lines, so we do NOT push each to the transcript. Instead we keep a
+  // small ring of the most-recent lines and only surface a TAIL of it when a
+  // failure event (start_timeout / exited) actually needs the diagnostic
+  // context — so a healthy-but-chatty gateway never spams the chat.
+  const STDERR_RING_LIMIT = 20
+  const STDERR_TAIL = 5
+  const stderrRing: string[] = []
+  function stderrTail(): string {
+    return stderrRing.slice(-STDERR_TAIL).join('\n')
+  }
+
   function setSkin(skin: GatewaySkinDecoded | undefined): void {
     setState('theme', themeFromSkin(skin))
   }
@@ -665,6 +677,47 @@ export function createSessionStore() {
             if (trace.length > SUBAGENT_TRACE_LIMIT) trace.splice(0, trace.length - SUBAGENT_TRACE_LIMIT)
           })
         )
+        break
+      }
+      // ── gateway lifecycle / transport errors (auto-heal foundations) ──
+      // The child exited mid-turn. THE key bug fix: clear the frozen `running`
+      // spinner (no message.complete will ever arrive for the lost reply), tell
+      // the user their in-flight reply was lost, and show a recovering status.
+      case 'gateway.exited': {
+        setState('info', prev => ({ ...prev, running: false }))
+        setState('status', 'gateway exited — recovering…')
+        const reason = event.payload?.reason
+        const base = 'gateway exited — recovering your session (any in-flight reply was lost)'
+        pushSystem(reason ? `${base}: ${reason}` : base)
+        break
+      }
+      // A respawn+resume attempt is in flight — reflect the attempt in the status.
+      case 'gateway.recovering': {
+        const attempt = event.payload?.attempt
+        setState('status', attempt ? `gateway recovering (attempt ${attempt})…` : 'gateway recovering…')
+        break
+      }
+      // Collect stderr into a bounded ring (NOT the transcript) — see stderrRing.
+      case 'gateway.stderr': {
+        stderrRing.push(event.payload.line)
+        if (stderrRing.length > STDERR_RING_LIMIT) stderrRing.splice(0, stderrRing.length - STDERR_RING_LIMIT)
+        break
+      }
+      // The gateway never reached `gateway.ready` — surface the failure with any
+      // stderr tail (payload is a loose Record; read defensively).
+      case 'gateway.start_timeout': {
+        const detail = readStr(event.payload, 'stderr') ?? readStr(event.payload, 'message') ?? stderrTail()
+        pushSystem(detail ? `gateway failed to start:\n${detail}` : 'gateway failed to start')
+        break
+      }
+      case 'gateway.protocol_error': {
+        const preview = event.payload?.preview
+        pushSystem(preview ? `gateway protocol error: ${preview}` : 'gateway protocol error')
+        break
+      }
+      case 'error': {
+        const message = event.payload?.message
+        pushSystem(message ? `error: ${message}` : 'error')
         break
       }
       // Other event types (chrome) are reduced in later phases; unhandled members

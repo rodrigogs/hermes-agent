@@ -331,6 +331,56 @@ describe('session store — session chrome / status bar (item 14)', () => {
   })
 })
 
+describe('session store — gateway lifecycle / transport errors (auto-heal foundations)', () => {
+  test('gateway.exited clears the frozen running spinner AND pushes a system notice', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'message.start' })
+    expect(store.state.info.running).toBe(true) // a turn is in flight
+    store.apply({ type: 'gateway.exited' })
+    // THE key bug fix: the spinner is cleared even though no message.complete arrived.
+    expect(store.state.info.running).toBe(false)
+    expect(store.state.status).toBe('gateway exited — recovering…')
+    const sys = store.state.messages.filter(m => m.role === 'system')
+    expect(sys).toHaveLength(1)
+    expect(sys[0]!.text).toContain('in-flight reply was lost')
+  })
+
+  test('gateway.exited enriches the notice with payload.reason when present', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.exited', payload: { reason: 'SIGKILL', code: 137 } })
+    const sys = store.state.messages.filter(m => m.role === 'system')
+    expect(sys[0]!.text).toContain('SIGKILL')
+  })
+
+  test('gateway.recovering reflects the attempt number in the status', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.recovering', payload: { attempt: 2 } })
+    expect(store.state.status).toBe('gateway recovering (attempt 2)…')
+  })
+
+  test('gateway.stderr is collected (NOT pushed to transcript), surfaced on start_timeout', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.stderr', payload: { line: 'ModuleNotFoundError: no module foo' } })
+    store.apply({ type: 'gateway.stderr', payload: { line: 'traceback line 2' } })
+    // chatty stderr never floods the transcript on its own
+    expect(store.state.messages).toHaveLength(0)
+    // …but the tail is surfaced when the gateway fails to start
+    store.apply({ type: 'gateway.start_timeout', payload: {} })
+    const sys = store.state.messages.filter(m => m.role === 'system')
+    expect(sys).toHaveLength(1)
+    expect(sys[0]!.text).toContain('gateway failed to start')
+    expect(sys[0]!.text).toContain('ModuleNotFoundError')
+  })
+
+  test('gateway.protocol_error and error are surfaced to the transcript', () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.protocol_error', payload: { preview: '<garbled>' } })
+    store.apply({ type: 'error', payload: { message: 'boom' } })
+    const sys = store.state.messages.filter(m => m.role === 'system')
+    expect(sys.map(m => m.text)).toEqual(['gateway protocol error: <garbled>', 'error: boom'])
+  })
+})
+
 describe('session store — resume hydrate (Phase 4b)', () => {
   test('beginBuffer + commitSnapshot replaces history then replays events buffered across the resume', () => {
     const store = createSessionStore()

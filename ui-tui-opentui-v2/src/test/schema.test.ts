@@ -37,6 +37,36 @@ describe('GatewayEvent schema decode (Phase 1)', () => {
     ).toBe(true)
   })
 
+  test('decodes gateway.exited with and without payload fields', () => {
+    const full = decode({ type: 'gateway.exited', payload: { reason: 'SIGKILL', code: 137, signal: 'SIGKILL' } })
+    expect(Option.isSome(full)).toBe(true)
+    if (Option.isSome(full) && full.value.type === 'gateway.exited') {
+      expect(full.value.payload?.reason).toBe('SIGKILL')
+      expect(full.value.payload?.code).toBe(137)
+      expect(full.value.payload?.signal).toBe('SIGKILL')
+    }
+    // payload is optional in full
+    const bare = decode({ type: 'gateway.exited' })
+    expect(Option.isSome(bare)).toBe(true)
+    if (Option.isSome(bare) && bare.value.type === 'gateway.exited') {
+      expect(bare.value.payload).toBeUndefined()
+    }
+  })
+
+  test('decodes gateway.recovering with and without payload fields', () => {
+    const full = decode({ type: 'gateway.recovering', payload: { attempt: 2, delay_ms: 2000 } })
+    expect(Option.isSome(full)).toBe(true)
+    if (Option.isSome(full) && full.value.type === 'gateway.recovering') {
+      expect(full.value.payload?.attempt).toBe(2)
+      expect(full.value.payload?.delay_ms).toBe(2000)
+    }
+    const bare = decode({ type: 'gateway.recovering' })
+    expect(Option.isSome(bare)).toBe(true)
+    if (Option.isSome(bare) && bare.value.type === 'gateway.recovering') {
+      expect(bare.value.payload).toBeUndefined()
+    }
+  })
+
   test('SKIPS an unrecognized event type (Option.none, no throw)', () => {
     expect(Option.isNone(decode({ type: 'totally.unknown.event', foo: 1 }))).toBe(true)
   })

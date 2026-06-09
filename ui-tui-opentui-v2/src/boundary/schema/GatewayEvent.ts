@@ -195,6 +195,19 @@ const GatewayProtocolError = Schema.Struct({
   session_id: opt(Str),
   payload: opt(Schema.Struct({ preview: opt(Str) }))
 })
+// gateway lifecycle recovery (auto-heal): the child exited (crash/kill) and the
+// transport is respawning+resuming the session. Surfaced so the frozen spinner
+// clears and the user sees the in-flight reply was lost (see store cases).
+const GatewayExited = Schema.Struct({
+  type: Schema.Literal('gateway.exited'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ reason: opt(Str), code: opt(Schema.Number), signal: opt(Str) }))
+})
+const GatewayRecovering = Schema.Struct({
+  type: Schema.Literal('gateway.recovering'),
+  session_id: opt(Str),
+  payload: opt(Schema.Struct({ attempt: opt(Schema.Number), delay_ms: opt(Schema.Number) }))
+})
 
 // ── The union ─────────────────────────────────────────────────────────
 export const GatewayEventSchema = Schema.Union([
@@ -232,7 +245,9 @@ export const GatewayEventSchema = Schema.Union([
   ErrorEvent,
   GatewayStderr,
   GatewayStartTimeout,
-  GatewayProtocolError
+  GatewayProtocolError,
+  GatewayExited,
+  GatewayRecovering
 ]).pipe(Schema.toTaggedUnion('type'))
 
 /** The decoded, typed event. Inferred from the schema — never hand-declared. */
