@@ -140,8 +140,9 @@ async function cellMem(opts) {
   const reps = opts.reps ?? 3
   const fx = await ensureFixture(msgs)
   const rand = rng(opts.seed ?? 20260611)
+  const configs = opts.configs ?? Object.keys(CONFIGS)
   for (let rep = 0; rep < reps; rep++) {
-    for (const config of shuffled(Object.keys(CONFIGS), rand)) {
+    for (const config of shuffled(configs, rand)) {
       await doRun(`mem${msgs}`, config, rep, {
         mode: 'mem',
         fixturePath: fx.path,
@@ -329,7 +330,8 @@ const opts = {
   reps: opt('reps') ? Number(opt('reps')) : undefined,
   msgs: opt('msgs') ? Number(opt('msgs')) : undefined,
   cap: opt('cap'),
-  seed: opt('seed') ? Number(opt('seed')) : undefined
+  seed: opt('seed') ? Number(opt('seed')) : undefined,
+  configs: opt('configs') ? opt('configs').split(',').filter(c => CONFIGS[c]) : undefined
 }
 const cell = opt('cell')
 mkdirSync(RESULTS_DIR, { recursive: true })

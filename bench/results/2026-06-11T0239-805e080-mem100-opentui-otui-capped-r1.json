@@ -1,0 +1,203 @@
+{
+ "meta": {
+  "cell": "mem100",
+  "ui": "opentui",
+  "config": "otui-capped",
+  "mode": "mem",
+  "rep": 1,
+  "run_id": "mq8w2gof-k2hb",
+  "utc": "2026-06-11T02:39:02.895Z",
+  "sha": "805e08081",
+  "node": "/home/daimon/.local/share/fnm/node-versions/v26.3.0/installation/bin/node",
+  "node_version": "v26.3.0",
+  "pty": {
+   "cols": 120,
+   "rows": 40,
+   "term": "xterm-256color"
+  },
+  "heap_mb": 8192,
+  "memory_max": "2G",
+  "container_cap": false,
+  "container_memory": null,
+  "opentui_cap": 3000,
+  "fixture": {
+   "path": "/home/daimon/github/worktrees/hermes-agent/lively-thrush/hermes-agent/bench/.cache/fixture-100.ndjson",
+   "msgs": 100,
+   "sha256": "0c583ebe8dd97aecb72cc947ae3fe83dc85539c87e8d70d17fb8994117d37a44"
+  },
+  "sample_every": 100,
+  "mode_params": {},
+  "ui_pid": 2718554,
+  "gw_pid": 2718568,
+  "cgroup": "/sys/fs/cgroup/user.slice/user-1001.slice/session-7421.scope",
+  "load_avg_at_start": [
+   0.92,
+   0.46,
+   0.27
+  ],
+  "instrumented": false
+ },
+ "samples": [
+  {
+   "kind": "periodic",
+   "t_ms": 26,
+   "msgs": null,
+   "events": null,
+   "pty_bytes": 0,
+   "pty_writes": 0,
+   "rss_kb": 28036,
+   "pss_kb": 10746,
+   "private_dirty_kb": 3848,
+   "vmhwm_kb": 28092,
+   "utime_ticks": 0,
+   "stime_ticks": 0,
+   "cg_current": 1033875456,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  },
+  {
+   "kind": "periodic",
+   "t_ms": 1042,
+   "msgs": null,
+   "events": null,
+   "pty_bytes": 28911,
+   "pty_writes": 13,
+   "rss_kb": 105076,
+   "pss_kb": 63281,
+   "private_dirty_kb": 48404,
+   "vmhwm_kb": 107620,
+   "utime_ticks": 17,
+   "stime_ticks": 3,
+   "cg_current": 1035780096,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  },
+  {
+   "kind": "boundary",
+   "t_ms": 1695,
+   "msgs": 100,
+   "events": 355,
+   "pty_bytes": 31413,
+   "pty_writes": 15,
+   "rss_kb": 109320,
+   "pss_kb": 67389,
+   "private_dirty_kb": 52460,
+   "vmhwm_kb": 109328,
+   "utime_ticks": 20,
+   "stime_ticks": 3,
+   "cg_current": 1014898688,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  },
+  {
+   "kind": "done",
+   "t_ms": 1696,
+   "msgs": 100,
+   "events": 355,
+   "pty_bytes": 31413,
+   "pty_writes": 15,
+   "rss_kb": 109336,
+   "pss_kb": 67405,
+   "private_dirty_kb": 52476,
+   "vmhwm_kb": 109336,
+   "utime_ticks": 20,
+   "stime_ticks": 3,
+   "cg_current": 1014898688,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  },
+  {
+   "kind": "periodic",
+   "t_ms": 2048,
+   "msgs": 100,
+   "events": null,
+   "pty_bytes": 35603,
+   "pty_writes": 19,
+   "rss_kb": 198096,
+   "pss_kb": 153988,
+   "private_dirty_kb": 137660,
+   "vmhwm_kb": 217796,
+   "utime_ticks": 74,
+   "stime_ticks": 8,
+   "cg_current": 1014849536,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  },
+  {
+   "kind": "final",
+   "t_ms": 2975,
+   "msgs": 100,
+   "events": 355,
+   "pty_bytes": 35675,
+   "pty_writes": 20,
+   "rss_kb": 198100,
+   "pss_kb": 153992,
+   "private_dirty_kb": 137664,
+   "vmhwm_kb": 217796,
+   "utime_ticks": 74,
+   "stime_ticks": 8,
+   "cg_current": 1018212352,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  },
+  {
+   "kind": "periodic",
+   "t_ms": 3062,
+   "msgs": 100,
+   "events": null,
+   "pty_bytes": 40010,
+   "pty_writes": 22,
+   "rss_kb": 198232,
+   "pss_kb": 154124,
+   "private_dirty_kb": 137796,
+   "vmhwm_kb": 217796,
+   "utime_ticks": 75,
+   "stime_ticks": 8,
+   "cg_current": 1019273216,
+   "cg_peak": 2533130240,
+   "cg_oom_kill": 0
+  }
+ ],
+ "events": [
+  {
+   "kind": "rpc",
+   "method": "session.create",
+   "t_ms": 176
+  },
+  {
+   "kind": "rpc",
+   "method": "startup.catalog",
+   "t_ms": 176
+  },
+  {
+   "kind": "rpc",
+   "method": "model.options",
+   "t_ms": 201
+  }
+ ],
+ "summary": {
+  "result": "completed",
+  "cap_hit": false,
+  "cap_hit_basis": null,
+  "at_messages": null,
+  "exit": {
+   "exitCode": 0,
+   "signal": 0,
+   "t": 3181
+  },
+  "stream_done": true,
+  "msgs_streamed": 100,
+  "events_streamed": 355,
+  "pty_bytes_total": 40130,
+  "pty_data_callbacks": 24,
+  "first_byte_ms": 143,
+  "session_create_ms": 176,
+  "stream_start_ms": 1694,
+  "vmhwm_kb": 217796,
+  "cg_peak": 2533130240,
+  "drain_max_loop_lag_ms": 2,
+  "drain_lag_violations": 0,
+  "drain_ok": true,
+  "digest": null
+ }
+}

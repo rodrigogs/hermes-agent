@@ -1,0 +1,199 @@
+{
+  "sources": {
+    "cli": 19,
+    "cron": 5159,
+    "telegram": 281,
+    "tui": 425,
+    "webhook": 67
+  },
+  "all": {
+    "n": 5951,
+    "min": 0,
+    "max": 1980,
+    "mean": 20.5,
+    "p50": 12,
+    "p75": 20,
+    "p90": 30,
+    "p95": 42,
+    "p99": 188,
+    "histogram": [
+      {
+        "lo": 0,
+        "hi": 10,
+        "count": 1918
+      },
+      {
+        "lo": 10,
+        "hi": 25,
+        "count": 3050
+      },
+      {
+        "lo": 25,
+        "hi": 50,
+        "count": 774
+      },
+      {
+        "lo": 50,
+        "hi": 100,
+        "count": 106
+      },
+      {
+        "lo": 100,
+        "hi": 200,
+        "count": 48
+      },
+      {
+        "lo": 200,
+        "hi": 300,
+        "count": 24
+      },
+      {
+        "lo": 300,
+        "hi": 500,
+        "count": 19
+      },
+      {
+        "lo": 500,
+        "hi": 1000,
+        "count": 6
+      },
+      {
+        "lo": 1000,
+        "hi": 3000,
+        "count": 6
+      },
+      {
+        "lo": 3000,
+        "hi": null,
+        "count": 0
+      }
+    ]
+  },
+  "tui_cli": {
+    "n": 444,
+    "min": 0,
+    "max": 1980,
+    "mean": 82.7,
+    "p50": 20,
+    "p75": 53,
+    "p90": 182,
+    "p95": 340,
+    "p99": 1941,
+    "histogram": [
+      {
+        "lo": 0,
+        "hi": 10,
+        "count": 168
+      },
+      {
+        "lo": 10,
+        "hi": 25,
+        "count": 78
+      },
+      {
+        "lo": 25,
+        "hi": 50,
+        "count": 78
+      },
+      {
+        "lo": 50,
+        "hi": 100,
+        "count": 47
+      },
+      {
+        "lo": 100,
+        "hi": 200,
+        "count": 30
+      },
+      {
+        "lo": 200,
+        "hi": 300,
+        "count": 14
+      },
+      {
+        "lo": 300,
+        "hi": 500,
+        "count": 18
+      },
+      {
+        "lo": 500,
+        "hi": 1000,
+        "count": 5
+      },
+      {
+        "lo": 1000,
+        "hi": 3000,
+        "count": 6
+      },
+      {
+        "lo": 3000,
+        "hi": null,
+        "count": 0
+      }
+    ]
+  },
+  "tui_cli_top": [
+    {
+      "msgs": 1980,
+      "tools": 12,
+      "source": "tui",
+      "title": "context-answerer"
+    },
+    {
+      "msgs": 1947,
+      "tools": 0,
+      "source": "tui",
+      "title": "context-answerer-2"
+    },
+    {
+      "msgs": 1946,
+      "tools": 1,
+      "source": "tui",
+      "title": "context-answerer-3"
+    },
+    {
+      "msgs": 1941,
+      "tools": 874,
+      "source": "tui",
+      "title": ""
+    },
+    {
+      "msgs": 1941,
+      "tools": 0,
+      "source": "tui",
+      "title": ""
+    },
+    {
+      "msgs": 1731,
+      "tools": 792,
+      "source": "tui",
+      "title": "daimon stuff"
+    },
+    {
+      "msgs": 762,
+      "tools": 327,
+      "source": "tui",
+      "title": "Restructuring Hermes Permission Gateway Into RFC Spec"
+    },
+    {
+      "msgs": 663,
+      "tools": 310,
+      "source": "tui",
+      "title": "tui-table"
+    },
+    {
+      "msgs": 593,
+      "tools": 271,
+      "source": "tui",
+      "title": "Claude Code Double Ctrl-C Skips Resumable Session"
+    },
+    {
+      "msgs": 574,
+      "tools": 259,
+      "source": "tui",
+      "title": "Hermes Discord Gateway Missing Dependencies"
+    }
+  ],
+  "generated_at": "2026-06-11T02:40:45.248Z",
+  "db": "/home/daimon/.hermes/state.db"
+}
