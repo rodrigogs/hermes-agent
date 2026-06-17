@@ -203,57 +203,7 @@ jobs:
           Write-Host "ffmpeg recording started (pid $($ffmpeg.Id))"
 
           try {
-            # Run the AHK helper first so it can detect the window.
-            $ahk = @'
-          #Requires AutoHotkey v2.0
-          #SingleInstance Force
-
-          ;
-          ; enable click animation
-          ;
-
-          DllCall("SystemParametersInfo", UInt, 0x101D, UInt, 0, UInt, 1, UInt, 0) ;SPI_SETMOUSESONAR ON
-
-          OnExit(ExitSub)
-          ExitSub:
-            DllCall("SystemParametersInfo", UInt, 0x101D, UInt, 0, UInt, 0, UInt, 0) ;SPI_SETMOUSESONAR OFF
-            ExitApp
-
-
-          ~LButton::
-          Send {Ctrl}
-          return
-
-          ~LButton UP::
-          Send {Ctrl}
-          return
-          ;;;;;;;;;;;
-
-
-          ; Wait for the Hermes installer window to appear.
-          winTitle := "Hermes"
-          if not WinWait(winTitle,, 30)
-          {
-              FileAppend("ERROR: Hermes installer window did not appear within 30s`n", "ahk.log")
-              ExitApp(1)
-          }
-
-          Sleep(1000)
-
-          WinGetPos(&x, &y, &w, &h, winTitle)
-          FileAppend(Format("Window found at x={1} y={2} w={3} h={4}`n", x, y, w, h), "ahk.log")
-
-          clickX := x + (w / 2)
-          clickY := y + 418
-          Click(clickX, clickY)
-
-          ; Take a screenshot and exit.  Maintainer reviews this and sends coords.
-          Sleep(1000)
-          Send("{PrintScreen}")
-          FileAppend("Captured screenshot, exiting`n", "ahk.log")
-          ExitApp(0)
-          '@
-          $ahk | Out-File -Encoding utf8 "capture-button.ahk"
+          $ahk | Out-File -Encoding utf8 ".\source\e2e\windows\install-hermes-desktop.ahk"
 
           $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
             -ArgumentList '"capture-button.ahk"' -PassThru -NoNewWindow `
