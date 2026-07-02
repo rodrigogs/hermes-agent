@@ -64,7 +64,7 @@ def _as_list(raw: Any) -> List[str]:
     return [str(raw).strip()] if str(raw).strip() else []
 
 
-def _coerce_spotify_uri(value: str, expected_type: Optional[str] = None) -> str:
+def _coerce_spotify_uri(value: Optional[str], expected_type: Optional[str] = None) -> str:
     """Normalize a Spotify URI/URL/ID into a canonical ``spotify:<type>:<id>`` URI.
 
     Delegates to ``normalize_spotify_uri`` from the Spotify client so behavior

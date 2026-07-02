@@ -320,3 +320,95 @@ def test_client_wraps_invalid_grant_as_spotify_auth_required_error(
     )
     with pytest.raises(spotify_mod.SpotifyAuthRequiredError, match="expired or was revoked"):
         spotify_mod.SpotifyClient()
+
+
+# ── Regression tests for _coerce_spotify_uri (fixed in bee0fc00d) ────────────
+# Original bug: bare IDs were rejected when expected_type=None, causing
+# spotify_queue "add" and playback "uris" to crash on search-result IDs.
+
+
+def test_coerce_spotify_uri_bare_id_passthrough_when_no_expected_type() -> None:
+    """Bare track ID from search results must pass through unchanged."""
+    result = spotify_tool._coerce_spotify_uri("7ouMYWpwJ422jRcDASZB7P", None)
+    assert result == "7ouMYWpwJ422jRcDASZB7P"
+
+
+def test_coerce_spotify_uri_bare_id_prefixes_expected_type() -> None:
+    """Bare ID with expected_type must be wrapped into a canonical URI."""
+    result = spotify_tool._coerce_spotify_uri("7ouMYWpwJ422jRcDASZB7P", "track")
+    assert result == "spotify:track:7ouMYWpwJ422jRcDASZB7P"
+
+
+def test_coerce_spotify_uri_canonicalizes_open_spotify_url() -> None:
+    """open.spotify.com URL must be converted to spotify: URI."""
+    url = "https://open.spotify.com/track/7ouMYWpwJ422jRcDASZB7P?si=abc"
+    result = spotify_tool._coerce_spotify_uri(url, "track")
+    assert result == "spotify:track:7ouMYWpwJ422jRcDASZB7P"
+
+
+def test_coerce_spotify_uri_returns_native_uri_unchanged() -> None:
+    """spotify: URIs with a matching expected_type pass through unchanged."""
+    uri = "spotify:album:0sNOF9WDwhWunNAHPD3Baj"
+    result = spotify_tool._coerce_spotify_uri(uri, "album")
+    assert result == uri
+
+
+def test_coerce_spotify_uri_rejects_type_mismatch() -> None:
+    with pytest.raises(spotify_mod.SpotifyError, match="Expected a Spotify track"):
+        spotify_tool._coerce_spotify_uri("spotify:album:abc", "track")
+
+
+def test_coerce_spotify_uri_empty_string_raises() -> None:
+    with pytest.raises(spotify_mod.SpotifyError, match="Spotify URI/url/id is required"):
+        spotify_tool._coerce_spotify_uri("", None)
+
+
+def test_coerce_spotify_uri_none_raises() -> None:
+    with pytest.raises(spotify_mod.SpotifyError, match="Spotify URI/url/id is required"):
+        spotify_tool._coerce_spotify_uri(None, None)
+
+
+def test_coerce_spotify_uri_accepts_keyword_arg_expected_type() -> None:
+    """Regression guard: expected_type must be accepted as a keyword argument."""
+    result = spotify_tool._coerce_spotify_uri("spotify:track:abc", expected_type="track")
+    assert result == "spotify:track:abc"
+
+
+# ── Regression test for spotify_queue "add" with bare ID ─────────────────────
+
+
+def test_handle_spotify_queue_add_rejects_when_no_device_and_no_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue add must fail fast with actionable error when no device is active."""
+    monkeypatch.setattr(spotify_tool, "_spotify_client", lambda: _StubSpotifyClient({}))
+    response = spotify_tool._handle_spotify_queue(
+        {"action": "add", "uri": "track-abc"}
+    )
+    payload = json.loads(response)
+    assert payload["error"] is not None
+    assert "No active Spotify playback device" in payload["error"]
+
+
+def test_handle_spotify_queue_add_with_bare_id_and_active_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queue add must pass bare IDs through unchanged when a device_id is provided."""
+    seen_uris: list[str] = []
+
+    class _QueueStub:
+        def add_to_queue(self, *, uri, device_id=None):
+            seen_uris.append(uri)
+            return {"snapshot_id": "snap-1"}
+
+    monkeypatch.setattr(spotify_tool, "_spotify_client", lambda: _QueueStub())
+    response = json.loads(
+        spotify_tool._handle_spotify_queue(
+            {"action": "add", "uri": "search-result-bare-id", "device_id": "dev-1"}
+        )
+    )
+    assert response["success"] is True
+    assert response["action"] == "add"
+    # expected_type=None is intentional for queue add; bare IDs pass through unchanged.
+    assert response["uri"] == "search-result-bare-id"
+    assert seen_uris == ["search-result-bare-id"]
