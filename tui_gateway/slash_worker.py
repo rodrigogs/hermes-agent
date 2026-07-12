@@ -53,14 +53,35 @@ _in_flight = threading.Event()  # set while a command is executing
 
 def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
     """True once our spawning gateway is gone. Compare to the ORIGINAL ppid
-    (never ==1: Linux reparents to a subreaper) and guard PID reuse via
-    create_time."""
+    (never ==1: Linux reparents to a subreaper) and guard PID reuse via the
+    /proc/<pid>/stat starttime (stable) instead of psutil create_time()
+    (which drifts ~1-2s on WSL2 via the jittery /proc/uptime boot_time)."""
     if getppid() != original_ppid:
         return True
+    # Fast path: read /proc/<ppid>/stat directly (Linux). Stable across reads.
     try:
-        if not psutil.pid_exists(original_ppid):
+        with open(f"/proc/{original_ppid}/stat") as f:
+            stat_fields = f.read().split()
+        if len(stat_fields) >= 22:
+            # Field 22 (1-indexed) = starttime in clock ticks since boot.
+            return int(stat_fields[21]) != parent_create_time
+        if psutil is not None:
+            return not psutil.pid_exists(original_ppid)
+        return False
+    except FileNotFoundError:
+        if psutil is None:
+            return False
+        try:
+            return not psutil.pid_exists(original_ppid)
+        except psutil.Error:
             return True
-        return psutil.Process(original_ppid).create_time() != parent_create_time
+    except (ProcessLookupError, OSError, ValueError):
+        if psutil is None:
+            return False
+        try:
+            return not psutil.pid_exists(original_ppid)
+        except psutil.Error:
+            return True
     except psutil.Error:
         return True
 
@@ -145,10 +166,19 @@ def main():
     # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
     # an orphan risk if the gateway dies mid-spawn.
     orig_ppid = os.getppid()
+    # Read raw starttime (clock ticks) from /proc/stat — stable, unlike
+    # psutil.create_time() which drifts on WSL2 (see _is_orphaned docstring).
+    parent_create_time = 0.0
     try:
-        parent_create_time = psutil.Process(orig_ppid).create_time()
-    except psutil.Error:
-        parent_create_time = 0.0
+        with open(f"/proc/{orig_ppid}/stat") as f:
+            stat_fields = f.read().split()
+        if len(stat_fields) >= 22:
+            parent_create_time = float(stat_fields[21])
+    except (OSError, ValueError):
+        try:
+            parent_create_time = psutil.Process(orig_ppid).create_time()
+        except psutil.Error:
+            parent_create_time = 0.0
     _start_parent_death_watchdog(orig_ppid, parent_create_time)
     _prepare_slash_worker_runtime()
 
