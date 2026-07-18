@@ -50,4 +50,14 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default="all",
         help="Which store to reset: 'all' (default), 'memory', or 'user'",
     )
+    _reindex_parser = memory_sub.add_parser(
+        "reindex",
+        help="Recompute HRR vectors for all stored facts (holographic provider)",
+    )
+    _reindex_parser.add_argument(
+        "--dim",
+        type=int,
+        default=None,
+        help="Override HRR dimensionality for the rebuild (default: configured hrr_dim)",
+    )
     memory_parser.set_defaults(func=cmd_memory)

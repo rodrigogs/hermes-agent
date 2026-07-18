@@ -83,7 +83,12 @@ class FactRetriever:
             # HRR similarity
             if self.hrr_weight > 0 and fact.get("hrr_vector"):
                 fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
-                query_vec = hrr.encode_text(query, self.hrr_dim)
+                # Bind the query to ROLE_CONTENT so it matches how encode_fact
+                # stores content (content is bound to role_content, not bare).
+                # Comparing a bare query vector against role-bound content is
+                # pure noise (~0.5 for every fact) — see audit 2026-07.
+                role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
+                query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), role_content)
                 hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
             else:
                 hrr_sim = 0.5  # neutral
@@ -177,13 +182,17 @@ class FactRetriever:
         for row in rows:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
-            # Unbind probe key from fact to see if entity is structurally present
-            residual = hrr.unbind(fact_vec, probe_key)
-            # Compare residual against content signal
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-            content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
-            sim = hrr.similarity(residual, content_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            # Direct presence test: is (entity ⊛ ROLE_ENTITY) a term in the
+            # bundled fact vector? The old unbind→compare-to-content identity
+            # was mathematically false (content and entities live in separate
+            # bundled slots), scoring ~random. Measured separation true-vs-
+            # distractor +0.54 with this form vs -0.03 before (audit 2026-07).
+            sim = hrr.similarity(fact_vec, probe_key)
+            # Use max(0, sim), NOT (sim+1)/2: the latter maps a non-match
+            # (sim≈0) to a 0.5 baseline, which — once multiplied by trust —
+            # lets an irrelevant high-trust fact outrank a relevant medium-trust
+            # one. Clamping at 0 keeps the HRR presence signal dominant.
+            fact["score"] = max(0.0, sim) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -324,12 +333,18 @@ class FactRetriever:
 
             entity_scores = []
             for probe_key in entity_residuals:
-                residual = hrr.unbind(fact_vec, probe_key)
-                sim = hrr.similarity(residual, role_content)
+                # Direct presence test per entity (same fix as probe()): score
+                # how strongly (entity ⊛ ROLE_ENTITY) is present in the bundled
+                # fact vector. The prior unbind→compare-to-role_content form
+                # ranked the true multi-entity fact worse than random.
+                sim = hrr.similarity(fact_vec, probe_key)
                 entity_scores.append(sim)
 
+            # AND semantics: a fact scores high only if ALL entities are present.
             min_sim = min(entity_scores)
-            fact["score"] = (min_sim + 1.0) / 2.0 * fact["trust_score"]
+            # max(0, .) not (x+1)/2 — avoid the 0.5 non-match baseline that
+            # lets trust dominate over actual multi-entity presence.
+            fact["score"] = max(0.0, min_sim) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -472,7 +487,9 @@ class FactRetriever:
             fact = dict(row)
             fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
             sim = hrr.similarity(target_vec, fact_vec)
-            fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
+            # max(0, sim) not (sim+1)/2 — see probe(): the 0.5 non-match
+            # baseline lets trust outrank relevance.
+            fact["score"] = max(0.0, sim) * fact["trust_score"]
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)

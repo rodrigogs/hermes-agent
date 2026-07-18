@@ -90,6 +90,60 @@ _RE_AKA          = re.compile(
     re.IGNORECASE,
 )
 
+# Common sentence-initial / auxiliary words that _RE_CAPITALIZED wrongly
+# promotes to entities when a sentence starts with them (e.g. "Running
+# Windows ...", "Admin Windows ..."). Also generic status/verb words that
+# are never real entities on their own.
+_ENTITY_STOPWORDS = frozenset({
+    "running", "admin", "created", "wait", "waiting", "note", "status",
+    "the", "this", "that", "when", "where", "while", "after", "before",
+    "then", "now", "also", "using", "used", "set", "get", "run", "ok",
+    "pass", "fail", "done", "todo", "fixme", "warning", "error", "info",
+    "started", "stopped", "enabled", "disabled", "blocked", "suspicious",
+    "protocol", "gateway", "gate", "unknown", "windows", "linux", "mac",
+})
+# Shell / command noise: if a quoted term looks like a command line or
+# contains shell metacharacters, it's not an entity. NOTE: does NOT reject
+# a plain '.' — identifiers like "glm-5.2" and "Z.AI" are valid entities.
+# Rejects real shell noise: pipes, redirects, subshells, flags (--foo),
+# absolute paths (/usr/bin/x), env assignment.
+_RE_SHELL_NOISE = re.compile(r'[|&;$<>(){}\[\]\\]|(?:^|\s)--?\w|/\w+/|\s=\s')
+
+
+def _is_valid_entity(name: str) -> bool:
+    """Reject junk entity candidates (sentence fragments, commands, noise).
+
+    Keeps real multi-word proper nouns ("Parrot Mambo", "Gaming Center") and
+    identifiers ("glm-5.2", "obdive") while dropping the garbage the old
+    unfiltered regexes produced (46% of entities were noise pre-2026-07).
+    """
+    n = name.strip()
+    if not (2 <= len(n) <= 40):
+        return False
+    low = n.lower()
+    # a comma anywhere -> sentence fragment, not an entity ("Wait, thats ...")
+    if "," in n:
+        return False
+    # strip surrounding punctuation from each word before stopword checks
+    words = [re.sub(r"^[\W_]+|[\W_]+$", "", w) for w in low.split()]
+    words = [w for w in words if w]
+    # first word is a stopword/verb -> sentence fragment, not an entity
+    if words and words[0] in _ENTITY_STOPWORDS:
+        return False
+    # every word is a stopword (e.g. "Running Windows") -> junk
+    if words and all(w in _ENTITY_STOPWORDS for w in words):
+        return False
+    # punctuation-only or ellipsis
+    if re.fullmatch(r"[\W_]+", n) or n.endswith("..."):
+        return False
+    # shell/command noise (quoted command lines, flags, paths)
+    if _RE_SHELL_NOISE.search(n):
+        return False
+    # must contain at least one letter
+    if not re.search(r"[A-Za-z]", n):
+        return False
+    return True
+
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
@@ -460,7 +514,9 @@ class MemoryStore:
 
         def _add(name: str) -> None:
             stripped = name.strip()
-            if stripped and stripped.lower() not in seen:
+            if not _is_valid_entity(stripped):
+                return
+            if stripped.lower() not in seen:
                 seen.add(stripped.lower())
                 candidates.append(stripped)
 
@@ -484,20 +540,27 @@ class MemoryStore:
 
         Returns the entity_id.
         """
-        # Exact name match
+        # Exact name match (case-insensitive). Use = COLLATE NOCASE, NOT LIKE:
+        # LIKE treats '_' and '%' in the incoming name as wildcards, which
+        # silently false-merges distinct entities (e.g. 'anthropic_messages'
+        # would match 'anthropicXmessages'). COLLATE NOCASE keeps the
+        # case-insensitivity without the wildcard footgun.
         row = self._conn.execute(
-            "SELECT entity_id FROM entities WHERE name LIKE ?", (name,)
+            "SELECT entity_id FROM entities WHERE name = ? COLLATE NOCASE", (name,)
         ).fetchone()
         if row is not None:
             return int(row["entity_id"])
 
-        # Search aliases — aliases stored as comma-separated; use LIKE with % boundaries
+        # Search aliases — aliases stored as comma-separated. Escape LIKE
+        # wildcards in the incoming name so '_'/'%' can't over-match, and match
+        # case-insensitively via COLLATE NOCASE.
+        escaped = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         alias_row = self._conn.execute(
             """
             SELECT entity_id FROM entities
-            WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%'
+            WHERE ',' || aliases || ',' LIKE '%,' || ? || ',%' ESCAPE '\\' COLLATE NOCASE
             """,
-            (name,),
+            (escaped,),
         ).fetchone()
         if alias_row is not None:
             return int(alias_row["entity_id"])

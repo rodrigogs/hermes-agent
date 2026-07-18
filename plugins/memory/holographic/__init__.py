@@ -63,7 +63,23 @@ FACT_STORE_SCHEMA = {
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
-            "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
+            "category": {
+                "type": "string",
+                "enum": [
+                    "user_pref",
+                    "project",
+                    "tool",
+                    "general",
+                    "provider-config",
+                    "security",
+                ],
+                "description": (
+                    "Fact category. user_pref=user preferences/settings; "
+                    "project=project-specific facts; tool=tooling/CLI/infra; "
+                    "provider-config=LLM provider/model/endpoint config; "
+                    "security=security-sensitive facts; general=everything else."
+                ),
+            },
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
@@ -115,6 +131,8 @@ def _load_plugin_config() -> dict:
 class HolographicMemoryProvider(MemoryProvider):
     """Holographic memory with structured facts, entity resolution, and HRR retrieval."""
 
+    _numpy_warned = False  # class-level: warn once per process about missing numpy
+
     def __init__(self, config: dict | None = None):
         self._config = config or _load_plugin_config()
         self._store = None
@@ -126,7 +144,22 @@ class HolographicMemoryProvider(MemoryProvider):
         return "holographic"
 
     def is_available(self) -> bool:
-        return True  # SQLite is always available, numpy is optional
+        # SQLite (FTS5 lexical retrieval) is always available, so the provider
+        # is usable even without numpy. But numpy is REQUIRED for the HRR
+        # compositional layer (probe/related/reason/contradict + vectorized
+        # search). Warn once when it's missing so a silently-degraded install
+        # is visible instead of masquerading as fully healthy.
+        from . import holographic as _hrr
+
+        if not _hrr._HAS_NUMPY and not HolographicMemoryProvider._numpy_warned:
+            HolographicMemoryProvider._numpy_warned = True
+            logger.warning(
+                "holographic memory: numpy is NOT installed — HRR compositional "
+                "retrieval is disabled and search falls back to FTS5+Jaccard only. "
+                "Install numpy (pip install numpy) then run rebuild_all_vectors() "
+                "to backfill fact vectors."
+            )
+        return True
 
     def save_config(self, values, hermes_home):
         """Write config to config.yaml under plugins.hermes-memory-store."""
@@ -169,12 +202,18 @@ class HolographicMemoryProvider(MemoryProvider):
         default_trust = float(self._config.get("default_trust", 0.5))
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
+        # fts/jaccard weights are now config-tunable (were hardcoded). Defaults
+        # match the recommended balance: BM25 primary, jaccard as tie-breaker.
+        fts_weight = float(self._config.get("fts_weight", 0.55))
+        jaccard_weight = float(self._config.get("jaccard_weight", 0.15))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
         self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
         self._retriever = FactRetriever(
             store=self._store,
             temporal_decay_half_life=temporal_decay,
+            fts_weight=fts_weight,
+            jaccard_weight=jaccard_weight,
             hrr_weight=hrr_weight,
             hrr_dim=hrr_dim,
         )

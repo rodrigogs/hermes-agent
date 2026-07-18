@@ -13105,6 +13105,43 @@ def cmd_memory(args):
             "\n  Memory reset complete. New sessions will start with a blank slate."
         )
         print(f"  Files were in: {display_hermes_home()}/memories/\n")
+    elif sub == "reindex":
+        # Recompute HRR vectors for every stored fact (holographic provider).
+        # Needed after installing numpy on an install that stored facts without
+        # it, or after changing hrr_dim. Backfills NULL vectors + rebuilds banks.
+        import os, sys
+        repo = "/usr/local/lib/hermes-agent"
+        if repo not in sys.path:
+            sys.path.insert(0, repo)
+        holo_dir = os.path.join(repo, "plugins", "memory", "holographic")
+        if holo_dir not in sys.path:
+            sys.path.insert(0, holo_dir)
+        try:
+            from plugins.memory.holographic import holographic as _hrr
+        except Exception:
+            import holographic as _hrr  # type: ignore
+        if not _hrr._HAS_NUMPY:
+            print("\n  ✗ numpy is not installed — HRR vectors cannot be computed.")
+            print("    Install it first:  hermes ... pip install numpy\n")
+            return
+        try:
+            from plugins.memory.holographic.store import MemoryStore
+        except Exception:
+            from store import MemoryStore  # type: ignore
+        from hermes_constants import get_hermes_home
+        db_path = get_hermes_home() / "memory_store.db"
+        if not db_path.exists():
+            print(f"\n  No memory store found at {db_path}\n")
+            return
+        store = MemoryStore(db_path=str(db_path))
+        dim = getattr(args, "dim", None)
+        print(f"\n  Reindexing HRR vectors in {db_path} ...")
+        n = store.rebuild_all_vectors(dim=dim) if dim else store.rebuild_all_vectors()
+        with_hrr = store._conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE hrr_vector IS NOT NULL"
+        ).fetchone()[0]
+        banks = store._conn.execute("SELECT COUNT(*) FROM memory_banks").fetchone()[0]
+        print(f"  ✓ Rebuilt {n} fact vector(s); {with_hrr} now vectorized, {banks} memory bank(s).\n")
     else:
         from hermes_cli.memory_setup import memory_command
 
