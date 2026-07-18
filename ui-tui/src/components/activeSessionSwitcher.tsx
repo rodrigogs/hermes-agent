@@ -295,6 +295,7 @@ export function ActiveSessionSwitcher({
   const [history, setHistory] = useState<SessionListItem[]>([])
   const [err, setErr] = useState('')
   const [sel, setSel] = useState(0)
+  const selRef = useRef(0)
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState('')
   const [draftModel, setDraftModel] = useState('')
@@ -329,6 +330,15 @@ export function ActiveSessionSwitcher({
   const listLen = liveCount + histCount
   const total = listLen + 1
   const rowKind = useCallback((index: number) => sessionRowKindAt(index, liveCount), [liveCount])
+
+  const updateSelection = useCallback((value: number | ((current: number) => number)) => {
+    const next = typeof value === 'function' ? value(selRef.current) : value
+
+    selRef.current = next
+    setSel(next)
+
+    return next
+  }, [])
 
   const load = useCallback(
     // `quiet` skips the loading spinner (used by the live-status poll);
@@ -389,7 +399,7 @@ export function ActiveSessionSwitcher({
         setHistory(hist)
         // Re-anchor selection to the same row by identity (the live list can
         // grow/shrink between polls, which would otherwise drift a flat index).
-        setSel(s => {
+        updateSelection(s => {
           if (initializeSelection) {
             // Land on the current live session (shifted +1 past the pinned new
             // row); with no live sessions, start on the new row itself.
@@ -427,7 +437,7 @@ export function ActiveSessionSwitcher({
         return []
       }
     },
-    [currentSessionId, gw]
+    [currentSessionId, gw, updateSelection]
   )
 
   useEffect(() => {
@@ -457,9 +467,9 @@ export function ActiveSessionSwitcher({
   )
 
   const closeSelected = useCallback(async () => {
-    const target = items[sel - 1]
+    const target = items[selRef.current - 1]
 
-    if (!target || rowKind(sel) !== 'live' || closingId) {
+    if (!target || rowKind(selRef.current) !== 'live' || closingId) {
       return
     }
 
@@ -484,14 +494,25 @@ export function ActiveSessionSwitcher({
       } else if (fallback.action === 'new') {
         onNew()
       } else {
-        setSel(s => Math.max(0, Math.min(s, remaining.length + history.length)))
+        updateSelection(s => Math.max(0, Math.min(s, remaining.length + history.length)))
       }
     } catch (e: unknown) {
       setErr(rpcErrorMessage(e))
     } finally {
       setClosingId('')
     }
-  }, [closingId, currentSessionId, history.length, items, load, onClose, onNew, onSelect, rowKind, sel])
+  }, [
+    closingId,
+    currentSessionId,
+    history.length,
+    items,
+    load,
+    onClose,
+    onNew,
+    onSelect,
+    rowKind,
+    updateSelection
+  ])
 
   const performDelete = useCallback(
     (id: string) => {
@@ -515,7 +536,7 @@ export function ActiveSessionSwitcher({
 
           rawHistoryRef.current = rawHistoryRef.current.filter(h => h.id !== target.id)
           setHistory(prev => prev.filter(h => h.id !== target.id))
-          setSel(s => Math.max(0, Math.min(s, items.length + history.length - 1)))
+          updateSelection(s => Math.max(0, Math.min(s, items.length + history.length - 1)))
           setErr('')
           setDeleting(false)
         })
@@ -524,7 +545,7 @@ export function ActiveSessionSwitcher({
           setDeleting(false)
         })
     },
-    [deleting, gw, history, items.length]
+    [deleting, gw, history, items.length, updateSelection]
   )
 
   const handleRowClick = useCallback(
@@ -534,22 +555,22 @@ export function ActiveSessionSwitcher({
       const clamped = Math.max(0, Math.min(index, total - 1))
 
       if (kind === 'live') {
-        setSel(clamped)
+        updateSelection(clamped)
         onSelect(items[index - 1]!.id)
 
         return
       }
 
       if (kind === 'history') {
-        setSel(clamped)
+        updateSelection(clamped)
         onResume(history[index - 1 - items.length]!.id)
 
         return
       }
 
-      setSel(0)
+      updateSelection(0)
     },
-    [history, items, onResume, onSelect, rowKind, total]
+    [history, items, onResume, onSelect, rowKind, total, updateSelection]
   )
 
   const selectedKind = rowKind(sel)
@@ -577,6 +598,9 @@ export function ActiveSessionSwitcher({
 
     const lower = ch?.toLowerCase() ?? ''
     const isCtrl = (letter: string) => key.ctrl && (lower === letter || ch === ctrlChar(letter))
+    const inputSel = selRef.current
+    const inputKind = rowKind(inputSel)
+    const inputNewSelected = inputKind === 'new'
 
     if (key.escape) {
       return onCancel()
@@ -593,7 +617,7 @@ export function ActiveSessionSwitcher({
     }
 
     if (key.tab) {
-      if (newSelected) {
+      if (inputNewSelected) {
         setPickingModel(true)
       }
 
@@ -601,7 +625,7 @@ export function ActiveSessionSwitcher({
     }
 
     if (isCtrl('d')) {
-      if (selectedKind === 'live') {
+      if (inputKind === 'live') {
         void closeSelected()
       }
 
@@ -610,26 +634,26 @@ export function ActiveSessionSwitcher({
 
     // `d` arms deletion on a resumable history row. (On the New row `d` is
     // captured by the prompt's TextInput, so it never reaches here.)
-    if (lower === 'd' && !key.ctrl && selectedKind === 'history') {
-      setConfirmDelete(history[sel - 1 - items.length]?.id ?? null)
+    if (lower === 'd' && !key.ctrl && inputKind === 'history') {
+      setConfirmDelete(history[inputSel - 1 - items.length]?.id ?? null)
 
       return
     }
 
-    if (newSelected && draftHasText) {
+    if (inputNewSelected && draftHasText) {
       return
     }
 
-    if (key.upArrow && sel > 0) {
-      return setSel(s => Math.max(0, s - 1))
+    if (key.upArrow && inputSel > 0) {
+      return updateSelection(Math.max(0, inputSel - 1))
     }
 
-    if (key.downArrow && sel < total - 1) {
-      return setSel(s => Math.min(total - 1, s + 1))
+    if (key.downArrow && inputSel < total - 1) {
+      return updateSelection(Math.min(total - 1, inputSel + 1))
     }
 
     if (key.return) {
-      if (newSelected) {
+      if (inputNewSelected) {
         if (!draftHasText) {
           return onNew()
         }
@@ -637,12 +661,12 @@ export function ActiveSessionSwitcher({
         return
       }
 
-      if (selectedKind === 'live' && items[sel - 1]) {
-        return onSelect(items[sel - 1]!.id)
+      if (inputKind === 'live' && items[inputSel - 1]) {
+        return onSelect(items[inputSel - 1]!.id)
       }
 
-      if (selectedKind === 'history' && history[sel - 1 - items.length]) {
-        return onResume(history[sel - 1 - items.length]!.id)
+      if (inputKind === 'history' && history[inputSel - 1 - items.length]) {
+        return onResume(history[inputSel - 1 - items.length]!.id)
       }
     }
   })

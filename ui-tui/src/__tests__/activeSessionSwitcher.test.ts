@@ -1,7 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { PassThrough } from 'node:stream'
+
+import { renderSync } from '@hermes/ink'
+import React from 'react'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   activeSessionCountLabel,
+  ActiveSessionSwitcher,
   canTypeOrchestratorPrompt,
   clampOrchestratorSelection,
   closeFallbackAfterClose,
@@ -206,5 +211,72 @@ describe('unified Sessions overlay helpers', () => {
     expect(relativeSessionAge(nowSec - 3 * 86400)).toBe('3d ago')
     expect(relativeSessionAge(undefined)).toBe('')
     expect(relativeSessionAge(0)).toBe('')
+  })
+})
+
+describe('unified Sessions overlay keyboard input', () => {
+  it('resumes the newly highlighted history row when Down and Enter arrive together', async () => {
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+
+    Object.assign(stdout, { columns: 120, isTTY: true, rows: 40 })
+    Object.assign(stdin, { isTTY: true, ref: vi.fn(), setRawMode: vi.fn(), unref: vi.fn() })
+    Object.assign(stderr, { isTTY: true })
+    stdout.on('data', () => {})
+
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'session.active_list') {
+          return Promise.resolve({ sessions: [{ current: true, id: 'live', status: 'idle' }] })
+        }
+
+        if (method === 'session.list') {
+          return Promise.resolve({
+            sessions: [{ id: 'history', message_count: 2, preview: 'saved chat', started_at: 1, title: 'Saved chat' }]
+          })
+        }
+
+        return Promise.reject(new Error(`unexpected RPC: ${method}`))
+      })
+    }
+
+    const onResume = vi.fn()
+    const onSelect = vi.fn()
+
+    const instance = renderSync(
+      React.createElement(ActiveSessionSwitcher, {
+        currentSessionId: 'live',
+        gw: gw as any,
+        onCancel: vi.fn(),
+        onClose: vi.fn(() => Promise.resolve(null)),
+        onNew: vi.fn(),
+        onNewPrompt: vi.fn(),
+        onResume,
+        onSelect,
+        t: DEFAULT_THEME
+      }),
+      {
+        patchConsole: false,
+        stderr: stderr as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream
+      }
+    )
+
+    try {
+      await new Promise(resolve => setTimeout(resolve, 30))
+      stdin.write('\u001b[B')
+      stdin.write('\r')
+      await new Promise(resolve => setTimeout(resolve, 30))
+
+      expect({ resumed: onResume.mock.calls, selected: onSelect.mock.calls }).toEqual({
+        resumed: [['history']],
+        selected: []
+      })
+    } finally {
+      instance.unmount()
+      instance.cleanup()
+    }
   })
 })
