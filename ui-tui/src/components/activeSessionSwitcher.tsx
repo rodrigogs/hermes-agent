@@ -501,18 +501,7 @@ export function ActiveSessionSwitcher({
     } finally {
       setClosingId('')
     }
-  }, [
-    closingId,
-    currentSessionId,
-    history.length,
-    items,
-    load,
-    onClose,
-    onNew,
-    onSelect,
-    rowKind,
-    updateSelection
-  ])
+  }, [closingId, currentSessionId, history.length, items, load, onClose, onNew, onSelect, rowKind, updateSelection])
 
   const performDelete = useCallback(
     (id: string) => {
