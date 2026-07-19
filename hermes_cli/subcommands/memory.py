@@ -60,4 +60,23 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
         default=None,
         help="Override HRR dimensionality for the rebuild (default: configured hrr_dim)",
     )
+    _audit_parser = memory_sub.add_parser(
+        "audit",
+        help="Audit holographic SQLite/FTS5/HRR integrity and parity",
+    )
+    _audit_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the complete report as JSON",
+    )
+    _gc_parser = memory_sub.add_parser(
+        "gc",
+        help="Remove holographic entities no longer linked to any fact",
+    )
+    _gc_parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
     memory_parser.set_defaults(func=cmd_memory)

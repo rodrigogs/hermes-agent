@@ -30,6 +30,8 @@ class FactRetriever:
         jaccard_weight: float = 0.3,
         hrr_weight: float = 0.3,
         hrr_dim: int = 1024,
+        probe_min_score: float = 0.08,
+        reason_min_score: float = 0.08,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
@@ -44,6 +46,11 @@ class FactRetriever:
         self.fts_weight = fts_weight
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
+        # Retained for config/API compatibility with pre-Honest-Memory setups.
+        # Exact probe/reason paths abstain instead of thresholding random HRR
+        # similarities; related/search still use HRR where it is non-assertive.
+        self.probe_min_score = probe_min_score
+        self.reason_min_score = reason_min_score
 
     def search(
         self,
@@ -122,81 +129,25 @@ class FactRetriever:
         category: str | None = None,
         limit: int = 10,
     ) -> list[dict]:
-        """Compositional entity query using HRR algebra.
+        """Return facts explicitly linked to an entity or alias.
 
-        Unbinds entity from memory bank to extract associated content.
-        This is NOT keyword search — it uses algebraic structure to find facts
-        where the entity plays a structural role.
-
-        Falls back to FTS5 search if numpy unavailable.
+        This is an assertive recall operation, so it uses persisted SQL links
+        only and abstains for unknown entities instead of guessing via HRR.
         """
-        if not hrr._HAS_NUMPY:
-            # Fallback to keyword search on entity name
-            return self.search(entity, category=category, limit=limit)
+        exact = self.store.facts_for_entity(entity)
+        if category is not None:
+            exact = [fact for fact in exact if fact["category"] == category]
+        if exact:
+            for fact in exact[:limit]:
+                fact["score"] = fact["trust_score"]
+                fact["retrieval_method"] = "entity_sql"
+            return exact[:limit]
 
-        conn = self.store._conn
-
-        # Encode entity as role-bound vector
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-        entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
-        probe_key = hrr.bind(entity_vec, role_entity)
-
-        # Try category-specific bank first, then all facts
-        if category:
-            bank_name = f"cat:{category}"
-            bank_row = conn.execute(
-                "SELECT vector FROM memory_banks WHERE bank_name = ?",
-                (bank_name,),
-            ).fetchone()
-            if bank_row:
-                bank_vec = hrr.bytes_to_phases(bank_row["vector"])
-                extracted = hrr.unbind(bank_vec, probe_key)
-                # Use extracted signal to score individual facts
-                return self._score_facts_by_vector(
-                    extracted, category=category, limit=limit
-                )
-
-        # Score against individual fact vectors directly
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
-        if category:
-            where += " AND category = ?"
-            params.append(category)
-
-        rows = conn.execute(
-            f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
-            """,
-            params,
-        ).fetchall()
-
-        if not rows:
-            # Final fallback: keyword search
-            return self.search(entity, category=category, limit=limit)
-
-        scored = []
-        for row in rows:
-            fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
-            # Direct presence test: is (entity ⊛ ROLE_ENTITY) a term in the
-            # bundled fact vector? The old unbind→compare-to-content identity
-            # was mathematically false (content and entities live in separate
-            # bundled slots), scoring ~random. Measured separation true-vs-
-            # distractor +0.54 with this form vs -0.03 before (audit 2026-07).
-            sim = hrr.similarity(fact_vec, probe_key)
-            # Use max(0, sim), NOT (sim+1)/2: the latter maps a non-match
-            # (sim≈0) to a 0.5 baseline, which — once multiplied by trust —
-            # lets an irrelevant high-trust fact outrank a relevant medium-trust
-            # one. Clamping at 0 keeps the HRR presence signal dominant.
-            fact["score"] = max(0.0, sim) * fact["trust_score"]
-            scored.append(fact)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        # Honest Memory is evidence-based: if no persisted entity/alias link
+        # exists, a random HRR similarity is not evidence that the entity is
+        # known. Probabilistic retrieval remains useful for search/related, but
+        # probe must abstain here.
+        return []
 
     def related(
         self,
@@ -227,16 +178,17 @@ class FactRetriever:
             where += " AND category = ?"
             params.append(category)
 
-        rows = conn.execute(
-            f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
-            """,
-            params,
-        ).fetchall()
+        with self.store._lock:
+            rows = conn.execute(
+                f"""
+                SELECT fact_id, content, category, tags, trust_score,
+                       retrieval_count, helpful_count, created_at, updated_at,
+                       hrr_vector
+                FROM facts
+                {where}
+                """,
+                params,
+            ).fetchall()
 
         if not rows:
             return self.search(entity, category=category, limit=limit)
@@ -272,83 +224,27 @@ class FactRetriever:
         category: str | None = None,
         limit: int = 10,
     ) -> list[dict]:
-        """Multi-entity compositional query — vector-space JOIN.
+        """Return facts explicitly linked to every requested entity.
 
-        Given multiple entities, algebraically intersects their structural
-        connections to find facts related to ALL of them simultaneously.
-        This is compositional reasoning that no embedding DB can do.
-
-        Example: reason(["peppi", "backend"]) finds facts where peppi AND
-        backend both play structural roles — without keyword matching.
-
-        Falls back to FTS5 search if numpy unavailable.
+        The SQL intersection is auditable and has strict AND semantics. If no
+        persisted fact contains all entities, abstain instead of inferring a
+        relation from probabilistic vector similarity.
         """
-        if not hrr._HAS_NUMPY or not entities:
-            # Fallback: search with all entities as keywords
-            query = " ".join(entities)
-            return self.search(query, category=category, limit=limit)
+        if not entities:
+            return []
 
-        conn = self.store._conn
-        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
+        exact = self.store.facts_for_entities_intersection(entities)
+        if category is not None:
+            exact = [fact for fact in exact if fact["category"] == category]
+        if exact:
+            for fact in exact[:limit]:
+                fact["score"] = fact["trust_score"]
+                fact["retrieval_method"] = "entity_sql_intersection"
+            return exact[:limit]
 
-        # For each entity, compute what the bank "remembers" about it
-        # by unbinding entity+role from each fact vector
-        entity_residuals = []
-        for entity in entities:
-            entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
-            probe_key = hrr.bind(entity_vec, role_entity)
-            entity_residuals.append(probe_key)
-
-        # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
-        params: list = []
-        if category:
-            where += " AND category = ?"
-            params.append(category)
-
-        rows = conn.execute(
-            f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
-            """,
-            params,
-        ).fetchall()
-
-        if not rows:
-            query = " ".join(entities)
-            return self.search(query, category=category, limit=limit)
-
-        # Score each fact by how much EACH entity is structurally present.
-        # A fact scores high only if ALL entities have structural presence
-        # (AND semantics via min, vs OR which would use mean/max).
-        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-
-        scored = []
-        for row in rows:
-            fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
-
-            entity_scores = []
-            for probe_key in entity_residuals:
-                # Direct presence test per entity (same fix as probe()): score
-                # how strongly (entity ⊛ ROLE_ENTITY) is present in the bundled
-                # fact vector. The prior unbind→compare-to-role_content form
-                # ranked the true multi-entity fact worse than random.
-                sim = hrr.similarity(fact_vec, probe_key)
-                entity_scores.append(sim)
-
-            # AND semantics: a fact scores high only if ALL entities are present.
-            min_sim = min(entity_scores)
-            # max(0, .) not (x+1)/2 — avoid the 0.5 non-match baseline that
-            # lets trust dominate over actual multi-entity presence.
-            fact["score"] = max(0.0, min_sim) * fact["trust_score"]
-            scored.append(fact)
-
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        # A relation is only asserted when one persisted fact links every
+        # requested entity. HRR similarity cannot establish that conjunction.
+        return []
 
     def contradict(
         self,
@@ -377,40 +273,41 @@ class FactRetriever:
             where += " AND f.category = ?"
             params.append(category)
 
-        rows = conn.execute(
-            f"""
-            SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score,
-                   f.created_at, f.updated_at, f.hrr_vector
-            FROM facts f
-            {where}
-            """,
-            params,
-        ).fetchall()
-
-        if len(rows) < 2:
-            return []
-
-        # Guard against O(n²) explosion on large fact stores.
-        # At 500 facts, that's ~125K comparisons — acceptable.
-        # Above that, only check the most recently updated facts.
-        _MAX_CONTRADICT_FACTS = 500
-        if len(rows) > _MAX_CONTRADICT_FACTS:
-            rows = sorted(rows, key=lambda r: r["updated_at"] or r["created_at"], reverse=True)
-            rows = rows[:_MAX_CONTRADICT_FACTS]
-
-        # Build entity sets per fact
-        fact_entities: dict[int, set[str]] = {}
-        for row in rows:
-            fid = row["fact_id"]
-            entity_rows = conn.execute(
-                """
-                SELECT e.name FROM entities e
-                JOIN fact_entities fe ON fe.entity_id = e.entity_id
-                WHERE fe.fact_id = ?
+        with self.store._lock:
+            rows = conn.execute(
+                f"""
+                SELECT f.fact_id, f.content, f.category, f.tags, f.trust_score,
+                       f.created_at, f.updated_at, f.hrr_vector
+                FROM facts f
+                {where}
                 """,
-                (fid,),
+                params,
             ).fetchall()
-            fact_entities[fid] = {r["name"].lower() for r in entity_rows}
+
+            if len(rows) < 2:
+                return []
+
+            # Guard against O(n²) explosion on large fact stores.
+            # At 500 facts, that's ~125K comparisons — acceptable.
+            # Above that, only check the most recently updated facts.
+            _MAX_CONTRADICT_FACTS = 500
+            if len(rows) > _MAX_CONTRADICT_FACTS:
+                rows = sorted(rows, key=lambda r: r["updated_at"] or r["created_at"], reverse=True)
+                rows = rows[:_MAX_CONTRADICT_FACTS]
+
+            # Build entity sets from the same committed snapshot as the facts.
+            fact_entities: dict[int, set[str]] = {}
+            for row in rows:
+                fid = row["fact_id"]
+                entity_rows = conn.execute(
+                    """
+                    SELECT e.name FROM entities e
+                    JOIN fact_entities fe ON fe.entity_id = e.entity_id
+                    WHERE fe.fact_id = ?
+                    """,
+                    (fid,),
+                ).fetchall()
+                fact_entities[fid] = {r["name"].lower() for r in entity_rows}
 
         # Compare all pairs: high entity overlap + low content similarity = contradiction
         facts = [dict(r) for r in rows]
@@ -471,16 +368,17 @@ class FactRetriever:
             where += " AND category = ?"
             params.append(category)
 
-        rows = conn.execute(
-            f"""
-            SELECT fact_id, content, category, tags, trust_score,
-                   retrieval_count, helpful_count, created_at, updated_at,
-                   hrr_vector
-            FROM facts
-            {where}
-            """,
-            params,
-        ).fetchall()
+        with self.store._lock:
+            rows = conn.execute(
+                f"""
+                SELECT fact_id, content, category, tags, trust_score,
+                       retrieval_count, helpful_count, created_at, updated_at,
+                       hrr_vector
+                FROM facts
+                {where}
+                """,
+                params,
+            ).fetchall()
 
         scored = []
         for row in rows:
@@ -538,11 +436,12 @@ class FactRetriever:
         """
         params.append(limit)
 
-        try:
-            rows = conn.execute(sql, params).fetchall()
-        except Exception:
-            # FTS5 MATCH can fail on malformed queries — fall back to empty
-            return []
+        with self.store._lock:
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except Exception:
+                # FTS5 MATCH can fail on malformed queries — fall back to empty
+                return []
 
         if not rows:
             return []

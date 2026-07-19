@@ -263,6 +263,40 @@ def test_handle_approve_all(hermes_home):
     assert len(store.user_entries) == 2
 
 
+def test_handle_approve_routes_holographic_pending_write(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    import plugins.memory.holographic as holographic
+
+    captured = {}
+    monkeypatch.setattr(
+        holographic,
+        "apply_holographic_pending",
+        lambda payload: captured.update(payload=payload) or {"success": True},
+    )
+    rec = wa.stage_write(
+        "memory",
+        {
+            "action": "holographic:add",
+            "provider": "holographic",
+            "db_path": "/tmp/memory_store.db",
+            "args": {"action": "add", "content": "approved"},
+        },
+        summary="holographic add",
+        origin="foreground",
+    )
+
+    out = handle_pending_subcommand(
+        wa.MEMORY,
+        ["approve", rec["id"]],
+        memory_store=None,
+    )
+
+    assert "Approved 1" in out
+    assert captured["payload"]["provider"] == "holographic"
+    assert wa.pending_count("memory") == 0
+
+
 def test_handle_reject(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools import write_approval as wa
