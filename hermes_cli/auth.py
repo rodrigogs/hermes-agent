@@ -3467,12 +3467,22 @@ def _sync_codex_pool_entries(
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    """Save Codex OAuth tokens back to the auth store they came from."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
+    with _provider_state_transaction("openai-codex") as (
+        active_store,
+        source_state,
+        source_path,
+    ):
+        active_path = _auth_file_path()
+        source_is_active = source_path is None or _same_path(source_path, active_path)
+        auth_store = (
+            active_store
+            if source_is_active
+            else _load_auth_store(source_path)
+        )
+        state = source_state or {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3491,7 +3501,10 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_auth_store(
+            auth_store,
+            target_path=active_path if source_is_active else source_path,
+        )
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -3809,19 +3822,23 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
+        # Re-read while holding both the active profile lock and the lock for
+        # any inherited global auth source. Codex refresh tokens are single-use,
+        # so profiles must serialize the network refresh against the shared
+        # source rather than only against their own auth.json.
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_codex_tokens(_lock=False)
-            tokens = dict(data["tokens"])
-            access_token = str(tokens.get("access_token", "") or "").strip()
-
-            should_refresh = bool(force_refresh)
-            if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
-
-            if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+            with _provider_state_transaction("openai-codex"):
+                data = _read_codex_tokens(_lock=False)
+                tokens = dict(data["tokens"])
                 access_token = str(tokens.get("access_token", "") or "").strip()
+
+                should_refresh = bool(force_refresh)
+                if (not should_refresh) and refresh_if_expiring:
+                    should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+
+                if should_refresh:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")

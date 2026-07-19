@@ -492,6 +492,62 @@ def test_provider_state_transaction_locks_global_fallback_before_use(
     ]
 
 
+def test_codex_refresh_persists_to_global_source_instead_of_shadowing_profile(
+    profile_env,
+    monkeypatch,
+):
+    """A profile borrowing global Codex auth must rotate the source token chain."""
+    import hermes_cli.auth as auth
+
+    old_tokens = {"access_token": "global-old-at", "refresh_token": "global-old-rt"}
+    new_tokens = {"access_token": "global-new-at", "refresh_token": "global-new-rt"}
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            providers={
+                "openai-codex": {
+                    "tokens": dict(old_tokens),
+                    "last_refresh": "2026-01-01T00:00:00Z",
+                    "auth_mode": "chatgpt",
+                }
+            },
+            pool={
+                "openai-codex": [
+                    {
+                        "id": "global-codex",
+                        "label": "global-codex",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        **old_tokens,
+                    }
+                ]
+            },
+        ),
+    )
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    def fake_refresh(access_token, refresh_token, *, timeout_seconds):
+        assert access_token == old_tokens["access_token"]
+        assert refresh_token == old_tokens["refresh_token"]
+        assert timeout_seconds > 0
+        return {**new_tokens, "last_refresh": "2026-01-02T00:00:00Z"}
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", fake_refresh)
+
+    resolved = auth.resolve_codex_runtime_credentials(force_refresh=True)
+
+    assert resolved["api_key"] == new_tokens["access_token"]
+    global_store = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert global_store["providers"]["openai-codex"]["tokens"] == new_tokens
+    assert global_store["credential_pool"]["openai-codex"][0]["access_token"] == new_tokens["access_token"]
+    assert global_store["credential_pool"]["openai-codex"][0]["refresh_token"] == new_tokens["refresh_token"]
+
+    profile_store = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "openai-codex" not in profile_store.get("providers", {})
+    assert profile_store.get("credential_pool", {}).get("openai-codex", []) == []
+
+
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
     """Changing profile context cannot inherit another store's lock depth."""
     import hermes_cli.auth as auth
