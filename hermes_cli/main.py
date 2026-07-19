@@ -13105,6 +13105,62 @@ def cmd_memory(args):
             "\n  Memory reset complete. New sessions will start with a blank slate."
         )
         print(f"  Files were in: {display_hermes_home()}/memories/\n")
+    elif sub == "audit":
+        import json as _json
+        from plugins.memory.holographic import (
+            HolographicMemoryProvider,
+            _load_plugin_config,
+        )
+
+        provider = HolographicMemoryProvider(config=_load_plugin_config())
+        try:
+            provider.initialize("memory-cli-audit")
+            report = provider._store.audit()
+            if getattr(args, "json", False):
+                print(_json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                marker = "✓" if report["healthy"] else "!"
+                print("\nHolographic memory audit")
+                print("────────────────────────────────────────")
+                print(f"  Status:               {marker} {'healthy' if report['healthy'] else 'attention required'}")
+                print(f"  SQLite integrity:     {report['integrity_check']}")
+                print(f"  Foreign keys:         {'on' if report['foreign_keys'] else 'off'}")
+                print(f"  Facts / FTS rows:     {report['facts']} / {report['fts_rows']}")
+                print(f"  HRR vectors missing:  {report['facts_without_hrr']}")
+                print(f"  Facts without entity: {report['facts_without_entities']}")
+                print(f"  Orphan entities:      {report['orphan_entities']}")
+                print(f"  Orphan links:         {report['orphan_links']}")
+                print(f"  Banks / bank facts:   {report['banks']} / {report['bank_fact_count']}\n")
+        finally:
+            provider.shutdown()
+    elif sub == "gc":
+        from plugins.memory.holographic import (
+            HolographicMemoryProvider,
+            _load_plugin_config,
+        )
+
+        provider = HolographicMemoryProvider(config=_load_plugin_config())
+        try:
+            provider.initialize("memory-cli-gc")
+            orphan_count = provider._store.audit()["orphan_entities"]
+            if orphan_count == 0:
+                print("\n  No orphan holographic entities found.\n")
+                return
+            if not getattr(args, "yes", False):
+                try:
+                    answer = input(
+                        f"\n  Remove {orphan_count} orphan holographic entity row(s)? Type 'yes': "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n  Cancelled.\n")
+                    return
+                if answer != "yes":
+                    print("  Cancelled.\n")
+                    return
+            removed = provider._store.garbage_collect_entities()
+            print(f"\n  ✓ Removed {removed} orphan holographic entity row(s).\n")
+        finally:
+            provider.shutdown()
     elif sub == "reindex":
         # Recompute HRR vectors for every stored fact (holographic provider).
         # Needed after installing numpy on an install that stored facts without

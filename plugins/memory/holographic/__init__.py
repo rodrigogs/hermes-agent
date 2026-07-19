@@ -61,7 +61,26 @@ FACT_STORE_SCHEMA = {
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
-            "entities": {"type": "array", "items": {"type": "string"}, "description": "Entity names for 'reason'."},
+            "entities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Entity names for 'reason', or explicit entities for 'add'/'update'.",
+            },
+            "aliases": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "entity": {"type": "string"},
+                        "aliases": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["entity", "aliases"],
+                },
+                "description": "Canonical entity and alias lists for 'add'/'update'.",
+            },
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
             "category": {
                 "type": "string",
@@ -206,6 +225,8 @@ class HolographicMemoryProvider(MemoryProvider):
         # match the recommended balance: BM25 primary, jaccard as tie-breaker.
         fts_weight = float(self._config.get("fts_weight", 0.55))
         jaccard_weight = float(self._config.get("jaccard_weight", 0.15))
+        probe_min_score = float(self._config.get("probe_min_score", 0.08))
+        reason_min_score = float(self._config.get("reason_min_score", 0.08))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
         self._store = MemoryStore(db_path=db_path, default_trust=default_trust, hrr_dim=hrr_dim)
@@ -216,6 +237,8 @@ class HolographicMemoryProvider(MemoryProvider):
             jaccard_weight=jaccard_weight,
             hrr_weight=hrr_weight,
             hrr_dim=hrr_dim,
+            probe_min_score=probe_min_score,
+            reason_min_score=reason_min_score,
         )
         self._session_id = session_id
 
@@ -274,20 +297,71 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._config.get("auto_extract", False):
+        auto_extract = self._config.get("auto_extract", False)
+        if isinstance(auto_extract, str):
+            auto_extract = auto_extract.strip().lower() in {
+                "true", "1", "yes", "y", "on"
+            }
+        if not auto_extract:
             return
         if not self._store or not messages:
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: dict | None = None,
+    ) -> None:
+        """Mirror committed built-in memory mutations without fuzzy deletes."""
+        if not self._store:
+            return
+        marker = f"builtin-memory:{target}"
+        metadata = metadata or {}
+        try:
+            if action in {"add", "replace"}:
+                validation_error = self._validate_fact_write({"content": content})
+                if validation_error:
+                    logger.warning("Holographic memory mirror blocked: %s", validation_error)
+                    return
+
+            if action == "add" and content:
                 category = "user_pref" if target == "user" else "general"
-                self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+                self._store.add_fact(content, category=category, tags=marker)
+                return
+
+            if action not in {"replace", "remove"}:
+                return
+            old_text = str(metadata.get("old_text") or "").strip()
+            if not old_text:
+                return
+            rows = self._store._conn.execute(
+                """
+                SELECT fact_id FROM facts
+                WHERE tags = ? AND instr(content, ?) > 0
+                ORDER BY fact_id
+                """,
+                (marker, old_text),
+            ).fetchall()
+            # Fail closed on zero/ambiguous matches: never mutate an unrelated
+            # deep fact because a short old_text happened to overlap.
+            if len(rows) != 1:
+                return
+            fact_id = int(rows[0]["fact_id"])
+            if action == "replace" and content:
+                category = "user_pref" if target == "user" else "general"
+                self._store.update_fact(
+                    fact_id,
+                    content=content,
+                    category=category,
+                    tags=marker,
+                )
+            elif action == "remove":
+                self._store.remove_fact(fact_id)
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         # Release the shared SQLite connection deterministically on the
@@ -306,17 +380,137 @@ class HolographicMemoryProvider(MemoryProvider):
 
     # -- Tool handlers -------------------------------------------------------
 
-    def _handle_fact_store(self, args: dict) -> str:
+    @staticmethod
+    def _normalize_aliases(value: Any) -> dict[str, list[str]] | None:
+        """Normalize structured tool input; retain map support for callers."""
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            if all(isinstance(names, list) for names in value.values()):
+                return {
+                    str(entity): [str(name) for name in names]
+                    for entity, names in value.items()
+                }
+            return None
+        if not isinstance(value, list):
+            return None
+        normalized: dict[str, list[str]] = {}
+        for item in value:
+            if not isinstance(item, dict):
+                return None
+            entity = item.get("entity")
+            names = item.get("aliases")
+            if not isinstance(entity, str) or not isinstance(names, list):
+                return None
+            normalized.setdefault(entity, []).extend(str(name) for name in names)
+        return normalized
+
+    @staticmethod
+    def _validate_fact_write(args: dict) -> str | None:
+        """Reject injection, secrets, and PII before a fact reaches SQLite."""
+        strings: list[str] = []
+        for key in ("content", "tags"):
+            value = args.get(key)
+            if isinstance(value, str) and value:
+                strings.append(value)
+        for value in args.get("entities") or []:
+            if isinstance(value, str) and value:
+                strings.append(value)
+        aliases = args.get("aliases") or {}
+        if isinstance(aliases, dict):
+            for canonical, values in aliases.items():
+                strings.append(str(canonical))
+                if isinstance(values, list):
+                    strings.extend(str(value) for value in values)
+        elif isinstance(aliases, list):
+            for item in aliases:
+                if not isinstance(item, dict):
+                    continue
+                strings.append(str(item.get("entity") or ""))
+                values = item.get("aliases") or []
+                if isinstance(values, list):
+                    strings.extend(str(value) for value in values)
+        if not strings:
+            return None
+
+        candidate = "\n".join(strings)
+        from tools.threat_patterns import first_threat_message
+
+        threat = first_threat_message(candidate, scope="strict")
+        if threat:
+            return threat
+
+        # This is a persistence boundary, so secret/PII blocking is mandatory
+        # even when display redaction has been disabled for debugging.
+        from agent.redact import redact_sensitive_text
+
+        if redact_sensitive_text(candidate, force=True, file_read=True) != candidate:
+            return "Blocked: fact content contains secret or PII-like data."
+        return None
+
+    def _handle_fact_store(self, args: dict, *, bypass_approval: bool = False) -> str:
         try:
             action = args["action"]
             store = self._store
             retriever = self._retriever
+
+            if action in {"add", "update"}:
+                validation_error = self._validate_fact_write(args)
+                if validation_error:
+                    return tool_error(validation_error)
+                alias_map = (
+                    self._normalize_aliases(args.get("aliases"))
+                    if "aliases" in args
+                    else None
+                )
+                if alias_map is None and "aliases" in args:
+                    return tool_error(
+                        "aliases must contain entity names and string alias lists"
+                    )
+            else:
+                alias_map = {}
+
+            if action in {"add", "update", "remove"} and not bypass_approval:
+                from tools import write_approval as wa
+
+                content = str(args.get("content") or "").strip()
+                summary = f"holographic {action}"
+                if content:
+                    summary += f": {content[:160]}"
+                decision = wa.evaluate_gate(
+                    wa.MEMORY,
+                    inline_summary=summary,
+                    inline_detail=json.dumps(args, ensure_ascii=False, indent=2),
+                )
+                if decision.blocked:
+                    return tool_error(decision.message)
+                if decision.stage:
+                    record = wa.stage_write(
+                        wa.MEMORY,
+                        {
+                            "action": f"holographic:{action}",
+                            "provider": "holographic",
+                            "db_path": str(store.db_path.resolve()),
+                            "args": dict(args),
+                        },
+                        summary=summary,
+                        origin=wa.current_origin(),
+                    )
+                    return json.dumps(
+                        {
+                            "status": "staged",
+                            "pending_id": record["id"],
+                            "message": decision.message,
+                        }
+                    )
 
             if action == "add":
                 fact_id = store.add_fact(
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
+                    entities=args.get("entities"),
+                    aliases=alias_map,
                 )
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
@@ -370,6 +564,8 @@ class HolographicMemoryProvider(MemoryProvider):
                     trust_delta=float(args["trust_delta"]) if "trust_delta" in args else None,
                     tags=args.get("tags"),
                     category=args.get("category"),
+                    entities=args.get("entities"),
+                    aliases=alias_map,
                 )
                 return json.dumps({"updated": updated})
 
@@ -428,8 +624,16 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="user_pref")
-                        extracted += 1
+                        result = json.loads(
+                            self._handle_fact_store(
+                                {
+                                    "action": "add",
+                                    "content": content[:400],
+                                    "category": "user_pref",
+                                }
+                            )
+                        )
+                        extracted += result.get("status") == "added"
                     except Exception:
                         pass
                     break
@@ -437,14 +641,62 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="project")
-                        extracted += 1
+                        result = json.loads(
+                            self._handle_fact_store(
+                                {
+                                    "action": "add",
+                                    "content": content[:400],
+                                    "category": "project",
+                                }
+                            )
+                        )
+                        extracted += result.get("status") == "added"
                     except Exception:
                         pass
                     break
 
         if extracted:
             logger.info("Auto-extracted %d facts from conversation", extracted)
+
+
+# ---------------------------------------------------------------------------
+# Pending approval replay
+# ---------------------------------------------------------------------------
+
+
+def apply_holographic_pending(payload: dict) -> dict:
+    """Replay an approved fact mutation without re-entering the approval gate."""
+    if payload.get("provider") != "holographic":
+        return {"success": False, "error": "not a holographic pending write"}
+    args = payload.get("args")
+    if not isinstance(args, dict):
+        return {"success": False, "error": "invalid holographic pending payload"}
+
+    db_path = payload.get("db_path")
+    if not db_path:
+        return {"success": False, "error": "holographic pending write has no database path"}
+    from pathlib import Path
+
+    canonical_path = Path(str(db_path)).expanduser()
+    if not canonical_path.is_absolute():
+        return {
+            "success": False,
+            "error": "holographic pending database path must be absolute",
+        }
+
+    config = dict(_load_plugin_config())
+    config["db_path"] = str(canonical_path)
+    provider = HolographicMemoryProvider(config=config)
+    try:
+        provider.initialize("pending-memory-approval")
+        result = json.loads(provider._handle_fact_store(args, bypass_approval=True))
+        if "error" in result:
+            return {"success": False, "error": result["error"]}
+        return {"success": True, **result}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+    finally:
+        provider.shutdown()
 
 
 # ---------------------------------------------------------------------------

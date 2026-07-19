@@ -55,6 +55,19 @@ def test_followup_builders_dispatch(name, builder, kw, argv):
     assert ns.func is handler
 
 
+@pytest.mark.parametrize("command", ["audit", "gc"])
+def test_memory_builder_accepts_health_subcommands(command):
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h("memory")
+    build_memory_parser(sub, cmd_memory=handler)
+
+    ns = parser.parse_args(["memory", command])
+
+    assert ns.memory_command == command
+    assert ns.func is handler
+
+
 def test_mcp_and_acp_accept_hooks_flag():
     # mcp/acp parser blocks use the shared add_accept_hooks_flag helper.
     parser = argparse.ArgumentParser(prog="hermes")

@@ -142,6 +142,11 @@ def _apply_one(subsystem: str, rec, memory_store):
     payload = rec.get("payload", {})
     try:
         if subsystem == wa.MEMORY:
+            if payload.get("provider") == "holographic":
+                from plugins.memory.holographic import apply_holographic_pending
+
+                result = apply_holographic_pending(payload)
+                return bool(result.get("success")), result.get("error", "")
             if memory_store is None:
                 return False, "memory store unavailable"
             from tools.memory_tool import apply_memory_pending
