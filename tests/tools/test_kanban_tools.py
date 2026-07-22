@@ -144,6 +144,36 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_platform_toolset_config_does_not_bypass_profile_gate(monkeypatch, tmp_path):
+    """A platform opt-in must not globally unlock Kanban mutation tools.
+
+    Registry availability checks are process-global and may serve several
+    platforms. Only the profile-level ``toolsets: [kanban]`` opt-in (or a
+    dispatcher worker env) may open the gate; otherwise one platform's config
+    could expose Kanban tools to every surface in the same process.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "toolsets:\n"
+        "  - hermes-cli\n"
+        "platform_toolsets:\n"
+        "  telegram:\n"
+        "    - kanban\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert not {name for name in names if name and name.startswith("kanban_")}
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------

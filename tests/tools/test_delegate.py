@@ -121,6 +121,16 @@ class TestDelegateRequirements(unittest.TestCase):
             self.assertNotIn("default 3", surface)
             self.assertNotIn("default 2", surface)
 
+    def test_schema_description_explains_profile_backed_and_kanban_workers(self):
+        """The model must distinguish ephemeral profile children from Kanban work."""
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        desc = _build_dynamic_schema_overrides()["description"]
+        self.assertIn("Set `profile`", desc)
+        self.assertIn("memory remains disabled", desc)
+        self.assertIn("Use Kanban instead", desc)
+        self.assertIn("durable cross-process work", desc)
+
     def test_schema_overrides_applied_via_get_definitions(self):
         """Registry.get_definitions() must apply dynamic_schema_overrides so
         the model API call sees current values, not the static import-time text.
