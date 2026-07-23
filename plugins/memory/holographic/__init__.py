@@ -41,7 +41,12 @@ FACT_STORE_SCHEMA = {
     "description": (
         "Deep structured memory with algebraic reasoning. "
         "Use alongside the memory tool — memory for always-on context, "
-        "fact_store for deep recall and compositional queries.\n\n"
+        "fact_store: UNLIMITED, searchable long-term knowledge base (INFINITE SIZE, held OUTSIDE "
+        "the context window -- you must search/probe to see it). This is the correct home for "
+        "bulk detail and any body of knowledge: datasets, rosters, catalogs, documents, logs, "
+        "episodic facts, and compositional knowledge to recall or reason over later. Prefer this "
+        "over the small `memory` tool whenever content is large, detailed, or not needed every "
+        "turn. Use fact_store for deep recall and compositional queries.\n\n"
         "ACTIONS (simple → powerful):\n"
         "• add — Store a fact the user would expect you to remember.\n"
         "• search — Keyword lookup ('editor config', 'deploy process').\n"
