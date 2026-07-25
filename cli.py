@@ -468,6 +468,7 @@ def load_cli_config() -> Dict[str, Any]:
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
             "threshold": 0.50,    # Compress at 50% of model's context limit
+            "min_tail_user_messages": 1,  # Real user messages guaranteed in the tail (1 = existing single anchor)
         },
         "agent": {
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
@@ -1431,7 +1432,7 @@ def _git_repo_root() -> Optional[str]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
         )
         if result.returncode == 0:
             return _normalize_git_bash_path(result.stdout.strip())
@@ -1478,7 +1479,7 @@ def _resolve_worktree_base(repo_root: str) -> tuple:
     def _git(args, timeout=20):
         return subprocess.run(
             ["git", *args],
-            capture_output=True, text=True, timeout=timeout, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=repo_root,
         )
 
     # 1. Current branch's upstream, if it tracks one.
@@ -1556,7 +1557,15 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     gitignore = Path(repo_root) / ".gitignore"
     _ignore_entry = ".worktrees/"
     try:
-        existing = gitignore.read_text() if gitignore.exists() else ""
+        # utf-8-sig: git files are UTF-8 and Notepad prepends a BOM, which
+        # would glue to the first line and defeat the membership check below
+        # (duplicating the entry); the locale default also breaks non-ASCII
+        # patterns on Windows. The append below already writes UTF-8.
+        existing = (
+            gitignore.read_text(encoding="utf-8-sig", errors="replace")
+            if gitignore.exists()
+            else ""
+        )
         if _ignore_entry not in existing.splitlines():
             with open(gitignore, "a", encoding="utf-8") as f:
                 if existing and not existing.endswith("\n"):
@@ -1577,7 +1586,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     try:
         result = subprocess.run(
             ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-            capture_output=True, text=True, timeout=30, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
         )
         if result.returncode != 0:
             # If branching from the resolved remote ref failed for any reason
@@ -1591,7 +1600,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
                 result = subprocess.run(
                     ["git", "worktree", "add", str(wt_path), "-b", branch_name, base_ref],
-                    capture_output=True, text=True, timeout=30, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
                 )
             if result.returncode != 0:
                 print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
@@ -1606,7 +1615,14 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
         try:
             repo_root_resolved = Path(repo_root).resolve()
             wt_path_resolved = wt_path.resolve()
-            for line in include_file.read_text().splitlines():
+            # utf-8-sig, not the locale default: on a cp1251/GBK Windows
+            # machine a UTF-8 include list either decodes to mojibake paths
+            # (entries silently not copied) or raises UnicodeDecodeError,
+            # which the enclosing handler swallows at DEBUG — no include is
+            # copied at all. A Notepad BOM likewise glued to the first entry.
+            for line in include_file.read_text(
+                encoding="utf-8-sig", errors="replace"
+            ).splitlines():
                 entry = line.strip()
                 if not entry or entry.startswith("#"):
                     continue
@@ -1672,7 +1688,7 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
     try:
         subprocess.run(
             ["git", "worktree", "lock", "--reason", f"hermes pid={os.getpid()}", str(wt_path)],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
         logger.debug("Worktree locked: %s (pid=%s)", wt_path, os.getpid())
     except Exception as e:
@@ -1705,7 +1721,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
     try:
         remote_refs = subprocess.run(
             ["git", "for-each-ref", "--format=%(refname)", "refs/remotes"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if remote_refs.returncode != 0:
             return True
@@ -1714,7 +1730,7 @@ def _worktree_has_unpushed_commits(worktree_path: str, timeout: int = 10) -> boo
 
         result = subprocess.run(
             ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if result.returncode != 0:
             return True
@@ -1735,7 +1751,7 @@ def _worktree_is_dirty(worktree_path: str, timeout: int = 10) -> bool:
     try:
         result = subprocess.run(
             ["git", "status", "--porcelain"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if result.returncode != 0:
             return True
@@ -1768,7 +1784,7 @@ def _worktree_commits_all_merged_upstream(
         try:
             probe = subprocess.run(
                 ["git", "rev-parse", "--verify", "--quiet", candidate],
-                capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
             )
             if probe.returncode == 0 and probe.stdout.strip():
                 base = candidate
@@ -1781,7 +1797,7 @@ def _worktree_commits_all_merged_upstream(
     try:
         ahead = subprocess.run(
             ["git", "rev-list", "--count", f"{base}..HEAD"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if ahead.returncode != 0:
             return False
@@ -1793,7 +1809,7 @@ def _worktree_commits_all_merged_upstream(
 
         cherry = subprocess.run(
             ["git", "cherry", base, "HEAD"],
-            capture_output=True, text=True, timeout=timeout, cwd=worktree_path,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=worktree_path,
         )
         if cherry.returncode != 0:
             return False
@@ -1828,7 +1844,7 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
     try:
         result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=timeout, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, cwd=repo_root,
         )
         if result.returncode != 0:
             return "live"
@@ -1903,7 +1919,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     try:
         subprocess.run(
             ["git", "worktree", "unlock", wt_path],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("git worktree unlock failed (non-fatal): %s", e)
@@ -1911,7 +1927,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     try:
         subprocess.run(
             ["git", "worktree", "remove", wt_path, "--force"],
-            capture_output=True, text=True, timeout=15, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("Failed to remove worktree: %s", e)
@@ -1920,7 +1936,7 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     try:
         subprocess.run(
             ["git", "branch", "-D", branch],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
     except Exception as e:
         logger.debug("Failed to delete branch %s: %s", branch, e)
@@ -1971,6 +1987,16 @@ def _run_state_db_auto_maintenance(session_db) -> None:
             logger.debug("Orphan compression finalize skipped: %s", _finalize_exc)
 
         cfg = (_load_full_config().get("sessions") or {})
+
+        # Auto-archive (soft-hide stale sessions) is independent of the
+        # destructive auto_prune sweep — run it first, before prune's early
+        # return, so enabling one doesn't require the other.
+        if cfg.get("auto_archive", False):
+            session_db.maybe_auto_archive(
+                idle_days=float(cfg.get("auto_archive_days", 3)),
+                min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+            )
+
         if not cfg.get("auto_prune", False):
             return
         session_db.maybe_auto_prune_and_vacuum(
@@ -1997,10 +2023,15 @@ def _run_checkpoint_auto_maintenance() -> None:
         if not cfg.get("auto_prune", False):
             return
         from tools.checkpoint_manager import maybe_auto_prune_checkpoints
+        # delete_orphans is intentionally never honoured here: a missing
+        # workdir at startup is ambiguous (deleted project vs. an unmounted
+        # external volume / network share / VPN not yet up) and this sweep
+        # runs unattended. Orphan cleanup is only ever done via the explicit
+        # `hermes checkpoints prune` command, which the user has to invoke.
         maybe_auto_prune_checkpoints(
             retention_days=int(cfg.get("retention_days", 7)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-            delete_orphans=bool(cfg.get("delete_orphans", True)),
+            delete_orphans=False,
             max_total_size_mb=int(cfg.get("max_total_size_mb", 500)),
         )
     except Exception as exc:
@@ -2111,7 +2142,7 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             try:
                 subprocess.run(
                     ["git", "worktree", "unlock", str(entry)],
-                    capture_output=True, text=True, timeout=10, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
                 )
             except Exception as e:
                 logger.debug("Failed to unlock dead worktree %s: %s", entry.name, e)
@@ -2120,13 +2151,13 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         try:
             branch_result = subprocess.run(
                 ["git", "branch", "--show-current"],
-                capture_output=True, text=True, timeout=5, cwd=str(entry),
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, cwd=str(entry),
             )
             branch = branch_result.stdout.strip()
 
             remove_result = subprocess.run(
                 ["git", "worktree", "remove", str(entry), "--force"],
-                capture_output=True, text=True, timeout=15, cwd=repo_root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=repo_root,
             )
             if remove_result.returncode != 0:
                 # Removal failed — keep the branch so any commits stay
@@ -2139,7 +2170,7 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
             if branch:
                 subprocess.run(
                     ["git", "branch", "-D", branch],
-                    capture_output=True, text=True, timeout=10, cwd=repo_root,
+                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
                 )
             logger.debug("Pruned stale worktree: %s (force=%s)", entry.name, force)
         except Exception as e:
@@ -2167,7 +2198,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     try:
         result = subprocess.run(
             ["git", "branch", "--format=%(refname:short)"],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
         if result.returncode != 0:
             return
@@ -2180,7 +2211,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     try:
         wt_result = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, cwd=repo_root,
         )
         for line in wt_result.stdout.split("\n"):
             if line.startswith("branch refs/heads/"):
@@ -2192,7 +2223,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     try:
         head_result = subprocess.run(
             ["git", "branch", "--show-current"],
-            capture_output=True, text=True, timeout=5, cwd=repo_root,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, cwd=repo_root,
         )
         current = head_result.stdout.strip()
         if current:
@@ -2216,7 +2247,7 @@ def _prune_orphaned_branches(repo_root: str) -> None:
         try:
             subprocess.run(
                 ["git", "branch", "-D"] + batch,
-                capture_output=True, text=True, timeout=30, cwd=repo_root,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, cwd=repo_root,
             )
         except Exception as e:
             logger.debug("Failed to prune orphaned branches: %s", e)
@@ -3854,6 +3885,28 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
+
+def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Map a ``moa:<preset>`` model string to ``(provider, preset)``.
+
+    Returns ``("moa", "<preset>")`` when *model* selects the MoA virtual
+    provider, otherwise ``(None, model)`` unchanged. This gives non-interactive
+    ``hermes chat -Q -m moa:<preset>`` the same routing the interactive
+    ``/moa`` command and the model picker already use: ``resolve_runtime_provider``
+    handles ``requested_provider == "moa"`` and ``agent_init`` builds the
+    MoAClient off ``provider == "moa"``. Without this the raw ``moa:<preset>``
+    string is sent to the real provider and rejected with a 401/400 "model not
+    supported" (#56828).
+    """
+    if isinstance(model, str):
+        stripped = model.strip()
+        if stripped.lower().startswith("moa:"):
+            preset = stripped.split(":", 1)[1].strip()
+            if preset:
+                return "moa", preset
+    return None, model
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -3984,6 +4037,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _DEFAULT_CONFIG_MODEL = ""
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
+        # A ``moa:<preset>`` model string selects the MoA virtual provider in
+        # one shot (parity with interactive ``/moa`` and the model picker). Do
+        # this before provider resolution so ``-Q -m moa:<preset>`` routes
+        # through MoA instead of hitting the real provider with an unknown
+        # model (#56828). A ``moa:`` prefix wins over an explicit ``--provider``.
+        _moa_provider_override, self.model = _normalize_moa_model(self.model)
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
         if _env_mt:
@@ -4019,7 +4078,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
-            provider
+            _moa_provider_override
+            or provider
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
@@ -9244,6 +9304,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "egress":
+            from hermes_cli.proxy_cli import format_status_text
+
+            self._console_print(format_status_text(), highlight=False, markup=False)
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
@@ -9484,7 +9548,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             from hermes_cli._subprocess_compat import windows_hide_flags
                             result = subprocess.run(
                                 exec_cmd, shell=True, capture_output=True,
-                                text=True, timeout=30, env=sanitized_env,
+                                text=True, encoding="utf-8", errors="replace", timeout=30, env=sanitized_env,
                                 # No console flash on Windows (#56747).
                                 creationflags=windows_hide_flags(),
                             )

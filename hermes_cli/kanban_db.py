@@ -5212,7 +5212,7 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
         # Check if session exists and pane is dead before killing
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         if out.stdout.strip() == "1":
             subprocess.run(
@@ -5947,6 +5947,15 @@ def decompose_triage_task(
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
+            elif child_ws_kind == "worktree":
+                # Never share one worktree checkout between siblings: the
+                # root's literal path would put every child in the same
+                # directory on the first-dispatched sibling's branch, with
+                # no lock — siblings can be promoted and dispatched
+                # concurrently. Leave the path unset so dispatch
+                # materializes a fresh <repo>/.worktrees/<child-id> per
+                # child from the board anchor.
+                child_ws_path = None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
             else:
@@ -6129,7 +6138,7 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6151,7 +6160,7 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "show-ref", "--verify", f"refs/heads/{branch_name}"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6165,7 +6174,7 @@ def _git_common_dir(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6184,7 +6193,7 @@ def _git_dir(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6203,7 +6212,7 @@ def _git_current_branch(path: Path) -> Optional[str]:
         result = subprocess.run(
             ["git", "-C", str(path), "branch", "--show-current"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -6260,7 +6269,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     result = subprocess.run(
         cmd,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         timeout=60,
         check=False,
     )
@@ -6324,6 +6333,24 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        if actual_branch == branch_name:
+            return requested_resolved, actual_branch
+        # The requested path is an existing checkout of a DIFFERENT
+        # task's branch. Decompose children inherit the root's
+        # workspace_path verbatim, so siblings all point here; reusing
+        # the checkout as-is would run this task on the other task's
+        # branch — silent cross-task provenance corruption, and unsafe
+        # when siblings run concurrently. Fall back to a fresh worktree
+        # of our own under the same repo.
+        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        if fallback_root is not None:
+            fallback = fallback_root / ".worktrees" / task.id
+            if fallback.resolve(strict=False) != requested_resolved:
+                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                return fallback.resolve(strict=False), branch_name
+        # No repo to anchor a fallback on (or the occupied path IS this
+        # task's own canonical worktree): keep the legacy reuse rather
+        # than failing dispatch.
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
@@ -6738,7 +6765,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 ["ps", "-o", "stat=", "-p", str(int(pid))],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=1,
                 check=False,
             )

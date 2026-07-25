@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
+import type { SessionMessage } from '@/types/hermes'
+
 import type { ChatMessage, ChatMessagePart } from './chat-messages'
 import {
   appendAssistantTextPart,
@@ -157,6 +159,63 @@ describe('toChatMessages', () => {
     ])
 
     expect(chatMessageText(message)).toBe('@file:foo.ts\n\nlook')
+  })
+
+  it('projects durable timeline kinds without inspecting their text', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'real user turn', timestamp: 1 },
+      { role: 'assistant', content: 'real assistant reply', timestamp: 2 },
+      {
+        role: 'user',
+        content: 'opaque compaction payload',
+        display_kind: 'hidden',
+        timestamp: 3
+      },
+      {
+        role: 'user',
+        content: 'opaque model context payload',
+        display_kind: 'model_switch',
+        timestamp: 4
+      },
+      {
+        role: 'user',
+        content: 'opaque delegation context payload',
+        display_kind: 'async_delegation_complete',
+        timestamp: 5
+      }
+    ])
+
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system'])
+    expect(messages.map(chatMessageText)).toEqual([
+      'real user turn',
+      'real assistant reply',
+      'model changed',
+      'background agent work finished'
+    ])
+  })
+
+  // A backend older than this app serves display_metadata as unparsed JSON
+  // text. Indexing into that string used to throw and fail the whole resume.
+  it.each([
+    ['an object', { delegation_id: 'deleg_1', task_count: 2 }, '2 background agents finished'],
+    ['JSON text', JSON.stringify({ delegation_id: 'deleg_1', task_count: 1 }), '1 background agent finished'],
+    ['unparseable text', '{not-json', 'background agent work finished'],
+    ['text that is not an object', '"deleg_1"', 'background agent work finished'],
+    ['a missing task count', { delegation_id: 'deleg_1' }, 'background agent work finished']
+  ])('labels a delegation event given %s', (_case, displayMetadata, expected) => {
+    const read = () =>
+      toChatMessages([
+        {
+          role: 'user',
+          content: 'opaque delegation context payload',
+          display_kind: 'async_delegation_complete',
+          display_metadata: displayMetadata as SessionMessage['display_metadata'],
+          timestamp: 1
+        }
+      ])
+
+    expect(read).not.toThrow()
+    expect(chatMessageText(read()[0])).toBe(expected)
   })
 })
 

@@ -94,6 +94,10 @@ export type GatewayEventPayload = {
   label?: string
   index?: number
   aggregator?: string
+  // moa.progress / moa.phase (Mixture of Agents fan-out progress relay)
+  refs_done?: number
+  refs_total?: number
+  phase?: string
   // message.complete — signals the final text was already previewed via
   // interim_assistant_callback, so the UI can settle instead of duplicating.
   response_previewed?: boolean
@@ -301,6 +305,48 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   const refs = [...new Set(Array.from(attachedContext.matchAll(CONTEXT_REF_RE)).map(match => match[0]))]
 
   return [refs.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
+}
+
+function transcriptContent(displayKind: SessionMessage['display_kind'], content: string): string | null {
+  return displayKind === 'hidden' ? null : content
+}
+
+// A remote backend older than this app serves display_metadata as raw JSON text,
+// and `in` throws on a primitive — which used to fail the whole session resume.
+function timelineTaskCount(metadata: SessionMessage['display_metadata']): number | undefined {
+  let parsed: unknown = metadata
+
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed)
+    } catch {
+      return undefined
+    }
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    return undefined
+  }
+
+  const count = (parsed as { task_count?: unknown }).task_count
+
+  return typeof count === 'number' ? count : undefined
+}
+
+function timelineDisplayContent(message: SessionMessage, content: string): string {
+  if (message.display_kind === 'model_switch') {
+    return 'model changed'
+  }
+
+  if (message.display_kind === 'async_delegation_complete') {
+    const count = timelineTaskCount(message.display_metadata)
+
+    return count === undefined
+      ? 'background agent work finished'
+      : `${count} background agent${count === 1 ? '' : 's'} finished`
+  }
+
+  return content
 }
 
 const STREAM_PART: Record<'reasoning' | 'text', (text: string) => ChatMessagePart> = {
@@ -884,7 +930,17 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const content = message.content || message.text || message.context || message.name
-    const displayContent = displayContentForMessage(message.role, content)
+
+    const displayContent = transcriptContent(
+      message.display_kind,
+      timelineDisplayContent(message, displayContentForMessage(message.role, content))
+    )
+
+    const displayRole =
+      message.display_kind === 'model_switch' || message.display_kind === 'async_delegation_complete'
+        ? 'system'
+        : message.role
+
     const parts: ChatMessagePart[] = []
 
     const reasoning =
@@ -897,7 +953,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     if (displayContent) {
-      parts.push(message.role === 'assistant' ? assistantTextPart(displayContent) : textPart(displayContent))
+      parts.push(displayRole === 'assistant' ? assistantTextPart(displayContent) : textPart(displayContent))
     }
 
     if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
@@ -951,8 +1007,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     result.push({
-      id: `${message.timestamp || Date.now()}-${index}-${message.role}`,
-      role: message.role,
+      id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
+      role: displayRole,
       parts,
       timestamp: message.timestamp
     })
