@@ -232,6 +232,11 @@ def _clamp_trust(value: float) -> float:
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring."""
 
+    # Exposed so a test can assert it is NOT relying on the stopword list when it
+    # means to test the sentence-position guard. Those two rejections overlap, and
+    # a test that confuses them passes against a broken pattern.
+    _ENTITY_STOPWORDS_FOR_TEST = _ENTITY_STOPWORDS
+
     # --- Process-wide shared connection registry -------------------------
     # SQLite permits only one writer at a time. Each MemoryStore instance used
     # to open its own connection guarded by its own RLock, so the several

@@ -357,7 +357,11 @@ def test_a_query_of_pure_punctuation_matches_nothing_without_raising(store, retr
     for pathological in ("*", "AND", "()", "---", "+"):
         assert FactRetriever._sanitize_fts_query(pathological) == '""', \
             f"{pathological!r} must sanitise to a matchless phrase"
-        assert retriever.search(pathological, limit=5) == [] or True  # must not raise
+        # `== [] or True` was here, which can never fail. What actually matters is
+        # that the call does not RAISE, so assert the type and let an exception be
+        # the failure.
+        assert isinstance(retriever.search(pathological, limit=5), list), \
+            f"{pathological!r} must return a list, not raise"
 
 
 def test_hyphen_handling_does_not_break_ordinary_words(store, retriever):
@@ -728,4 +732,82 @@ def test_update_fact_keeps_the_vector_in_step_with_its_links(tmp_path):
     ).fetchone()["hrr_vector"]
     assert stored == hrr_mod.phases_to_bytes(
         hrr_mod.encode_fact("A fact about the router", names, store.hrr_dim))
+    store.close()
+
+
+# ── 11. entity extraction: the change that drove the data migration ─────
+def test_a_single_word_product_name_becomes_an_entity(tmp_path):
+    """_RE_CAPITALIZED demands TWO consecutive capitalised words, so the names this
+    store is mostly ABOUT — "Bedrock", "Claude", "Avell" — were never extracted.
+    Measured consequence: 20 of 104 live facts had no entity at all and were
+    unreachable by probe/reason.
+
+    This change drove an irreversible migration over the live store, and had no
+    behavioural test until this one.
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+    got = store._extract_entities(
+        "Claude runs on Bedrock in us-west-2, verified on the Avell laptop"
+    )
+    lowered = {g.lower() for g in got}
+    for expected in ("bedrock", "avell", "us-west-2"):
+        assert expected in lowered, f"{expected!r} not extracted from {got}"
+    store.close()
+
+
+def test_a_technical_slug_is_captured_whole(tmp_path):
+    """Slugs are the other half of the gap, and an earlier attempt truncated them:
+    \\b matched after a hyphen, turning "us-west-2" into "west-2"."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    got = {g.lower() for g in store._extract_entities(
+        "Route via copilot-acp to gpt-5.6-terra, fallback glm-4.7-flash on z.ai"
+    )}
+    for whole in ("copilot-acp", "gpt-5.6-terra", "glm-4.7-flash", "z.ai"):
+        assert whole in got, f"{whole!r} missing from {sorted(got)}"
+    # And no truncated fragment sneaked in alongside the whole term.
+    assert "west-2" not in got and "terra" not in got, f"truncated: {sorted(got)}"
+    store.close()
+
+
+def test_extraction_refuses_prose_that_merely_looks_like_a_slug(tmp_path):
+    """Hyphenated English compounds share the shape but name nothing. Accepting
+    them polluted the graph: measured 6.5% junk entities on the live store."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    got = {g.lower() for g in store._extract_entities(
+        "The self-hosted, read-only, end-to-end setup is well-known and open-source"
+    )}
+    for prose in ("self-hosted", "read-only", "end-to-end", "well-known", "open-source"):
+        assert prose not in got, f"{prose!r} is prose, not an entity: {sorted(got)}"
+    store.close()
+
+
+def test_a_sentence_initial_capital_is_not_a_name(tmp_path):
+    """Grammatical capitalisation is not a proper noun. Accepting it produced 446
+    one-off junk entities when first tried.
+
+    The words here are deliberately NOT in _ENTITY_STOPWORDS. A first version used
+    "Please"/"Full"/"Todos", which the stopword list already rejects — so the test
+    passed with the position guard removed and proved nothing about it.
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+    for opener in ("Sudden", "Neither", "Whereas", "Consider", "Rather"):
+        assert opener.lower() not in store._ENTITY_STOPWORDS_FOR_TEST, \
+            f"{opener!r} must not be covered by the stopword list, or this proves nothing"
+        got = {g.lower() for g in store._extract_entities(
+            f"{opener} the deploy failed on Bedrock"
+        )}
+        assert opener.lower() not in got, \
+            f"{opener!r} is sentence-initial, not a name: {sorted(got)}"
+        assert "bedrock" in got, "the real name mid-sentence is still captured"
+    store.close()
+
+
+def test_extraction_is_stable_for_the_same_input(tmp_path):
+    """A migration ran this over 104 facts. Non-determinism would mean the graph
+    changes shape on every rebuild."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    text = "Claude Code on Bedrock via copilot-acp, checked on the Avell G1555"
+    first = store._extract_entities(text)
+    for _ in range(5):
+        assert store._extract_entities(text) == first
     store.close()
