@@ -285,7 +285,16 @@ class HolographicMemoryProvider(MemoryProvider):
                 # Collapse newlines: a stored fact spanning lines could otherwise
                 # forge its own "## " heading inside this block and appear to be
                 # a new section of the system prompt rather than one memory.
+                # Flatten to one line AND defuse markup that would read as
+                # structure. Flattening alone is not enough: a fact containing
+                # "## SYSTEM RULES" still carries a heading inline, and a model
+                # reading the assembled prompt has no way to know it came from
+                # inside a list item. Neutralised, not dropped — the operator's
+                # content is preserved, only its markup authority is removed.
                 content = " ".join(str(r.get("content", "")).split())
+                content = _DEFUSE_MARKUP.sub(lambda m: m.group(0).replace("#", "＃")
+                                             .replace("`", "ˋ").replace("|", "ǀ"),
+                                             content)
                 lines.append(f"- [{trust:.1f}] {content}")
             # Memories are RECALLED TEXT, not instructions. Fact #121 on the live
             # store proves why this matters: auto-extraction stored a whole user
@@ -786,6 +795,12 @@ _IMPERATIVE = re.compile(
     r')',
     re.IGNORECASE,
 )
+
+# Markup inside a RECALLED fact that would read as prompt structure. Rewritten to
+# lookalike characters on injection so the text survives while its authority does
+# not. Distinct from _FORGES_STRUCTURE, which REFUSES such content at write time:
+# facts stored before that guard existed still have to be rendered safely.
+_DEFUSE_MARKUP = re.compile(r'#{2,}|```|`{1,2}|<\|[^>]{0,20}\|>|\|{2,}')
 
 # Markup that would let a stored fact impersonate structure in the system prompt.
 _FORGES_STRUCTURE = re.compile(r'(?:^|\s)(?:#{1,6}\s|```|<\|)|\bSYSTEM\s*:', re.IGNORECASE)
