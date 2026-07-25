@@ -811,3 +811,63 @@ def test_extraction_is_stable_for_the_same_input(tmp_path):
     for _ in range(5):
         assert store._extract_entities(text) == first
     store.close()
+
+
+def test_audit_detects_PARTIAL_index_loss_not_just_total(tmp_path):
+    """A single-fact probe was blind to the likelier failure.
+
+    Rows are lost in blocks — a failed batch, an interrupted migration — not all
+    at once. Two bugs made partial loss invisible: the probe sampled one fact, and
+    it matched the TERM rather than the term within THAT fact's row, so one
+    surviving index row satisfied every probe. Deleting 19 of 20 facts from the
+    index still reported healthy=True.
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+    for i in range(20):
+        store.add_fact(f"Distinct fact number {i} about subject-{i}", category="general")
+    assert store.audit()["healthy"] is True
+
+    # Drop every fact but the first from the index.
+    with store._lock:
+        for row in store._conn.execute(
+            "select fact_id, content, tags from facts where fact_id > 1"
+        ).fetchall():
+            store._conn.execute(
+                "INSERT INTO facts_fts(facts_fts, rowid, content, tags)"
+                " VALUES ('delete', ?, ?, ?)",
+                (row["fact_id"], row["content"], row["tags"]),
+            )
+        store._conn.commit()
+
+    report = store.audit()
+    assert report["healthy"] is False, "95% index loss must not read as healthy"
+    assert "not findable" in report["fts_integrity"]
+    assert "rebuild_fts" in report["fts_integrity"], "the report names the repair"
+
+    assert store.rebuild_fts() == "ok"
+    assert store.audit()["healthy"] is True
+    store.close()
+
+
+def test_the_probe_samples_more_than_one_fact(tmp_path):
+    """A fence on the sampling itself: losing only the NEWEST fact from the index
+    is the signature of an interrupted write, and is what an operator most needs
+    to hear about."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    for i in range(12):
+        store.add_fact(f"Fact {i} concerning topic{i} and detail{i}", category="general")
+
+    newest = store._conn.execute("select max(fact_id) from facts").fetchone()[0]
+    with store._lock:
+        row = store._conn.execute(
+            "select fact_id, content, tags from facts where fact_id = ?", (newest,)
+        ).fetchone()
+        store._conn.execute(
+            "INSERT INTO facts_fts(facts_fts, rowid, content, tags) VALUES ('delete', ?, ?, ?)",
+            (row["fact_id"], row["content"], row["tags"]),
+        )
+        store._conn.commit()
+
+    assert store.audit()["healthy"] is False, \
+        "the most recent memory going missing from the index must be reported"
+    store.close()

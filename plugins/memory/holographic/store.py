@@ -92,6 +92,9 @@ _UNHELPFUL_DELTA = -0.10
 # Deliberate removal is unaffected: remove_fact() deletes, and update_fact() can
 # still drive trust to 0.0 explicitly via trust_delta.
 _TRUST_FEEDBACK_MIN = 0.3
+# How many facts audit() probes for lexical recall. One was not enough: with a
+# single probe, destroying 19 of 20 facts' index rows still reported healthy.
+_FTS_PROBE_SAMPLES = 8
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
@@ -796,7 +799,7 @@ class MemoryStore:
             }
 
     def _probe_fts_recall(self, fact_count: int) -> str:
-        """Confirm the index can still find a term the corpus definitely contains.
+        """Confirm the index can still find terms the corpus definitely contains.
 
         Returns "ok", or a description of the failure. Caller holds the lock.
 
@@ -804,30 +807,55 @@ class MemoryStore:
         integrity-check passes while every search silently returns nothing — the
         exact failure that made audit() report healthy=True on a store that had
         lost all lexical recall.
+
+        SAMPLES SEVERAL FACTS, not one. A single-fact probe was blind to partial
+        desync: deleting 19 of 20 facts' index rows while leaving the probe target
+        intact still reported healthy=True. Spread the sample across the id range,
+        because rows are usually lost in blocks (a failed batch, an interrupted
+        migration), not at random.
         """
         if fact_count == 0:
             return "ok"  # nothing to find; not a fault
-        row = self._conn.execute(
-            "SELECT content FROM facts WHERE content <> '' ORDER BY fact_id LIMIT 1"
-        ).fetchone()
-        if row is None:
+        rows = self._conn.execute(
+            "SELECT fact_id, content FROM facts WHERE content <> ''"
+            # Spread over the id range: first, last and a few in between.
+            " ORDER BY fact_id"
+        ).fetchall()
+        if not rows:
             return "ok"
-        # A single alphanumeric word, long enough to survive tokenisation.
-        words = [w for w in re.findall(r"[A-Za-z0-9]{4,}", row["content"] or "")]
-        if not words:
-            return "ok"  # cannot form a probe; do not cry wolf
-        try:
-            hits = self._conn.execute(
-                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?",
-                (f'"{words[0].lower()}"',),
-            ).fetchone()[0]
-        except sqlite3.Error as exc:
-            return f"probe query failed: {exc}"
-        if hits == 0:
-            return (
-                f"index does not match {words[0]!r}, a term present in fact"
-                f" {row['content'][:40]!r} — run rebuild_fts()"
-            )
+        step = max(1, len(rows) // _FTS_PROBE_SAMPLES)
+        sample = rows[::step][:_FTS_PROBE_SAMPLES]
+        # Always include the newest fact: an interrupted write leaves the tail
+        # unindexed, and that is the most recent thing the agent learned.
+        if rows[-1] not in sample:
+            sample.append(rows[-1])
+
+        checked = 0
+        for row in sample:
+            words = re.findall(r"[A-Za-z0-9]{4,}", row["content"] or "")
+            if not words:
+                continue  # cannot form a probe from this fact; do not cry wolf
+            checked += 1
+            try:
+                # Constrain to THIS fact's rowid. Matching the term alone was
+                # useless: the first long word is usually shared across facts, so
+                # one surviving index row satisfied every probe — 19 of 20 facts
+                # could be missing and the audit still passed.
+                hits = self._conn.execute(
+                    "SELECT COUNT(*) FROM facts_fts"
+                    " WHERE facts_fts MATCH ? AND rowid = ?",
+                    (f'"{words[0].lower()}"', row["fact_id"]),
+                ).fetchone()[0]
+            except sqlite3.Error as exc:
+                return f"probe query failed: {exc}"
+            if hits == 0:
+                return (
+                    f"fact {row['fact_id']} is not findable by {words[0]!r}, a term"
+                    f" in its own content — the index is out of sync with"
+                    f" {len(rows)} facts; run rebuild_fts()"
+                )
+        if checked == 0:
+            return "ok"  # no probeable content anywhere
         return "ok"
 
     def rebuild_fts(self) -> str:
