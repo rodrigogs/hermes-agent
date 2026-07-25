@@ -121,6 +121,10 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        # Count what was actually served. This is the ONLY live retrieval path,
+        # so if it does not record use, retrieval_count stays zero forever and a
+        # never-once-useful memory is indistinguishable from a load-bearing one.
+        self.store.record_retrievals([f["fact_id"] for f in results if f.get("fact_id")])
         return results
 
     def probe(
@@ -440,11 +444,19 @@ class FactRetriever:
             try:
                 rows = conn.execute(sql, params).fetchall()
             except Exception:
-                # FTS5 MATCH can fail on malformed queries — fall back to empty
-                return []
+                # A malformed MATCH must not silently erase the memory: FTS5
+                # rejects bare operators ("AND", "*", "a-b OR c"), which a human
+                # types often. Scan instead of giving up.
+                rows = []
 
         if not rows:
-            return []
+            # FTS is lexical: it only finds a fact whose stored WORDS overlap the
+            # query. Ask "how do I reach the Oracle machine" and every candidate
+            # is dropped when the facts say "araponga"/"ssh" instead — measured
+            # on the live store, that query returned zero of 104 facts. Falling
+            # through to a token scan keeps a vocabulary mismatch from reading
+            # as "the agent knows nothing about this".
+            return self._scan_candidates(query, category, min_trust, limit)
 
         # Normalize FTS5 rank: rank is negative, lower = better
         # Convert to positive score in [0, 1] range
@@ -460,6 +472,90 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    # Minimum Jaccard for the fallback to call a fact a candidate. Low enough
+    # that a short query against a long fact still matches (a 4-token question
+    # against a 40-token fact tops out near 0.1), high enough to reject a single
+    # incidental word in common.
+    _SCAN_MIN_OVERLAP = 0.04
+
+    def _scan_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Last-resort candidate pass when FTS5 yields nothing.
+
+        Deliberately dumb and bounded: pull the eligible facts and rank them by
+        token overlap in Python. At the scale this store actually operates
+        (hundreds to low thousands of facts) that costs microseconds, and it is
+        the difference between "no memory matched your words" and "no memory
+        exists". Candidates come back with ``fts_rank`` at 0.0, so the caller's
+        scoring is driven by Jaccard and HRR — the FTS term contributes nothing
+        it did not earn.
+        """
+        params: list = []
+        where = ["trust_score >= ?"]
+        params.append(min_trust)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        sql = (
+            "SELECT * FROM facts WHERE " + " AND ".join(where)
+            # Cap the scan so a pathological store cannot stall a turn; newest
+            # first, because a fact the agent learned recently is the likelier
+            # answer when nothing matched lexically.
+            + " ORDER BY updated_at DESC, fact_id DESC LIMIT ?"
+        )
+        params.append(max(limit * 20, 200))
+
+        with self.store._lock:
+            try:
+                rows = self.store._conn.execute(sql, params).fetchall()
+            except Exception:
+                return []
+
+        # Stopwords must not be evidence. Matching on "the"/"do"/"and" made this
+        # fallback surface whatever fact happened to contain a function word —
+        # measured: "how do I reach the Oracle machine" returned a note about
+        # Python formatting, matched on {"i", "the"}. Noise the model then trusts
+        # is worse than an honest miss.
+        query_tokens = {t for t in self._tokenize(query) if t not in self._FTS_STOPWORDS}
+        if not query_tokens:
+            return []
+
+        # A category-centroid tie-breaker was tried here and MEASURED AS HARMFUL:
+        # asking each of the 104 live facts to identify its own category from its
+        # own content, the bundled centroid ranked the true category first only
+        # 3.8% of the time — worse than the 14.3% a uniform guess over 7
+        # categories would score. Bundling hundreds of HRR vectors into one
+        # destroys the signal. So ranking here uses token overlap alone;
+        # store.rank_categories() remains available as a diagnostic, and the
+        # dead-weight of maintaining memory_banks is noted in its docstring.
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            fact = dict(row)
+            fact_tokens = {
+                t for t in self._tokenize(fact.get("content", ""))
+                | self._tokenize(fact.get("tags", ""))
+                if t not in self._FTS_STOPWORDS
+            }
+            shared = query_tokens & fact_tokens
+            if not shared:
+                continue
+            # Require a content word in common, not merely a nonzero Jaccard: a
+            # long fact sharing one incidental token scores above zero yet has
+            # nothing to do with the question.
+            overlap = self._jaccard_similarity(query_tokens, fact_tokens)
+            if overlap < self._SCAN_MIN_OVERLAP:
+                continue
+            fact["fts_rank"] = 0.0
+            scored.append((overlap, fact))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [fact for _, fact in scored[:limit]]
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
@@ -514,24 +610,47 @@ class FactRetriever:
         """
         if not query:
             return ""
-        # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
-        _FTS_SPECIAL = '"()*^:-+'
+        # Strip FTS5 operator characters from EACH token to avoid accidentally
+        # creating a malformed query.
+        #
+        # The hyphen is deliberately NOT in this set. Deleting it turned
+        # "copilot-acp" into "copilotacp", which matches nothing: measured on the
+        # live store, every hyphenated term scored zero — copilot-acp (present in
+        # 9 facts), capability-router (4), gpt-5.6-terra (5), deepseek-v3.2 (2).
+        # Those are precisely the provider, model and plugin names the agent asks
+        # about most, so the single most common class of query could not retrieve
+        # anything. Inside a quoted FTS5 phrase a hyphen is literal, so keeping it
+        # is safe; what is unsafe is a BARE hyphen, which FTS5 reads as NOT.
+        _FTS_SPECIAL = '"()*^:+'
         tokens: list[str] = []
+        seen: set[str] = set()
+
+        def push(term: str) -> None:
+            if len(term) < 2 or term in cls._FTS_STOPWORDS or term in seen:
+                return
+            seen.add(term)
+            # Phrase-literal so no special char can escape as an operator.
+            tokens.append(f'"{term}"')
+
         for raw in query.lower().split():
-            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
+            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
                 str.maketrans("", "", _FTS_SPECIAL)
             )
-            if len(cleaned) < 2:
+            # A stray leading/trailing hyphen is punctuation, not part of a name.
+            cleaned = cleaned.strip("-")
+            if not cleaned:
                 continue
-            if cleaned in cls._FTS_STOPWORDS:
-                continue
-            # FTS5 phrase-literal each token to ensure no special chars
-            # sneak through as operators.
-            tokens.append(f'"{cleaned}"')
+            push(cleaned)
+            if "-" in cleaned:
+                # Also offer the components: the tokenizer may have indexed
+                # "capability" and "router" separately, and either should hit.
+                for part in cleaned.split("-"):
+                    push(part)
         if not tokens:
-            # Fallback: raw query (likely returns 0, but never crashes)
-            return query
+            # Nothing survived (pure punctuation, or all stopwords). Returning the
+            # raw query here used to raise OperationalError on ordinary input like
+            # "AND" or "*"; an empty phrase matches nothing and never throws.
+            return '""'
         return " OR ".join(tokens)
 
     @staticmethod

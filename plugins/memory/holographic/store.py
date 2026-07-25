@@ -79,11 +79,53 @@ CREATE TABLE IF NOT EXISTS memory_banks (
 # Trust adjustment constants
 _HELPFUL_DELTA   =  0.05
 _UNHELPFUL_DELTA = -0.10
+# Feedback-driven trust bottoms out here rather than at 0.0.
+#
+# Retrieval filters at min_trust=0.3 by default, so three downvotes took a fact
+# from 0.5 to 0.2 and it was never served again — and a fact that is never served
+# can never be upvoted back. That is a one-way trap: an honest correction of a
+# once-wrong memory permanently deleted it from recall while leaving the row on
+# disk, so nobody could see what had been lost. The floor keeps a distrusted fact
+# reachable (it still ranks last, since score scales with trust) so the trap
+# becomes a demotion.
+#
+# Deliberate removal is unaffected: remove_fact() deletes, and update_fact() can
+# still drive trust to 0.0 explicitly via trust_delta.
+_TRUST_FEEDBACK_MIN = 0.3
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+# A single capitalised word, but NOT at the start of a sentence or line — that
+# position is grammatical capitalisation, not a name, and accepting it produced
+# 446 one-off junk entities ("Full", "Keep", "Please", "Todos") on the live
+# store. Requiring a preceding word means "on Bedrock" is captured while
+# "Bedrock (Mac, ...)" at position 0 is left to the other patterns.
+_RE_PROPER_NOUN  = re.compile(r'(?<=[a-z,;)]\s)([A-Z][a-z]{2,})\b')
+# Technical identifiers the agent is asked about by name: copilot-acp,
+# gpt-5.6-terra, us-west-2, glm-4.7-flash, hermes-delegate-profile, z.ai.
+# Captures the WHOLE dotted/hyphenated run — an earlier attempt let \b match
+# after a hyphen and truncated "us-west-2" to "west-2", "glm-4.7-flash" to
+# "glm-4.7".
+_RE_SLUG = re.compile(r'(?<![\w.-])([a-z][a-z0-9]*(?:[-.][a-z0-9]+)+)(?![\w-])')
+
+# Hyphenated English compounds share the slug SHAPE but name no entity. A
+# heuristic (digit present, part count, dot count) was tried and misjudged in
+# both directions — it rejected "openai-codex" and accepted "read-only" — so the
+# distinction is drawn explicitly. Anything unlisted is treated as a name, which
+# is the right default for a store whose subject IS technical identifiers.
+_SLUG_STOPWORDS = frozenset({
+    "self-hosted", "self-host", "zero-key", "end-to-end", "access-verified",
+    "high-volume", "family-estimated", "best-value", "not-trust",
+    "do-not-trust", "evidence-based", "always-in-context", "last-resort",
+    "read-only", "write-only", "host-key", "ff-only", "up-to-date",
+    "out-of-date", "brave-free", "well-known", "free-models-per-day",
+    "case-insensitive", "cross-platform", "open-source", "real-time",
+    "per-day", "per-turn", "per-call", "one-way", "two-way", "built-in",
+    "opt-in", "opt-out", "fail-closed", "fail-open", "read-write",
+    "auto-extraction", "in-context", "non-claude", "e2e",
+})
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 _RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
 _RE_AKA          = re.compile(
@@ -102,6 +144,14 @@ _ENTITY_STOPWORDS = frozenset({
     "pass", "fail", "done", "todo", "fixme", "warning", "error", "info",
     "started", "stopped", "enabled", "disabled", "blocked", "suspicious",
     "protocol", "gateway", "gate", "unknown", "windows", "linux", "mac",
+    # Fragments of multi-word names the single-word pattern also matches:
+    # "Claude Code" yields "Code", "Hermes One" yields "One". Both are captured
+    # whole by _RE_CAPITALIZED, so the fragment is a duplicate that splits one
+    # entity's facts across two nodes. Measured on the live store: "Code" 14
+    # facts and "one" 11, shadowing "Claude Code" and "Hermes One".
+    "code", "one", "two", "web", "full", "keep", "final", "other", "only",
+    "canonical", "highest", "cost", "please", "commit", "patches", "discovery",
+    "config", "detalhes", "busca", "todos", "zerar", "teste", "fluxo", "limite",
 })
 # Shell / command noise: if a quoted term looks like a command line or
 # contains shell metacharacters, it's not an entity. NOTE: does NOT reject
@@ -124,6 +174,9 @@ def _is_valid_entity(name: str) -> bool:
     low = n.lower()
     # a comma anywhere -> sentence fragment, not an entity ("Wait, thats ...")
     if "," in n:
+        return False
+    # Hyphenated English compounds look like slugs but name nothing.
+    if low in _SLUG_STOPWORDS:
         return False
     # strip surrounding punctuation from each word before stopword checks
     words = [re.sub(r"^[\W_]+|[\W_]+$", "", w) for w in low.split()]
@@ -319,6 +372,13 @@ class MemoryStore:
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
+            # Inside the atomic group ON PURPOSE. A failure here rolls the whole
+            # write back, and that is correct: a fact stored without its entity
+            # links or HRR vector is a half-written memory, and the existing suite
+            # pins this (test_failed_add_rolls_back_fact_entities_and_vector uses
+            # a failing bank as its atomicity canary). Making it best-effort was
+            # tried and reverted — it traded a strong consistency guarantee for a
+            # weaker durability one and left the store quietly inconsistent.
             self._rebuild_bank(category)
 
             return fact_id
@@ -380,6 +440,87 @@ class MemoryStore:
                 self._commit_if_needed()
 
             return results
+
+    def rank_categories(self, query: str, dim: int | None = None) -> list[tuple[str, float]]:
+        """Rank categories by how much a query resembles each one's centroid.
+
+        ``memory_banks`` holds one bundled HRR vector per category, rebuilt on
+        every write — 66% of add_fact's time, measured.
+
+        MEASURED QUALITY, so nobody has to guess: asking each of 104 real facts
+        to identify its own category from its own content, this ranked the true
+        category first 3.8% of the time, against 14.3% for a uniform guess over
+        7 categories. Bundling hundreds of HRR vectors into a single superposition
+        destroys the signal. It is therefore NOT used to influence retrieval; it
+        is kept as a diagnostic, and the write cost it imposes is a standing
+        argument for either raising hrr_dim or dropping the banks entirely.
+
+        Returns ``(category, similarity)`` best-first, or [] when HRR is
+        unavailable or no bank exists. Never raises: a ranking hint that fails
+        must degrade to "no hint", not break retrieval.
+        """
+        if not self._hrr_available or not query:
+            return []
+        dim = dim or self.hrr_dim
+        try:
+            query_vec = hrr.encode_text(query, dim)
+        except Exception:
+            return []
+
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT bank_name, vector, dim FROM memory_banks"
+                ).fetchall()
+            except sqlite3.Error:
+                return []
+
+        ranked: list[tuple[str, float]] = []
+        for row in rows:
+            # A bank built at a different dimension cannot be compared; skip it
+            # rather than producing a meaningless number.
+            if row["dim"] != dim:
+                continue
+            name = str(row["bank_name"] or "")
+            category = name[4:] if name.startswith("cat:") else name
+            try:
+                sim = hrr.similarity(query_vec, hrr.bytes_to_phases(row["vector"]))
+            except Exception:
+                continue
+            ranked.append((category, float(sim)))
+
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        return ranked
+
+    def record_retrievals(self, fact_ids: list[int]) -> None:
+        """Count that these facts were actually served to the model.
+
+        ``search_facts`` already did this, but nothing calls it: live retrieval
+        goes through ``HybridRetriever``, which issues its own SELECT. The result
+        was a usage column that stayed at zero (3 of 104 facts on the live store)
+        while the agent retrieved on every turn — so nobody could tell a
+        load-bearing memory from one that has never once been useful.
+
+        Best-effort by design: failing to count a retrieval must never break the
+        turn that was about to use the memory.
+        """
+        if not fact_ids:
+            return
+        ids = [int(f) for f in fact_ids]
+        placeholders = ",".join("?" * len(ids))
+        with self._lock:
+            try:
+                self._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1"
+                    f" WHERE fact_id IN ({placeholders})",
+                    ids,
+                )
+                self._commit_if_needed()
+            except sqlite3.Error:
+                # This module has no logger; swallowing is correct here because
+                # the count is telemetry, not the memory itself. Losing a count
+                # is invisible; failing the turn would not be.
+                pass
 
     def update_fact(
         self,
@@ -634,6 +775,12 @@ class MemoryStore:
             old_trust: float = row["trust_score"]
             delta = _HELPFUL_DELTA if helpful else _UNHELPFUL_DELTA
             new_trust = _clamp_trust(old_trust + delta)
+            # Downvotes demote, they do not delete. Never push a fact below the
+            # retrieval floor, or it can never be served again and so can never
+            # earn its trust back. A fact already below the floor (set explicitly,
+            # or by an older build) is left where it is rather than promoted.
+            if not helpful and old_trust >= _TRUST_FEEDBACK_MIN:
+                new_trust = max(new_trust, _TRUST_FEEDBACK_MIN)
 
             helpful_increment = 1 if helpful else 0
             self._conn.execute(
@@ -763,6 +910,22 @@ class MemoryStore:
                 candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
+            _add(m.group(1))
+
+        # A one-word proper noun is still a proper noun. _RE_CAPITALIZED demands
+        # TWO consecutive capitalised words, so "Bedrock", "Claude", "Avell",
+        # "Hermes" — the entities this store is mostly ABOUT — were never
+        # extracted. Measured: 20 of 104 facts had no entity at all, and every
+        # one of them named a single-word product or vendor. _is_valid_entity
+        # already rejects sentence-initial verbs and status words, so this is
+        # generous at the pattern and strict at the filter.
+        for m in _RE_PROPER_NOUN.finditer(text):
+            _add(m.group(1))
+
+        # Technical slugs are the other half of the gap: copilot-acp, us-west-2,
+        # glm-4.7-flash, gpt-5.6-terra. These are the names the agent is asked
+        # about most, and no pattern saw them.
+        for m in _RE_SLUG.finditer(text):
             _add(m.group(1))
 
         for m in _RE_DOUBLE_QUOTE.finditer(text):
