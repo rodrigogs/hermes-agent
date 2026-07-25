@@ -1001,3 +1001,65 @@ def test_audit_does_not_modify_the_database(tmp_path):
     store.close()
 
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before, "audit() mutated the store"
+
+
+# ── 14. the fallback must not throw away the answer it exists to find ───
+def test_the_scan_finds_an_old_match_in_a_large_store(tmp_path):
+    """The cap defeated the fallback's whole purpose.
+
+    _scan_candidates pulled "newest 200" and ranked those. With 301 facts where the
+    ONLY match was the oldest, it returned nothing — so a fact the agent had was
+    unreachable, which is exactly the failure the fallback was added to prevent.
+    Narrowing in SQL first makes the cap bound the CANDIDATES, not the corpus.
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("The unique zebra quokka fact", category="general")
+    for i in range(300):
+        store.add_fact(f"Filler fact {i} about padding and noise{i}", category="general")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    found = retriever._scan_candidates("zebra quokka", None, 0.0, 5)
+
+    assert found, "the only matching fact was older than the scan cap and got dropped"
+    assert "zebra quokka" in found[0]["content"]
+    store.close()
+
+
+def test_the_scan_is_still_bounded(tmp_path):
+    """The prefilter must not turn the fallback into a full-corpus rank."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    for i in range(400):
+        store.add_fact(f"Fact {i} mentioning padding everywhere", category="general")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    start = time.perf_counter()
+    got = retriever._scan_candidates("padding everywhere", None, 0.0, 5)
+    elapsed = time.perf_counter() - start
+
+    assert len(got) <= 5, "it still honours the caller's limit"
+    assert elapsed < 1.0, f"scan took {elapsed:.2f}s on 400 facts"
+    store.close()
+
+
+def test_a_query_of_only_stopwords_matches_nothing_in_the_scan(tmp_path):
+    """Matching on "the"/"and" made the fallback surface whatever fact happened to
+    contain a function word — noise the model then trusts."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("I prefer the python code with the black formatter",
+                   category="user_pref")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    assert retriever._scan_candidates("the and of with", None, 0.0, 5) == []
+    store.close()
+
+
+def test_a_nul_byte_in_a_query_does_not_raise(tmp_path):
+    """FTS5 rejects a NUL, and the sanitizer passes it through inside the phrase."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("A fact about routing", category="general")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    for hostile in ("rout\x00ing", "\x00", "a\x00b"):
+        assert isinstance(retriever.search(hostile, limit=3), list), \
+            f"{hostile!r} must not raise"
+    store.close()

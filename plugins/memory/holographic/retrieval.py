@@ -479,6 +479,10 @@ class FactRetriever:
     # incidental word in common.
     _SCAN_MIN_OVERLAP = 0.04
 
+    # Longest query tokens used for the SQL prefilter. Bounded so a rambling
+    # question cannot build a 40-clause OR.
+    _SCAN_MAX_TOKENS = 6
+
     def _scan_candidates(
         self,
         query: str,
@@ -502,11 +506,24 @@ class FactRetriever:
         if category:
             where.append("category = ?")
             params.append(category)
+        # Narrow in SQL FIRST, then cap. Capping a plain "newest 200" scan threw
+        # away the answer: with 301 facts where the ONLY match was the oldest, the
+        # fallback returned nothing — defeating the entire reason it exists. A LIKE
+        # over each query token is a coarse prefilter (SQLite has no index for it,
+        # but this only runs when FTS already found nothing), after which the cap
+        # bounds the number of CANDIDATES rather than truncating the corpus.
+        tokens = sorted(
+            {t for t in self._tokenize(query) if t not in self._FTS_STOPWORDS},
+            key=len, reverse=True,
+        )[: self._SCAN_MAX_TOKENS]
+        if tokens:
+            where.append("(" + " OR ".join("lower(content) LIKE ?" for _ in tokens)
+                         + " OR " + " OR ".join("lower(tags) LIKE ?" for _ in tokens) + ")")
+            params.extend([f"%{t}%" for t in tokens] * 2)
         sql = (
             "SELECT * FROM facts WHERE " + " AND ".join(where)
-            # Cap the scan so a pathological store cannot stall a turn; newest
-            # first, because a fact the agent learned recently is the likelier
-            # answer when nothing matched lexically.
+            # Newest first: when several facts match, a recent one is the likelier
+            # answer. The cap is a stall guard, not a filter.
             + " ORDER BY updated_at DESC, fact_id DESC LIMIT ?"
         )
         params.append(max(limit * 20, 200))
