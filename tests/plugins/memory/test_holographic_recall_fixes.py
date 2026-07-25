@@ -20,6 +20,7 @@ Two defects, both measured on the live 104-fact store before fixing:
 from __future__ import annotations
 
 import sqlite3
+import time
 
 import pytest
 
@@ -871,3 +872,132 @@ def test_the_probe_samples_more_than_one_fact(tmp_path):
     assert store.audit()["healthy"] is False, \
         "the most recent memory going missing from the index must be reported"
     store.close()
+
+
+# ── 12. the counter must never cost a turn ──────────────────────────────
+def test_counting_never_waits_for_a_writer_in_ANOTHER_process(tmp_path):
+    """The regression this pins was mine, and it was the worst one.
+
+    Adding record_retrievals() to search() turned the prefetch path — a pure read,
+    which in WAL mode is never blocked — into a WRITE, which is. Measured with one
+    concurrent add_fact process: a prefetch-shaped search went from 2.7ms to
+    10020ms (the whole busy_timeout) and then swallowed the error, so the count it
+    waited ten seconds for was not even recorded.
+
+    The contention that matters is CROSS-PROCESS: the store's lock is an RLock, so
+    a same-thread acquire always succeeds and proves nothing. The real defence is
+    busy_timeout=0 on the counter's own statement.
+    """
+    db = tmp_path / "memory_store.db"
+    store = MemoryStore(db)
+    fact_id = store.add_fact("A fact worth serving", category="general")
+
+    # A second connection holding a write transaction, exactly as _atomic() does.
+    blocker = sqlite3.connect(db, timeout=0.1)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("UPDATE facts SET tags = 'held' WHERE fact_id = ?", (fact_id,))
+    try:
+        start = time.perf_counter()
+        store.record_retrievals([fact_id])
+        elapsed = time.perf_counter() - start
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert elapsed < 0.5, \
+        f"the counter waited {elapsed:.2f}s behind another process's writer"
+    store.close()
+
+
+def test_a_search_does_not_stall_behind_a_concurrent_writer(tmp_path):
+    """The property an operator actually feels: the turn does not hang."""
+    db = tmp_path / "memory_store.db"
+    store = MemoryStore(db)
+    for i in range(10):
+        store.add_fact(f"Seed fact {i} about routing topic{i}", category="general")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    blocker = sqlite3.connect(db, timeout=0.1)
+    blocker.execute("BEGIN IMMEDIATE")
+    blocker.execute("UPDATE facts SET tags = 'held' WHERE fact_id = 1")
+    try:
+        start = time.perf_counter()
+        hits = retriever.search("routing topic", limit=5)
+        elapsed = time.perf_counter() - start
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert hits, "the memory must still be served"
+    assert elapsed < 1.0, f"prefetch stalled {elapsed:.2f}s while a writer held the lock"
+    store.close()
+
+
+def test_counting_still_happens_when_the_lock_is_free(tmp_path):
+    """Non-blocking must not mean never-counting."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    fact_id = store.add_fact("The router sidecar listens on port 8791", category="tool")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    for _ in range(3):
+        retriever.search("router sidecar port", limit=5)
+
+    assert usage(store, fact_id) == 3
+    store.close()
+
+
+def test_the_counter_restores_the_busy_timeout_it_borrowed(tmp_path):
+    """It sets busy_timeout=0 for its own UPDATE. Leaving that in place would make
+    every LATER write fail instantly instead of waiting — a far worse bug than the
+    one being fixed."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    fact_id = store.add_fact("A fact", category="general")
+
+    store.record_retrievals([fact_id])
+
+    timeout = store._conn.execute("pragma busy_timeout").fetchone()[0]
+    assert timeout == 10000, f"busy_timeout left at {timeout}"
+    # And an ordinary write still works afterwards.
+    assert store.add_fact("A later fact", category="general")
+    store.close()
+
+
+# ── 13. the health probe must speak the operator's language ─────────────
+def test_audit_does_not_cry_wolf_over_accented_content(tmp_path):
+    """[A-Za-z0-9]{4,} truncated at the first accent, so "Coração" yielded the
+    fragment "Cora" — not a token in the index — and audit() reported a perfectly
+    healthy Portuguese store as desynced, demanding a rebuild that could not clear
+    it. This store is full of Portuguese."""
+    for content in (
+        "Coração é o nome do servidor de produção",
+        "Configuração do gateway está pronta",
+        "Der Straße server läuft",
+        "Sessão carrega muito mais rápido agora",
+    ):
+        store = MemoryStore(tmp_path / f"{abs(hash(content))}.db")
+        store.add_fact(content, category="general")
+        report = store.audit()
+        assert report["healthy"] is True, \
+            f"false alarm on {content[:30]!r}: {report['fts_integrity']}"
+        store.close()
+
+
+def test_audit_does_not_modify_the_database(tmp_path):
+    """audit() is a diagnostic. It issues an FTS5 integrity-check command, which
+    needs a writable handle — but it must not change a byte."""
+    import hashlib
+
+    db = tmp_path / "memory_store.db"
+    store = MemoryStore(db)
+    for i in range(5):
+        store.add_fact(f"Fact {i} about subject{i}", category="general")
+    store._conn.execute("pragma wal_checkpoint(TRUNCATE)")
+    store.close()
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+
+    store = MemoryStore(db)
+    assert store.audit()["healthy"] is True
+    store._conn.execute("pragma wal_checkpoint(TRUNCATE)")
+    store.close()
+
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before, "audit() mutated the store"

@@ -542,8 +542,17 @@ class MemoryStore:
         while the agent retrieved on every turn — so nobody could tell a
         load-bearing memory from one that has never once been useful.
 
-        Best-effort by design: failing to count a retrieval must never break the
-        turn that was about to use the memory.
+        Best-effort by design, and NON-BLOCKING. This runs on the prefetch path,
+        which used to be a pure read — and in WAL mode a reader is never blocked by
+        a writer, but a WRITER is. Measured: with one concurrent add_fact process,
+        a prefetch-shaped search went from 2.7ms to 10020ms, the entire
+        busy_timeout, and then swallowed the error so the counter it waited for was
+        never even recorded. Waiting ten seconds to write telemetry, and losing the
+        telemetry anyway, is the worst of both.
+
+        So the counter takes the lock only if it is free, and abandons the count
+        otherwise. A usage statistic is allowed to be approximate; a turn is not
+        allowed to hang.
         """
         if not fact_ids:
             return
@@ -555,24 +564,39 @@ class MemoryStore:
             ids = [int(f) for f in fact_ids]
         except (TypeError, ValueError):
             return
-        # SQLite's default variable limit is 999. Chunk rather than risk a
-        # "too many SQL variables" error on a large result set.
-        with self._lock:
+        # Never queue behind another writer: give up immediately if the in-process
+        # lock is held, and tell SQLite not to wait either.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._conn.execute("PRAGMA busy_timeout = 0")
+            # Chunked: SQLite's variable limit is build-dependent (999 on older
+            # builds, 32766 on 3.53) and a single IN (...) over a large result set
+            # trips "too many SQL variables".
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                self._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1"
+                    f" WHERE fact_id IN ({placeholders})",
+                    chunk,
+                )
+            self._commit_if_needed()
+        except sqlite3.Error:
+            # SQLITE_BUSY lands here now instead of after a ten-second wait. The
+            # count is telemetry, not the memory: losing one is invisible, and
+            # stalling the turn that was about to use the memory is not.
             try:
-                for start in range(0, len(ids), 500):
-                    chunk = ids[start:start + 500]
-                    placeholders = ",".join("?" * len(chunk))
-                    self._conn.execute(
-                        f"UPDATE facts SET retrieval_count = retrieval_count + 1"
-                        f" WHERE fact_id IN ({placeholders})",
-                        chunk,
-                    )
-                self._commit_if_needed()
+                self._conn.rollback()
             except sqlite3.Error:
-                # This module has no logger; swallowing is correct here because
-                # the count is telemetry, not the memory itself. Losing a count
-                # is invisible; failing the turn would not be.
                 pass
+        finally:
+            # Restore the timeout every other caller depends on.
+            try:
+                self._conn.execute("PRAGMA busy_timeout = 10000")
+            except sqlite3.Error:
+                pass
+            self._lock.release()
 
     def update_fact(
         self,
@@ -832,7 +856,13 @@ class MemoryStore:
 
         checked = 0
         for row in sample:
-            words = re.findall(r"[A-Za-z0-9]{4,}", row["content"] or "")
+            # \w with re.UNICODE, NOT [A-Za-z0-9]: the ASCII class truncated at
+            # the first accent, so "Coração" yielded the fragment "Cora", which is
+            # not a token in the index — and audit() then reported a perfectly
+            # healthy Portuguese store as desynced and demanded a rebuild that
+            # could not clear it. This store is full of Portuguese.
+            words = [w for w in re.findall(r"[^\W\d_]{4,}|\w{4,}", row["content"] or "",
+                                           re.UNICODE)]
             if not words:
                 continue  # cannot form a probe from this fact; do not cry wolf
             checked += 1
