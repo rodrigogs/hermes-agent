@@ -585,3 +585,80 @@ def test_an_apostrophe_does_not_forge_an_entity(tmp_path):
     # A genuine single-quoted term is still captured.
     assert "pytest" in store._extract_entities("Run 'pytest' before pushing")
     store.close()
+
+
+# ── 9. telemetry and extraction must not be able to hurt a turn ─────────
+def test_a_malformed_fact_id_does_not_kill_the_retrieval(tmp_path):
+    """record_retrievals promises to be best-effort, but int(None) raises
+    TypeError and int("x") raises ValueError — neither is a sqlite3.Error, so the
+    coercion sat OUTSIDE the guard and a malformed id would have propagated out of
+    search() and killed the turn that was about to use the memory."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("A fact worth serving", category="general")
+
+    for junk in ([None], ["not-an-int"], [None, 1], [object()]):
+        store.record_retrievals(junk)  # must not raise
+
+    # A real id still counts, so the guard did not swallow the feature.
+    fact_id = store.list_facts(min_trust=0.0, limit=1)[0]["fact_id"]
+    store.record_retrievals([fact_id])
+    assert usage(store, fact_id) == 1
+    store.close()
+
+
+def test_counting_a_large_result_set_does_not_exceed_sqlites_variable_limit(tmp_path):
+    """A single IN (...) over too many ids raises "too many SQL variables".
+
+    The limit is build-dependent — 999 on older SQLite, 32766 on the 3.53.1 this
+    host runs — so the test probes the ACTUAL limit and exceeds it, rather than
+    hard-coding a number that may not bite. (A first version passed 3000 ids and
+    silently proved nothing on this build.)
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("One real fact", category="general")
+    real = store.list_facts(min_trust=0.0, limit=1)[0]["fact_id"]
+
+    limit = 999
+    for probe in (32766, 999):
+        try:
+            store._conn.execute(
+                "SELECT 1 WHERE 1 IN (" + ",".join("?" * probe) + ")",
+                list(range(probe)),
+            )
+            limit = probe
+            break
+        except sqlite3.OperationalError:
+            continue
+
+    store.record_retrievals(list(range(1, limit + 500)))  # must not raise
+
+    assert usage(store, real) == 1, "the real id in an over-limit batch is still counted"
+    store.close()
+
+
+def test_entity_extraction_cannot_stall_a_write(tmp_path):
+    """_RE_AKA's `(\\w+(?:\\s+\\w+)*)` backtracked quadratically: measured at
+    1873ms on a 2000-word fact and 730ms on a 5000-char run of one letter — all of
+    it inside add_fact's transaction, holding the write lock."""
+    import time
+    store = MemoryStore(tmp_path / "memory_store.db")
+
+    for text in ("Word " * 2000, "A" * 5000, "Aa " * 1500, "a-" * 2000):
+        start = time.perf_counter()
+        store._extract_entities(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 0.25, f"extraction took {elapsed*1000:.0f}ms on {text[:12]!r}"
+    store.close()
+
+
+def test_the_bounded_aka_pattern_still_finds_aliases(tmp_path):
+    """Bounding the runs must not cost the feature it exists for."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    for text, expected in (
+        ("Guido aka BDFL", {"Guido", "BDFL"}),
+        ("Parrot Mambo aka the drone", {"Parrot Mambo"}),
+        ("Hermes One also known as the WebUI", {"Hermes One"}),
+    ):
+        got = set(store._extract_entities(text))
+        assert got & expected, f"{text!r} lost its alias: got {got}"
+    store.close()

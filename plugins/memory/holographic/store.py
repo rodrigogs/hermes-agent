@@ -132,8 +132,14 @@ _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
 # "The user's shell is zsh and it's persistent" previously yielded the entity
 # "s shell is zsh and it", which validated and persisted permanently.
 _RE_SINGLE_QUOTE = re.compile(r"(?<![\w'])'([^'\n]{2,40})'(?![\w'])")
+# Bounded on both sides. The original `(\w+(?:\s+\w+)*)` backtracks quadratically:
+# measured at 1873ms on a 2000-word fact and 730ms on a 5000-char run of one
+# letter, all of it inside add_fact's transaction, holding the write lock. An alias
+# is a name — a few short words — never a paragraph, so capping the run at 4 words
+# of <=30 chars loses nothing real and brings both cases under 10ms.
 _RE_AKA          = re.compile(
-    r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
+    r'((?:\w{1,30}\s+){0,3}\w{1,30})\s+(?:aka|also known as)\s+'
+    r'((?:\w{1,30}\s+){0,3}\w{1,30})',
     re.IGNORECASE,
 )
 
@@ -533,15 +539,26 @@ class MemoryStore:
         """
         if not fact_ids:
             return
-        ids = [int(f) for f in fact_ids]
-        placeholders = ",".join("?" * len(ids))
+        # Coercion is INSIDE the guard: int(None) and int("x") raise TypeError and
+        # ValueError, neither of which is a sqlite3.Error, so a malformed id would
+        # have propagated out of search() and killed the turn that was about to use
+        # the memory — the exact opposite of what this method promises.
+        try:
+            ids = [int(f) for f in fact_ids]
+        except (TypeError, ValueError):
+            return
+        # SQLite's default variable limit is 999. Chunk rather than risk a
+        # "too many SQL variables" error on a large result set.
         with self._lock:
             try:
-                self._conn.execute(
-                    f"UPDATE facts SET retrieval_count = retrieval_count + 1"
-                    f" WHERE fact_id IN ({placeholders})",
-                    ids,
-                )
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    self._conn.execute(
+                        f"UPDATE facts SET retrieval_count = retrieval_count + 1"
+                        f" WHERE fact_id IN ({placeholders})",
+                        chunk,
+                    )
                 self._commit_if_needed()
             except sqlite3.Error:
                 # This module has no logger; swallowing is correct here because

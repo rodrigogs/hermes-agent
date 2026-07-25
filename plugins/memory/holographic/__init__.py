@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -737,12 +738,57 @@ class HolographicMemoryProvider(MemoryProvider):
 # Before any tool call, state in one sentence whether you ..." — the tail is a
 # behavioural directive the operator never asked to persist, now injected every
 # turn.
+# Text is NORMALISED before matching, then matched against a pattern set that
+# spans both languages the operator writes. A denylist leaks by construction —
+# measured, 6 of 13 crafted bypasses got through the first version: double spaces
+# defeated `\s`, a Cyrillic "е" defeated "before", a zero-width space split the
+# word, and nothing in it was Portuguese at all. Normalisation closes the
+# lookalike and spacing classes; the wider pattern set closes the phrasing ones.
+#
+# This is still a heuristic. It is the SECOND line of defence: _claim_only already
+# limits what can be stored to one sentence, and prefetch() labels the whole block
+# as reference data. The point is that an auto-extracted "fact" is replayed into
+# the system prompt forever, so the bar for admitting one is deliberately high and
+# the failure mode is "we did not remember a preference", never "we adopted a rule".
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
+# Cyrillic/Greek homoglyphs that read as Latin. Not exhaustive; folds the common
+# substitution attack for the words this guard cares about.
+_HOMOGLYPHS = str.maketrans({
+    "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p", "\u0441": "c",
+    "\u0443": "y", "\u0445": "x", "\u03bf": "o", "\u03b1": "a", "\u0456": "i",
+})
+
+
+def _normalise_for_guard(text: str) -> str:
+    """Fold the text so a guard cannot be defeated by how it is spelled."""
+    folded = unicodedata.normalize("NFKC", text or "")
+    folded = folded.translate(_ZERO_WIDTH).translate(_HOMOGLYPHS)
+    # Collapse all whitespace: "BEFORE  ANY" must match "before any".
+    return " ".join(folded.lower().split())
+
+
 _IMPERATIVE = re.compile(
-    r'\b(?:before any|from now on|always\s+(?:state|say|respond|reply|answer|output)'
-    r'|never\s+(?:state|say|respond|reply|answer|output)|you\s+must|ignore\s+(?:all|any|previous)'
-    r'|disregard|instead of following|new instructions?)\b',
+    r'(?:'
+    # English: second-person directives and rule-setting.
+    r'before any\b|from now on\b|henceforth\b|going forward\b'
+    r'|(?:always|never)\s+\w{0,12}\s*(?:state|say|respond|reply|answer|output|ask|use|do)\b'
+    r'|you\s+(?:must|should always|should never|will always|will never)\b'
+    r'|ignore\s+(?:all|any|previous|the)\b|disregard\b|override\b'
+    r'|instead of following\b|new (?:rule|instruction)s?\b|your new rule\b'
+    r'|treat (?:every|all|any)\b|all future\b|every (?:answer|response|reply)\b'
+    r'|kindly ensure\b|make sure (?:you|to)\b|remember to\b'
+    # Portuguese: the operator's other language, absent from the first version.
+    r'|a partir de agora\b|de agora em diante\b|daqui (?:pra|para) frente\b'
+    r'|(?:sempre|nunca)\s+(?:responda|diga|pergunte|use|faca|faça|peca|peça)\b'
+    r'|ignore\s+(?:as|todas|qualquer|o|a)\b|desconsidere\b'
+    r'|voce\s+(?:deve|tem que)\b|você\s+(?:deve|tem que)\b'
+    r'|nova regra\b|regra:\b|toda (?:resposta|mensagem)\b'
+    r')',
     re.IGNORECASE,
 )
+
+# Markup that would let a stored fact impersonate structure in the system prompt.
+_FORGES_STRUCTURE = re.compile(r'(?:^|\s)(?:#{1,6}\s|```|<\|)|\bSYSTEM\s*:', re.IGNORECASE)
 
 
 def _claim_only(match: "re.Match") -> str:
@@ -766,7 +812,17 @@ def _harvestable_claim(content: str, match: "re.Match") -> str | None:
     edit, not in a memory that is replayed silently.
     """
     claim = _claim_only(match)
-    if len(claim) < 10 or _IMPERATIVE.search(claim):
+    if len(claim) < 10:
+        return None
+    # Match against the FOLDED text, but store the original: normalisation exists
+    # to defeat evasion, not to rewrite what the operator said.
+    folded = _normalise_for_guard(claim)
+    if _IMPERATIVE.search(folded):
+        return None
+    # A fact that carries a heading, a fence or a "SYSTEM:" label can pass for
+    # structure once it is spliced into the prompt, whatever the header above it
+    # says. prefetch() already flattens newlines; this refuses the content outright.
+    if _FORGES_STRUCTURE.search(claim):
         return None
     return claim[:400]
 
