@@ -127,7 +127,11 @@ _SLUG_STOPWORDS = frozenset({
     "auto-extraction", "in-context", "non-claude", "e2e",
 })
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
-_RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
+# Require a word boundary outside both quotes, so an apostrophe inside a word
+# ("user's", "it's") cannot pair with the next one. Verified on the live shape:
+# "The user's shell is zsh and it's persistent" previously yielded the entity
+# "s shell is zsh and it", which validated and persisted permanently.
+_RE_SINGLE_QUOTE = re.compile(r"(?<![\w'])'([^'\n]{2,40})'(?![\w'])")
 _RE_AKA          = re.compile(
     r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
     re.IGNORECASE,
@@ -153,6 +157,19 @@ _ENTITY_STOPWORDS = frozenset({
     "canonical", "highest", "cost", "please", "commit", "patches", "discovery",
     "config", "detalhes", "busca", "todos", "zerar", "teste", "fluxo", "limite",
 })
+# Only these may not START an entity. Verbs, auxiliaries and sentence glue — a
+# name beginning with one is a fragment. Product-name heads (windows, linux, mac,
+# gateway, protocol, status) stay OUT of this set and remain in the all-words
+# check below, so "Windows Server" is a name while "Windows" alone is not.
+_ENTITY_HEAD_STOPWORDS = frozenset({
+    "running", "admin", "created", "wait", "waiting", "note", "using", "used",
+    "set", "get", "run", "started", "stopped", "enabled", "disabled", "blocked",
+    "the", "this", "that", "when", "where", "while", "after", "before", "then",
+    "now", "also", "ok", "pass", "fail", "done", "todo", "fixme",
+    # Possessive fragments left by an apostrophe split.
+    "s", "t", "re", "ll", "ve", "d", "m",
+})
+
 # Shell / command noise: if a quoted term looks like a command line or
 # contains shell metacharacters, it's not an entity. NOTE: does NOT reject
 # a plain '.' — identifiers like "glm-5.2" and "Z.AI" are valid entities.
@@ -181,8 +198,11 @@ def _is_valid_entity(name: str) -> bool:
     # strip surrounding punctuation from each word before stopword checks
     words = [re.sub(r"^[\W_]+|[\W_]+$", "", w) for w in low.split()]
     words = [w for w in words if w]
-    # first word is a stopword/verb -> sentence fragment, not an entity
-    if words and words[0] in _ENTITY_STOPWORDS:
+    # A leading VERB means a sentence fragment ("Running Windows ..."). A leading
+    # noun does not: rejecting the whole set made "Gateway API", "Windows Server",
+    # "Linux Mint" and "Mac Studio" invalid while "API Gateway" passed — the same
+    # two words, accepted or refused by order alone.
+    if words and words[0] in _ENTITY_HEAD_STOPWORDS:
         return False
     # every word is a stopword (e.g. "Running Windows") -> junk
     if words and all(w in _ENTITY_STOPWORDS for w in words):
@@ -364,8 +384,15 @@ class MemoryStore:
 
             # Explicit entities are authoritative. Heuristic extraction remains
             # the fallback for callers that do not provide them.
-            entity_names = entities if entities is not None else self._extract_entities(content)
-            for name in self._normalize_entities(entity_names):
+            #
+            # A name the CALLER chose is validated strictly — a refused link is
+            # something they must hear about. A name a REGEX guessed is not: this
+            # runs inside the atomic group, so raising on one junk candidate rolled
+            # back the fact itself. Losing a memory because a heuristic misfired is
+            # the worst possible trade.
+            explicit = entities is not None
+            entity_names = entities if explicit else self._extract_entities(content)
+            for name in self._normalize_entities(entity_names, strict=explicit):
                 entity_id = self._resolve_entity(name)
                 self._set_entity_aliases(entity_id, self._aliases_for(name, aliases))
                 self._link_fact_entity(fact_id, entity_id)
@@ -661,7 +688,26 @@ class MemoryStore:
         with self._lock:
             one = lambda sql: self._conn.execute(sql).fetchone()[0]
             facts = one("SELECT COUNT(*) FROM facts")
+            # COUNT(*) on an external-content FTS5 table scans the CONTENT table
+            # (facts), not the inverted index, so "fts_rows == facts" was a
+            # tautology that could never fail. Verified: wiping the index with
+            # delete-all left audit() reporting healthy=True while every search
+            # returned nothing — the one check an operator would trust was
+            # structurally blind to total loss of lexical recall.
             fts_rows = one("SELECT COUNT(*) FROM facts_fts")
+            # FTS5's own integrity-check is NOT enough: measured, it reports "ok"
+            # for a wiped index, because empty is a *consistent* state. The only
+            # signal that recall actually works is that a term known to be in the
+            # corpus still matches, so probe one.
+            fts_integrity = "ok"
+            try:
+                self._conn.execute(
+                    "INSERT INTO facts_fts(facts_fts) VALUES('integrity-check')"
+                )
+            except sqlite3.Error as exc:
+                fts_integrity = f"integrity-check failed: {exc}"
+            else:
+                fts_integrity = self._probe_fts_recall(facts)
             facts_with_hrr = one(
                 "SELECT COUNT(*) FROM facts WHERE hrr_vector IS NOT NULL"
             )
@@ -700,7 +746,8 @@ class MemoryStore:
                 (
                     integrity_check == "ok",
                     foreign_keys,
-                    fts_rows == facts,
+                    # The real index self-test, not the tautological row count.
+                    fts_integrity == "ok",
                     facts_without_hrr == 0 if self._hrr_available else True,
                     orphan_entities == 0,
                     orphan_links == 0,
@@ -710,6 +757,7 @@ class MemoryStore:
             return {
                 "path": str(self.db_path),
                 "integrity_check": integrity_check,
+                "fts_integrity": fts_integrity,
                 "foreign_keys": foreign_keys,
                 "hrr_available": self._hrr_available,
                 "facts": facts,
@@ -724,6 +772,54 @@ class MemoryStore:
                 "bank_fact_count": bank_fact_count,
                 "healthy": healthy,
             }
+
+    def _probe_fts_recall(self, fact_count: int) -> str:
+        """Confirm the index can still find a term the corpus definitely contains.
+
+        Returns "ok", or a description of the failure. Caller holds the lock.
+
+        An empty external-content index is internally consistent, so FTS5's
+        integrity-check passes while every search silently returns nothing — the
+        exact failure that made audit() report healthy=True on a store that had
+        lost all lexical recall.
+        """
+        if fact_count == 0:
+            return "ok"  # nothing to find; not a fault
+        row = self._conn.execute(
+            "SELECT content FROM facts WHERE content <> '' ORDER BY fact_id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return "ok"
+        # A single alphanumeric word, long enough to survive tokenisation.
+        words = [w for w in re.findall(r"[A-Za-z0-9]{4,}", row["content"] or "")]
+        if not words:
+            return "ok"  # cannot form a probe; do not cry wolf
+        try:
+            hits = self._conn.execute(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?",
+                (f'"{words[0].lower()}"',),
+            ).fetchone()[0]
+        except sqlite3.Error as exc:
+            return f"probe query failed: {exc}"
+        if hits == 0:
+            return (
+                f"index does not match {words[0]!r}, a term present in fact"
+                f" {row['content'][:40]!r} — run rebuild_fts()"
+            )
+        return "ok"
+
+    def rebuild_fts(self) -> str:
+        """Rebuild the FTS5 index from the facts table.
+
+        The repair for what _probe_fts_recall detects. Nothing in the plugin could
+        do this before, so a desynced index was permanent.
+        """
+        with self._lock:
+            self._conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            self._commit_if_needed()
+        return self._probe_fts_recall(
+            self._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        )
 
     def list_facts(
         self,
@@ -806,16 +902,33 @@ class MemoryStore:
     # Entity helpers
     # ------------------------------------------------------------------
 
-    def _normalize_entities(self, entities: list[str]) -> list[str]:
-        """Validate and case-insensitively deduplicate entity names."""
+    def _normalize_entities(
+        self, entities: list[str], *, strict: bool = True
+    ) -> list[str]:
+        """Validate and case-insensitively deduplicate entity names.
+
+        ``strict=True`` (the default, for entities a caller named explicitly)
+        raises on a rejected name: the caller asked for a specific link and
+        deserves to hear that it was refused.
+
+        ``strict=False`` skips rejects instead. That is for HEURISTIC candidates,
+        where raising is catastrophic: _extract_entities runs inside add_fact's
+        atomic group, so one junk candidate from a regex — an apostrophe
+        cross-pair such as "s shell is zsh and it" — rolled the whole write back
+        and silently discarded the fact the agent was told to remember.
+        """
         normalized: list[str] = []
         seen: set[str] = set()
         for raw in entities:
             if not isinstance(raw, str):
-                raise ValueError("entities must contain only strings")
+                if strict:
+                    raise ValueError("entities must contain only strings")
+                continue
             name = raw.strip()
             if not _is_valid_entity(name):
-                raise ValueError(f"invalid entity name: {raw!r}")
+                if strict:
+                    raise ValueError(f"invalid entity name: {raw!r}")
+                continue
             key = name.casefold()
             if key not in seen:
                 seen.add(key)

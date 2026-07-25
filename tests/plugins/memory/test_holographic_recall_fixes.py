@@ -455,3 +455,133 @@ def test_upvotes_still_raise_trust_to_the_ceiling(tmp_path):
              if f["fact_id"] == fact_id][0]["trust_score"]
     assert trust == pytest.approx(1.0), "trust must still be able to reach 1.0"
     store.close()
+
+
+# ── 7. the health check must be able to fail ────────────────────────────
+def test_audit_detects_an_index_that_has_lost_all_recall(tmp_path):
+    """audit()'s FTS parity check was a tautology.
+
+    COUNT(*) on an external-content FTS5 table scans the CONTENT table, so
+    "fts_rows == facts" could never be false. Wiping the index left audit()
+    reporting healthy=True while every search returned nothing — the one check an
+    operator would trust was structurally blind to total loss of lexical recall.
+
+    FTS5's own integrity-check is not enough either: measured, it reports "ok" for
+    an empty index, because empty is a *consistent* state.
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("Routing sends hard verbs to the opus tier", category="model-routing")
+
+    assert store.audit()["healthy"] is True
+    assert store.audit()["fts_integrity"] == "ok"
+
+    with store._lock:
+        store._conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('delete-all')")
+        store._conn.commit()
+
+    report = store.audit()
+    assert report["healthy"] is False, "a store with no lexical recall is not healthy"
+    assert "rebuild" in report["fts_integrity"], "and the report must name the repair"
+    store.close()
+
+
+def test_a_desynced_index_can_actually_be_repaired(tmp_path):
+    """Detection without a repair path just relocates the problem: nothing in the
+    plugin could rebuild the index before, so a desync was permanent."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    store.add_fact("Compaction threshold is 208352 tokens", category="project")
+    retriever = FactRetriever(store, fts_weight=0.55, jaccard_weight=0.15, hrr_weight=0.0)
+
+    def fts_only(term: str) -> int:
+        """Ask the index directly. _fts_candidates now falls through to a token
+        scan when FTS finds nothing (that is the recall fix), so it cannot be used
+        to observe whether the index itself is alive."""
+        with store._lock:
+            return store._conn.execute(
+                "SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?",
+                (f'"{term}"',),
+            ).fetchone()[0]
+
+    assert fts_only("compaction") == 1, "sanity: the index works to begin with"
+
+    with store._lock:
+        store._conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('delete-all')")
+        store._conn.commit()
+    assert fts_only("compaction") == 0, "index is wiped"
+    assert store.audit()["healthy"] is False
+    # The fallback keeps the memory reachable even now — that is the whole point
+    # of it — so recall degrades rather than disappearing while the index is down.
+    assert retriever.search("compaction threshold", min_trust=0.0, limit=5), \
+        "the scan fallback must cover for a dead index"
+
+    assert store.rebuild_fts() == "ok"
+
+    assert fts_only("compaction") == 1, "lexical recall restored"
+    assert store.audit()["healthy"] is True
+    store.close()
+
+
+def test_the_health_probe_does_not_cry_wolf(tmp_path):
+    """An empty store, or content with no probeable word, must not read as broken."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    assert store.audit()["healthy"] is True, "an empty store is healthy"
+    store.add_fact("a b c", category="general")  # no token >= 4 chars
+    assert store.audit()["fts_integrity"] == "ok"
+    store.close()
+
+
+# ── 8. a heuristic must never cost the fact ─────────────────────────────
+def test_junk_from_a_regex_does_not_discard_the_fact(tmp_path):
+    """_extract_entities runs inside add_fact's atomic group, and
+    _normalize_entities RAISED on a rejected name — so one bad guess from a regex
+    rolled back the whole write and the memory was silently lost.
+
+    Content below is engineered to make the old patterns produce fragments: the
+    apostrophe rule cross-paired "user's ... it's" into the entity
+    "s shell is zsh and it".
+    """
+    store = MemoryStore(tmp_path / "memory_store.db")
+
+    hostile = [
+        "The user's shell is zsh and it's persistent across Wait, this reboots",
+        "Running Windows on the Avell, admin' rights needed' for the ACPI fix",
+        "we decided 'to use, a comma' inside quotes which is a fragment",
+    ]
+    for text in hostile:
+        assert store.add_fact(text, category="general"), f"lost: {text[:40]}"
+
+    assert len(store.list_facts(min_trust=0.0, limit=10)) == len(hostile)
+    store.close()
+
+
+def test_an_entity_the_caller_named_still_fails_loudly(tmp_path):
+    """The leniency is for GUESSES only. A caller who asked for a specific link
+    must hear that it was refused, rather than have it silently dropped."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    with pytest.raises(ValueError, match="invalid entity name"):
+        store.add_fact("A fact", entities=["Wait, this is a fragment"])
+    assert store.list_facts(min_trust=0.0, limit=10) == [], "and it rolls back"
+    store.close()
+
+
+def test_a_real_name_is_not_rejected_for_its_first_word(tmp_path):
+    """The first-word stopword rule was order-dependent nonsense: "API Gateway"
+    passed and "Gateway API" did not — the same two words."""
+    from plugins.memory.holographic.store import _is_valid_entity
+    for name in ("API Gateway", "Gateway API", "Windows Server", "Linux Mint",
+                 "Mac Studio", "Protocol Buffers"):
+        assert _is_valid_entity(name), f"{name!r} is a real product name"
+    # Fragments must still be refused.
+    for junk in ("Running Windows", "Wait, this", "the thing", "s shell is zsh"):
+        assert not _is_valid_entity(junk), f"{junk!r} is a sentence fragment"
+
+
+def test_an_apostrophe_does_not_forge_an_entity(tmp_path):
+    """r"'([^']+)'" treated apostrophes as quote delimiters and cross-paired them
+    into a multi-word sentence that passed validation and persisted forever."""
+    store = MemoryStore(tmp_path / "memory_store.db")
+    got = store._extract_entities("The user's shell is zsh and it's persistent")
+    assert not any("shell is zsh" in g for g in got), f"cross-paired: {got}"
+    # A genuine single-quoted term is still captured.
+    assert "pytest" in store._extract_entities("Run 'pytest' before pushing")
+    store.close()
