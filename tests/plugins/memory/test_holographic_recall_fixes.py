@@ -662,3 +662,70 @@ def test_the_bounded_aka_pattern_still_finds_aliases(tmp_path):
         got = set(store._extract_entities(text))
         assert got & expected, f"{text!r} lost its alias: got {got}"
     store.close()
+
+
+# ── 10. an entity link change invalidates the vector ────────────────────
+def test_changing_a_facts_entity_links_recomputes_its_vector(tmp_path):
+    """The bug this pins cost 94% of the live store's vectors.
+
+    hrr.encode_fact(content, entities) binds each linked entity INTO the vector:
+        bundle(bind(content, ROLE_CONTENT), *[bind(e, ROLE_ENTITY) for e in ...])
+    A maintenance pass added 381 entity links without recomputing, so almost every
+    fact carried a vector describing its OLD entity set, and every HRR path
+    (related, contradict, the hrr term in search) scored against stale structure.
+
+    Anything that writes fact_entities must either go through update_fact or call
+    rebuild_all_vectors afterwards; this test makes the coupling visible.
+    """
+    import plugins.memory.holographic.holographic as hrr_mod
+
+    store = MemoryStore(tmp_path / "memory_store.db")
+    fact_id = store.add_fact("Routing sends hard verbs to T4", category="model-routing",
+                             entities=["capability-router"])
+
+    def stored_vector():
+        return store._conn.execute(
+            "select hrr_vector from facts where fact_id = ?", (fact_id,)
+        ).fetchone()["hrr_vector"]
+
+    def expected_vector():
+        names = [r["name"] for r in store._conn.execute(
+            "select e.name from entities e join fact_entities fe"
+            " on fe.entity_id = e.entity_id where fe.fact_id = ?", (fact_id,))]
+        return hrr_mod.phases_to_bytes(
+            hrr_mod.encode_fact("Routing sends hard verbs to T4", names, store.hrr_dim))
+
+    assert stored_vector() == expected_vector(), "fresh after add_fact"
+
+    # A raw link insert — exactly what the enrichment pass did — makes it stale.
+    with store._lock:
+        eid = store._resolve_entity("gpt-5.6-terra")
+        store._link_fact_entity(fact_id, eid)
+        store._conn.commit()
+    assert stored_vector() != expected_vector(), \
+        "sanity: a bare link insert really does invalidate the vector"
+
+    assert store.rebuild_all_vectors() >= 1
+    assert stored_vector() == expected_vector(), "rebuild_all_vectors is the repair"
+    store.close()
+
+
+def test_update_fact_keeps_the_vector_in_step_with_its_links(tmp_path):
+    """The supported path must not need the manual repair."""
+    import plugins.memory.holographic.holographic as hrr_mod
+
+    store = MemoryStore(tmp_path / "memory_store.db")
+    fact_id = store.add_fact("A fact about the router", category="project",
+                             entities=["router"])
+    store.update_fact(fact_id, entities=["router", "sidecar"])
+
+    names = [r["name"] for r in store._conn.execute(
+        "select e.name from entities e join fact_entities fe"
+        " on fe.entity_id = e.entity_id where fe.fact_id = ?", (fact_id,))]
+    assert set(names) == {"router", "sidecar"}
+    stored = store._conn.execute(
+        "select hrr_vector from facts where fact_id = ?", (fact_id,)
+    ).fetchone()["hrr_vector"]
+    assert stored == hrr_mod.phases_to_bytes(
+        hrr_mod.encode_fact("A fact about the router", names, store.hrr_dim))
+    store.close()
