@@ -41,6 +41,7 @@ import os
 import sqlite3
 import struct
 import threading
+import time
 import urllib.error
 import urllib.request
 from typing import Iterable, Optional, Sequence
@@ -60,6 +61,18 @@ DEFAULT_DIM = 768
 # A turn must not wait on the embedder. 8s is generous for a warm local model
 # (measured 45ms/fact) and short enough that a hung ollama cannot hold a turn.
 DEFAULT_TIMEOUT = 8.0
+# How long a failure suppresses further attempts. The latch below used to be
+# permanent, which turned one restart of ollama into "no dense retrieval until
+# the agent restarts" — silently, because every entry point fails open. A window
+# keeps the original property (one outage costs one timeout, not one per query)
+# without making the outage permanent.
+DEFAULT_RETRY_AFTER = 60.0
+# ollama unloads an idle model after ~5 minutes, and reloading nomic-embed-text
+# costs ~3s. prefetch() runs on every turn, so an operator who pauses for a
+# coffee pays that on their next message. Asking ollama to keep the model
+# resident trades ~377MB of RSS for never paying it. Measured: 908G free on this
+# box, and the same model is already held for other callers.
+DEFAULT_KEEP_ALIVE = "30m"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fact_embeddings (
@@ -113,20 +126,43 @@ class Embedder:
         self.model = model or os.environ.get("HERMES_EMBED_MODEL", DEFAULT_MODEL)
         self.timeout = float(timeout if timeout is not None else DEFAULT_TIMEOUT)
         self.dim = dim
+        self.keep_alive = os.environ.get("HERMES_EMBED_KEEP_ALIVE", DEFAULT_KEEP_ALIVE)
+        self.retry_after = float(os.environ.get("HERMES_EMBED_RETRY_AFTER", DEFAULT_RETRY_AFTER))
         self._lock = threading.Lock()
         self._cache: dict[str, "np.ndarray"] = {}
-        # Latched after a failure so a dead endpoint is not retried on every
-        # single query, turning one outage into a per-turn stall.
-        self._unavailable = False
+        # Set to the monotonic deadline after which the endpoint may be tried
+        # again; 0.0 means "believed healthy". This used to be a bool that was
+        # only ever set to True, and reset() had no callers anywhere in the tree
+        # — so a single connection refused (an ollama restart, a slow first load
+        # exceeding the timeout) disabled dense retrieval for the entire life of
+        # the process. Retrieval still worked, silently lexical-only, which is
+        # the worst kind of failure: no error, just quietly worse answers.
+        self._retry_at = 0.0
+
+    def _suppressed(self) -> bool:
+        """True while a recent failure is still suppressing attempts.
+
+        A pure comparison, deliberately: nothing is cleared here, so reading
+        `available` never consumes the one retry the window is about to permit.
+        Once the deadline passes the next attempt goes through on its own, and if
+        it fails _call latches again for another window.
+        """
+        return bool(self._retry_at) and time.monotonic() < self._retry_at
+
+    def _latch(self) -> None:
+        self._retry_at = time.monotonic() + self.retry_after
 
     @property
     def available(self) -> bool:
-        return _HAS_NUMPY and not self._unavailable
+        if not _HAS_NUMPY:
+            return False
+        with self._lock:
+            return not self._suppressed()
 
     def reset(self) -> None:
-        """Clear the unavailable latch (the endpoint may have come back)."""
+        """Clear the failure window (the endpoint is known to be back)."""
         with self._lock:
-            self._unavailable = False
+            self._retry_at = 0.0
 
     def embed(self, texts: Sequence[str]) -> Optional["np.ndarray"]:
         """Embed a batch. Returns an (n, dim) unit-norm array, or None on failure."""
@@ -136,7 +172,7 @@ class Embedder:
         keys = [content_hash(f"{self.model}:{t}") for t in cleaned]
 
         with self._lock:
-            if self._unavailable:
+            if self._suppressed():
                 return None
             missing = [i for i, k in enumerate(keys) if k not in self._cache]
 
@@ -159,7 +195,10 @@ class Embedder:
         return None if batch is None else batch[0]
 
     def _call(self, texts: list[str]) -> Optional["np.ndarray"]:
-        payload = json.dumps({"model": self.model, "input": texts}).encode("utf-8")
+        body_out = {"model": self.model, "input": texts}
+        if self.keep_alive:
+            body_out["keep_alive"] = self.keep_alive
+        payload = json.dumps(body_out).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint, data=payload, headers={"Content-Type": "application/json"}
         )
@@ -167,10 +206,10 @@ class Embedder:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 body = json.load(response)
         except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
-            # Latch: a missing or hung endpoint must cost one timeout, not one per
-            # query for the rest of the process's life.
+            # Latch for a window: a missing or hung endpoint must cost one
+            # timeout, not one per query — and not the rest of the process's life.
             with self._lock:
-                self._unavailable = True
+                self._latch()
             return None
 
         raw = body.get("embeddings")
@@ -178,17 +217,17 @@ class Embedder:
             raw = [body["embedding"]]
         if not raw or len(raw) != len(texts):
             with self._lock:
-                self._unavailable = True
+                self._latch()
             return None
         try:
             vectors = np.array(raw, dtype="<f4")
         except (TypeError, ValueError):
             with self._lock:
-                self._unavailable = True
+                self._latch()
             return None
         if vectors.ndim != 2 or vectors.shape[1] < 8:
             with self._lock:
-                self._unavailable = True
+                self._latch()
             return None
         self.dim = int(vectors.shape[1])
         return _normalise(vectors)
