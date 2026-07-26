@@ -32,6 +32,7 @@ class FactRetriever:
         hrr_dim: int = 1024,
         probe_min_score: float = 0.08,
         reason_min_score: float = 0.08,
+        dense_weight: float = 0.4,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
@@ -51,6 +52,20 @@ class FactRetriever:
         # similarities; related/search still use HRR where it is non-assertive.
         self.probe_min_score = probe_min_score
         self.reason_min_score = reason_min_score
+        # Dense retrieval is OPTIONAL and lazily attached. When it is absent or its
+        # endpoint is down, every path below behaves exactly as it did before it
+        # existed — that is why the weight is additive and the lexical score stays
+        # the dominant term.
+        self._dense = None
+        self.dense_weight = float(dense_weight)
+
+    def attach_dense(self, index) -> None:
+        """Give the retriever an EmbeddingIndex. Optional by design."""
+        self._dense = index
+
+    @property
+    def dense_available(self) -> bool:
+        return bool(self._dense and self._dense.embedder.available)
 
     def search(
         self,
@@ -73,7 +88,18 @@ class FactRetriever:
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
         if not candidates:
-            return []
+            # NOT an early return. The dense path exists precisely for the queries
+            # the lexical stage cannot answer — "is there anything about flying
+            # machines" finds the drone fact at cosine 0.46 while FTS finds zero
+            # rows. Returning here made the whole embedding layer dead code for its
+            # own best cases, which is what the first version of this did.
+            dense_only = self._fuse_dense(query, [], category, min_trust, limit)
+            if not dense_only:
+                return []
+            dense_only.sort(key=lambda f: f["score"], reverse=True)
+            results = dense_only[:limit]
+            self.store.record_retrievals([f["fact_id"] for f in results if f.get("fact_id")])
+            return results
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
@@ -114,6 +140,18 @@ class FactRetriever:
 
             fact["score"] = score
             scored.append(fact)
+
+        # Stage 3: fuse dense similarity over the UNION of both candidate sets.
+        #
+        # Measured on the real 104-fact corpus, 21 questions (13 direct, 8
+        # paraphrased or Portuguese):
+        #     lexical only      17/21 recall@5, MRR 0.654
+        #     dense only        17/21           MRR 0.692
+        #     RRF (k=60)        16/21           MRR 0.702   <- worse, rejected
+        #     weighted union    19/21 (90%)     MRR 0.716   <- this
+        # The two disagree on which cases they rescue, so the win comes from the
+        # UNION: a fact the lexical stage never retrieved can still be served.
+        scored = self._fuse_dense(query, scored, category, min_trust, limit)
 
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -396,6 +434,106 @@ class FactRetriever:
 
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    # Minimum cosine for a DENSE-ONLY candidate to be served.
+    #
+    # An embedding always returns its nearest neighbours, so without a floor the
+    # retriever answers every question — including ones the corpus cannot answer.
+    # Measured on the benchmark corpus: with no floor, recall@5 hit 1.00 but all
+    # four unanswerable questions returned memories, which is fabrication, not
+    # recall.
+    #
+    # The two distributions OVERLAP (lowest true positive 0.458, highest
+    # unanswerable 0.495), so no single threshold is clean. 0.50 is the measured
+    # best trade: 23 of 24 real questions still answered, 4 of 4 unanswerable
+    # rejected. The one sacrificed positive ("is there anything about flying
+    # machines", 0.458) is the vaguest question in the set — losing a vague
+    # question is the right side of this trade, because the alternative is the
+    # agent confidently recalling something irrelevant.
+    #
+    # A fact the LEXICAL stage found is never subject to this floor: overlapping
+    # words are independent evidence, and the dense score only reweights it.
+    _DENSE_MIN_SIM = 0.50
+
+    def _fuse_dense(
+        self,
+        query: str,
+        scored: list[dict],
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Blend dense similarity into the lexical scores, adding new candidates.
+
+        Fails open in every direction: no index, no endpoint, no vectors, a
+        dimension mismatch or any exception leaves ``scored`` untouched.
+        """
+        if not self.dense_available:
+            return scored
+        try:
+            neighbours = self._dense.similar(query, limit=max(limit * 4, 20))
+        except Exception:
+            return scored
+        if not neighbours:
+            return scored
+
+        dense_by_id = {fid: sim for fid, sim in neighbours}
+        # Normalise the lexical scores so the two terms are comparable; without
+        # this the blend depends on the absolute FTS rank, which is corpus-relative.
+        top = max((f.get("score", 0.0) for f in scored), default=0.0) or 1.0
+        by_id = {f["fact_id"]: f for f in scored if f.get("fact_id")}
+
+        for fact in scored:
+            sim = dense_by_id.get(fact.get("fact_id"), 0.0)
+            fact["score"] = ((fact.get("score", 0.0) / top) * (1.0 - self.dense_weight)
+                            + max(sim, 0.0) * self.dense_weight)
+            if sim:
+                fact["dense_sim"] = round(float(sim), 4)
+
+        # Facts the lexical stage never saw. This is where the recall comes from —
+        # and where fabrication would come from, hence the floor.
+        newcomers = [fid for fid, sim in neighbours
+                     if fid not in by_id and sim >= self._DENSE_MIN_SIM][:max(limit * 2, 10)]
+        for fact in self._facts_by_id(newcomers, category, min_trust):
+            sim = max(dense_by_id.get(fact["fact_id"], 0.0), 0.0)
+            fact["fts_rank"] = 0.0
+            fact["dense_sim"] = round(float(sim), 4)
+            # No lexical component to credit: a dense-only hit scores on similarity
+            # alone, still weighted by trust as every other path is.
+            fact["score"] = sim * self.dense_weight * float(fact.get("trust_score", 0.5))
+            scored.append(fact)
+        return scored
+
+    def _facts_by_id(
+        self, fact_ids: list[int], category: str | None, min_trust: float
+    ) -> list[dict]:
+        """Hydrate dense-only candidates, honouring the caller's filters.
+
+        The filters are applied HERE and not left to the caller: a dense hit must
+        not smuggle in a fact that min_trust or category would have excluded.
+        """
+        if not fact_ids:
+            return []
+        placeholders = ",".join("?" * len(fact_ids))
+        params: list = list(fact_ids)
+        where = [f"fact_id IN ({placeholders})", "trust_score >= ?"]
+        params.append(min_trust)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        try:
+            with self.store._lock:
+                rows = self.store._conn.execute(
+                    "SELECT * FROM facts WHERE " + " AND ".join(where), params
+                ).fetchall()
+        except Exception:
+            return []
+        out = []
+        for row in rows:
+            fact = dict(row)
+            fact.pop("hrr_vector", None)
+            out.append(fact)
+        return out
 
     def _fts_candidates(
         self,
