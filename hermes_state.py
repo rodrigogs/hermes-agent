@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -28,6 +29,11 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
+from agent.skill_commands import (
+    SKILL_EXCERPT_JOINT,
+    SKILL_SCAFFOLD_SQL_LIKE,
+    describe_skill_invocation,
+)
 from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
@@ -56,12 +62,6 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
     remain protected until normal TTL expiry (conservative: PID reuse must
     never steal a live lease, and a wrongly-kept lease self-heals via TTL).
     """
-    # Windows stays TTL-only: stdlib os.kill(pid, 0) is NOT a no-op probe
-    # there (bpo-14484 — sig=0 maps to CTRL_C_EVENT and can kill the target's
-    # console group), and PID recycling semantics make liveness a weaker
-    # deadness signal. The 300s lease TTL remains the recovery path.
-    if os.name == "nt":
-        return False
     match = _COMPRESSION_LOCK_HOLDER_PID_RE.search(holder or "")
     if match is None:
         return False
@@ -83,10 +83,14 @@ def _compression_lock_holder_process_is_dead(holder: str) -> bool:
             return not psutil.pid_exists(pid)
         except Exception:
             return False  # any doubt → keep the lease until TTL expiry
-    # Scaffold-phase fallback only (psutil missing). POSIX-only by the
-    # os.name gate above.
+    # Scaffold-phase fallback only (psutil missing), and POSIX-only: stdlib
+    # os.kill(pid, 0) is NOT a no-op probe on Windows (bpo-14484 — sig=0 maps
+    # to CTRL_C_EVENT and can kill the target's console group). Without psutil
+    # a Windows host stays TTL-only; the lease TTL remains the recovery path.
+    if os.name == "nt":
+        return False
     try:
-        os.kill(pid, 0)  # windows-footgun: ok — function early-returns on nt above
+        os.kill(pid, 0)  # windows-footgun: ok — nt early-returns just above
     except ProcessLookupError:
         return True
     except (PermissionError, OSError, OverflowError):
@@ -129,6 +133,51 @@ def _delegate_from_json(col: str = "model_config") -> str:
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
+
+
+# Session preview = the head of the first user message, shown wherever a
+# session has no title (sidebar rows, pickers, exports, the desktop's
+# `sessionTitle` fallback).
+#
+# A /skill invocation expands into a message that embeds the whole skill body,
+# so the plain head of it previews the SKILL's opening prose as if the user had
+# written it. Scaffolded rows therefore carry a wider excerpt so
+# ``_shape_preview`` can hand it to ``describe_skill_invocation`` and recover
+# ``/work — fix the title leak``: the whole message while it stays under the
+# budget, and head + tail (where the typed instruction lands) once it doesn't.
+_PREVIEW_HEAD_CHARS = 63
+_PREVIEW_SCAFFOLD_WINDOW = 400
+_PREVIEW_MAX_CHARS = 60
+
+_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
+_PREVIEW_SCAFFOLDED_SQL = f"m.content LIKE '{SKILL_SCAFFOLD_SQL_LIKE}'"
+
+# The shared ``_preview_raw`` SELECT expression, interpolated by every listing
+# query. A scaffolded row gets a wider excerpt: the whole message while it fits
+# the budget, else head + tail (where the typed instruction lands) spliced
+# around SKILL_EXCERPT_JOINT.
+_PREVIEW_RAW_SELECT = (
+    f"CASE WHEN {_PREVIEW_SCAFFOLDED_SQL}"
+    f" AND LENGTH(m.content) > {_PREVIEW_SCAFFOLD_WINDOW * 2}"
+    f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW})"
+    f" || '{SKILL_EXCERPT_JOINT}'"
+    f" || SUBSTR({_PREVIEW_CONTENT_SQL}, -{_PREVIEW_SCAFFOLD_WINDOW})"
+    f" WHEN {_PREVIEW_SCAFFOLDED_SQL}"
+    f" THEN SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_SCAFFOLD_WINDOW * 2})"
+    f" ELSE SUBSTR({_PREVIEW_CONTENT_SQL}, 1, {_PREVIEW_HEAD_CHARS}) END"
+)
+
+
+def _shape_preview(raw: Any) -> str:
+    """Turn a ``_preview_raw`` column into the short preview callers show."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    described = describe_skill_invocation(text)
+    text = described if described is not None else text.split(SKILL_EXCERPT_JOINT)[0]
+    if len(text) > _PREVIEW_MAX_CHARS:
+        return text[:_PREVIEW_MAX_CHARS] + "..."
+    return text
 
 
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
@@ -531,6 +580,17 @@ def apply_wal_with_fallback(
     (prefer DELETE).  If the on-disk DB is already WAL, keep WAL and warn
     — never live-downgrade under possible concurrent openers.
 
+    This gate (#70055) is deliberately RETAINED. An earlier revision of the
+    lock-cancellation fix (#71724) reverted it on the theory that DELETE was
+    "the mode that corrupts", but that comparison was confounded: the clean
+    WAL result came from SQLite 3.53.1, which carries BOTH the WAL-reset fix
+    AND 3.51.0's defenses against close()-broken POSIX locks, so it says
+    nothing about 3.50.4.  Re-measured on the actually-bundled 3.50.4 with
+    the lock fix in place, WAL and DELETE are both clean (0/3 each) — i.e.
+    there is no evidence that WAL is safer here, and upstream still documents
+    the WAL-reset bug as real through 3.51.2 with serious consequences.  Until
+    a fixed runtime is delivered, keep new databases out of WAL.
+
     The WARNING is deduplicated per ``db_label``: repeated connections
     to the same underlying DB (e.g. kanban_db.connect() which is called
     on every kanban operation) log once per process, not once per call.
@@ -730,9 +790,29 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
     Raw file copy on purpose: the DB won't open cleanly, so we preserve the
     bytes exactly for forensics / manual restore. WAL and SHM sidecars are
     copied too when present. Returns the backup path, or None on failure.
+
+    Refuses when a connection to this database is still live in the process:
+    reading the file would ``close()`` a descriptor for it and cancel that
+    connection's POSIX advisory locks (see ``hermes_cli.sqlite_safe_read``).
+    The repair path can be entered by one SessionDB while the gateway holds
+    others, so this is a real possibility rather than a theoretical one.
     """
     import datetime
     import shutil
+
+    try:
+        from hermes_cli.sqlite_safe_read import has_live_connection
+    except ImportError:
+        has_live_connection = None  # type: ignore[assignment]
+
+    if has_live_connection is not None and has_live_connection(db_path):
+        logger.error(
+            "Refusing to raw-copy %s for backup: a connection to it is still "
+            "open in this process and the copy would cancel that connection's "
+            "POSIX locks. Close all SessionDB handles first.",
+            db_path,
+        )
+        return None
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
@@ -1575,6 +1655,194 @@ class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
 
+def _connect_tracked_db(path, tracking_path=None, **kwargs):
+    """``sqlite3.connect`` that registers the open fd for lock-safety.
+
+    While a connection is live, byte-level probes of the same file are
+    refused: an ``open()``/``close()`` cancels every POSIX advisory lock this
+    process holds on it -- including a running VACUUM's EXCLUSIVE lock.
+    Released automatically on ``close()``.
+
+    The ONLY tolerated fallback is the helper being absent entirely
+    (scaffold/embed installs that ship hermes_state without hermes_cli). A
+    real connection failure must propagate: silently retrying an *untracked*
+    connect would disable the guard for the lifetime of that connection,
+    which is precisely the failure mode this module exists to prevent.
+    """
+    try:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+    except ImportError:
+        logger.debug(
+            "hermes_cli.sqlite_safe_read unavailable; opening %s untracked "
+            "(byte-probe guard inactive in this install)",
+            path,
+        )
+        return sqlite3.connect(str(path), **kwargs)
+
+    # Open through THIS module's sqlite3.connect so callers (and tests) that
+    # patch hermes_state.sqlite3.connect keep control of connection creation;
+    # the helper still owns tracking.
+    return connect_tracked(
+        path,
+        tracking_path=tracking_path,
+        connect_fn=sqlite3.connect,
+        **kwargs,
+    )
+
+
+def is_zeroed_state_db(
+    path: Path, *, probe_bytes: int = 100, force: bool = False
+) -> bool:
+    """Detect the #68474 zeroed state.db signature (size>0, NUL header).
+
+    Byte-level probe, so it is only safe BEFORE any connection to *path*
+    exists in this process: ``close()`` cancels every POSIX advisory lock the
+    process holds on the file, which can pull the EXCLUSIVE lock out from
+    under a running VACUUM and corrupt the database. The read is routed
+    through ``read_header_bytes_preopen``, which refuses (returning False
+    here) once a connection is live. Pass ``force=True`` only for offline
+    files -- quarantined copies, snapshots, archives.
+
+    Prefer ``hermes_cli.backup.is_zeroed_sqlite_file`` when available; this
+    local copy keeps SessionDB openable without importing the CLI package
+    in constrained embed paths.
+    """
+    try:
+        from hermes_cli.backup import is_zeroed_sqlite_file
+
+        return is_zeroed_sqlite_file(path, probe_bytes=probe_bytes, force=force)
+    except Exception:
+        pass
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(
+        path, length=max(16, probe_bytes), force=force
+    )
+    if not head or head.startswith(b"SQLite format 3"):
+        return False
+    return all(byte == 0 for byte in head)
+
+
+def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
+    """Move a zeroed state.db aside (preserve bytes) and return quarantine path.
+
+    Uses a cross-process lock (``#68805``) so two concurrent startups cannot
+    race: the first process moves the zeroed file and the second re-checks
+    under the lock, finding the file already gone (or a fresh DB in its place)
+    instead of clobbering the quarantine.
+    """
+    import platform
+
+    lock_path = path.with_name(path.name + ".quarantine.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        deadline = time.monotonic() + 5.0
+        if platform.system() == "Windows":
+            import msvcrt
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.020)
+        else:
+            import fcntl
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.020)
+        if not acquired:
+            # Fail closed: do NOT proceed without the lock. A slow or paused
+            # startup that still owns the lock can overlap this fallback and
+            # the two processes can act on the same live file (#68805 review).
+            logger.error(
+                "quarantine lock for %s not acquired within 5s — refusing to "
+                "quarantine without the cross-process lock. The zeroed file "
+                "is left in place. If sessions fail to load, restore from "
+                "state-snapshots via `hermes snapshot list` / "
+                "`hermes snapshot restore <id>`.",
+                path,
+            )
+            return None
+        # Re-check under the lock: another process may have already quarantined
+        # the file, leaving a fresh DB (or no file at all) in its place.
+        if not path.exists():
+            logger.info(
+                "quarantine_zeroed_state_db: %s already moved by another process",
+                path,
+            )
+            return None
+        if not is_zeroed_state_db(path):
+            logger.info(
+                "quarantine_zeroed_state_db: %s is no longer zeroed (another "
+                "process quarantined it and a fresh DB was created)",
+                path,
+            )
+            return None
+
+        try:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+        except Exception:
+            ts = "unknown"
+        # Unique destination with PID suffix to avoid collision across
+        # concurrent startups that somehow both enter the lock.
+        dest = path.with_name(
+            f"{path.name}.zeroed-{ts}-{os.getpid()}.bak"
+        )
+        # Non-clobbering: if dest somehow exists, append a counter.
+        n = 0
+        while dest.exists():
+            n += 1
+            dest = path.with_name(
+                f"{path.name}.zeroed-{ts}-{os.getpid()}-{n}.bak"
+            )
+        try:
+            path.rename(dest)
+        except OSError as exc:
+            logger.error("Failed to quarantine zeroed %s: %s", path, exc)
+            return None
+        # Also move empty WAL/SHM if present so a fresh open is clean
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(path) + suffix)
+            if side.exists():
+                try:
+                    side.rename(Path(str(dest) + suffix))
+                except OSError:
+                    pass
+        return dest
+    finally:
+        try:
+            if acquired:
+                if platform.system() == "Windows":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, AttributeError):
+            pass
+        finally:
+            handle.close()
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -1649,8 +1917,9 @@ class SessionDB:
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
-                self._conn = sqlite3.connect(
+                self._conn = _connect_tracked_db(
                     f"file:{self.db_path}?mode=ro",
+                    tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
                     timeout=1.0,
@@ -1661,8 +1930,37 @@ class SessionDB:
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
+            # generic "file is not a database" with no recovery path. Quarantine
+            # the bytes (do not delete) and continue so a fresh DB can open;
+            # point the operator at pre-update snapshots.
+            if (
+                not read_only
+                and self.db_path.exists()
+                and is_zeroed_state_db(self.db_path)
+            ):
+                try:
+                    zsize = self.db_path.stat().st_size
+                except OSError:
+                    zsize = -1
+                qpath = quarantine_zeroed_state_db(self.db_path)
+                snaps = self.db_path.parent / "state-snapshots"
+                msg = (
+                    f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
+                    f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
+                    f"Restore from {snaps} via `hermes snapshot list` / "
+                    f"`hermes snapshot restore <id>` if available. "
+                    "Opening a fresh empty database so the agent can start."
+                )
+                logger.error(msg)
+                _set_last_init_error(msg)
+                # If quarantine failed, do not open the zeroed file (would fail
+                # opaquely or risk further damage). Raise with the clear message.
+                if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
+                    raise sqlite3.DatabaseError(msg)
+
             def _connect_and_init():
-                self._conn = sqlite3.connect(
+                self._conn = _connect_tracked_db(
                     str(self.db_path),
                     check_same_thread=False,
                     # Short timeout — application-level retry with random
@@ -2811,6 +3109,21 @@ class SessionDB:
                 # reclaimed until a later VACUUM. Non-fatal.
                 logger.warning("VACUUM after FTS optimize failed: %s", exc)
                 vacuum_ok = False
+            # Best-effort: fold the WAL back into the main file so the on-disk
+            # size settles now rather than at close(). NOTE this is REFUSED
+            # (SQLITE_BUSY) while any other connection holds a WAL read-mark —
+            # e.g. a live gateway sharing the DB — so it is not sufficient on
+            # its own. Callers must therefore NOT size the result by stat()ing
+            # the file; use :meth:`logical_size_bytes`, which is truthful
+            # immediately regardless of readers.
+            try:
+                with self._lock:
+                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as exc:
+                logger.debug(
+                    "WAL checkpoint (TRUNCATE) after optimize VACUUM failed: %s",
+                    exc,
+                )
 
         # Phase 4: stamp the FTS storage layout as current, clear the "available"
         # flag, and advance schema_version if it was somehow still behind (the
@@ -4327,7 +4640,24 @@ class SessionDB:
         holder: str,
         ttl_seconds: float = 300.0,
     ) -> bool:
-        """Extend the compression lock lease if ``holder`` still owns it."""
+        """Extend the compression lock lease if ``holder`` still owns it.
+
+        Ownership is decided by the ``holder`` column alone, deliberately NOT
+        by ``expires_at``: a live owner whose refresher thread was starved
+        (GC pause, loaded CI runner, a slow write escaping ``_execute_write``'s
+        retry budget) past its own TTL must be able to revive its still-unclaimed
+        row on the next tick. Requiring ``expires_at >= now`` here made such a
+        stall permanent — every later refresh matched 0 rows, so the owner kept
+        compressing and rotating with no lease at all, which is exactly the
+        unprotected window a competing path can fork the session lineage in.
+
+        This does not resurrect a lock somebody else already took: SQLite
+        serialises writes, so a reclaim (DELETE-expired + INSERT-or-IGNORE in
+        :meth:`try_acquire_compression_lock`) and this UPDATE never interleave.
+        Reclaim-first replaces ``holder``, so this UPDATE matches nothing and
+        returns False; refresh-first pushes ``expires_at`` into the future, so
+        the reclaimer's DELETE-expired matches nothing and its acquire fails.
+        """
         if not session_id or not holder:
             return False
         now = time.time()
@@ -4336,8 +4666,8 @@ class SessionDB:
         def _do(conn):
             cur = conn.execute(
                 "UPDATE compression_locks SET expires_at = ? "
-                "WHERE session_id = ? AND holder = ? AND expires_at >= ?",
-                (expires_at, session_id, holder, now),
+                "WHERE session_id = ? AND holder = ?",
+                (expires_at, session_id, holder),
             )
             return cur.rowcount > 0
 
@@ -5725,7 +6055,7 @@ class SessionDB:
                 )
                 SELECT {_sel},
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -5750,7 +6080,7 @@ class SessionDB:
             query = f"""
                 SELECT {_sel},
                     COALESCE(
-                        (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                        (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                          ORDER BY m.timestamp, m.id LIMIT 1),
@@ -5772,13 +6102,7 @@ class SessionDB:
         sessions = []
         for row in rows:
             s = dict(row)
-            # Build the preview from the raw substring
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             # Drop the internal ordering column so callers see a clean dict.
             s.pop("_effective_last_active", None)
             sessions.append(s)
@@ -5851,10 +6175,10 @@ class SessionDB:
         # compute it generically rather than hardcoding the successor char.
         prefix_hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
-        query = """
+        query = f"""
             SELECT s.*,
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -5876,12 +6200,7 @@ class SessionDB:
         runs: List[Dict[str, Any]] = []
         for row in rows:
             s = dict(row)
-            raw = s.pop("_preview_raw", "").strip()
-            if raw:
-                text = raw[:60]
-                s["preview"] = text + ("..." if len(raw) > 60 else "")
-            else:
-                s["preview"] = ""
+            s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
             runs.append(s)
         return runs
 
@@ -5897,7 +6216,7 @@ class SessionDB:
         query = f"""
             SELECT {_sel},
                 COALESCE(
-                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                    (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                      ORDER BY m.timestamp, m.id LIMIT 1),
@@ -5916,13 +6235,53 @@ class SessionDB:
         if not row:
             return None
         s = dict(row)
-        raw = s.pop("_preview_raw", "").strip()
-        if raw:
-            text = raw[:60]
-            s["preview"] = text + ("..." if len(raw) > 60 else "")
-        else:
-            s["preview"] = ""
+        s["preview"] = _shape_preview(s.pop("_preview_raw", ""))
         return s
+
+    def list_skill_scaffolded_sessions(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Titled sessions whose first user turn was a ``/skill`` invocation.
+
+        Those titles were generated from the expanded message, which embeds the
+        whole skill body — so they describe the skill rather than the request.
+        Returns ``id``, ``title``, and the full first-turn ``content`` so a
+        caller can re-derive what the user typed. Newest first.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.id, s.title, m.content
+                FROM sessions s
+                JOIN messages m ON m.id = (
+                    SELECT m2.id FROM messages m2
+                    WHERE m2.session_id = s.id AND m2.role = 'user'
+                      AND m2.content IS NOT NULL
+                    ORDER BY m2.timestamp, m2.id LIMIT 1
+                )
+                WHERE s.title IS NOT NULL AND m.content LIKE ?
+                ORDER BY s.started_at DESC
+                LIMIT ?
+                """,
+                (SKILL_SCAFFOLD_SQL_LIKE, int(limit)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_first_assistant_text(self, session_id: str) -> str:
+        """The session's first assistant reply as plain text ('' when none).
+
+        Pairs with :meth:`list_skill_scaffolded_sessions` so a re-title can feed
+        the titler the same (request, reply) shape the live path uses.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND content IS NOT NULL "
+                "ORDER BY timestamp, id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return ""
+        decoded = self._decode_content(row["content"])
+        return decoded if isinstance(decoded, str) else ""
 
     # =========================================================================
     # Message storage
@@ -7302,7 +7661,9 @@ class SessionDB:
                 if not preview:
                     preview = "[multimodal content]"
             elif isinstance(decoded, str):
-                preview = decoded
+                # A /skill turn embeds the whole skill body; show what the user
+                # typed instead of the skill's opening prose.
+                preview = describe_skill_invocation(decoded) or decoded
             else:
                 preview = ""
             preview = " ".join(preview.split())  # collapse whitespace
@@ -8959,10 +9320,28 @@ class SessionDB:
         except OSError:
             pass
 
+    def get_session_delete_targets(self, session_id: str) -> List[str]:
+        """Return every session row that :meth:`delete_session` would remove.
+
+        The requested session is first, followed by its recursively discovered
+        delegate/subagent children. Branch and compression children are not
+        included because deletion preserves them by orphaning their parent
+        reference.
+        """
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+            if not exists:
+                return []
+            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
+        return [session_id, *sorted(delegate_ids)]
+
     def delete_session(
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        expected_delete_ids: Optional[List[str]] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -8972,9 +9351,18 @@ class SessionDB:
         (``parent_session_id → NULL``) so they remain accessible independently.
         When *sessions_dir* is provided, also removes on-disk transcript
         files (``.json`` / ``.jsonl`` / ``request_dump_*``) for every deleted
-        session. Returns True if the session was found and deleted.
+        session. When *expected_delete_ids* is provided, deletion proceeds only
+        if the parent plus delegate cascade still matches that exact set. This
+        lets export-before-delete callers fail closed if a new delegate appears
+        after they materialize their archive. The delegate tree is re-walked
+        inside the write transaction on purpose (TOCTOU guard); the cost is
+        accepted for correctness. Returns True if the session was found and
+        deleted.
         """
         removed_delegate_ids: List[str] = []
+        expected_ids = (
+            set(expected_delete_ids) if expected_delete_ids is not None else None
+        )
 
         def _do(conn):
             cursor = conn.execute(
@@ -8982,6 +9370,13 @@ class SessionDB:
             )
             if cursor.fetchone()[0] == 0:
                 return False
+            if expected_ids is not None:
+                actual_ids = {
+                    session_id,
+                    *_collect_delegate_child_ids(conn, [session_id]),
+                }
+                if actual_ids != expected_ids:
+                    return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -9997,10 +10392,10 @@ class SessionDB:
         with self._lock:
             try:
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                         COALESCE(
-                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                            (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                              ORDER BY m.timestamp, m.id LIMIT 1),
@@ -10026,10 +10421,10 @@ class SessionDB:
                 # telegram_dm_topic_bindings doesn't exist yet — no bindings
                 # means every telegram session for this user is "unlinked".
                 rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT s.*,
                         COALESCE(
-                            (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                            (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
                              ORDER BY m.timestamp, m.id LIMIT 1),
@@ -10051,8 +10446,7 @@ class SessionDB:
         sessions: List[Dict[str, Any]] = []
         for row in rows:
             session = dict(row)
-            raw = str(session.pop("_preview_raw", "") or "").strip()
-            session["preview"] = raw[:60] + ("..." if len(raw) > 60 else "") if raw else ""
+            session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
             sessions.append(session)
         return sessions
 
@@ -10145,6 +10539,34 @@ class SessionDB:
                         "FTS rebuild failed for %s: %s", tbl, exc
                     )
         return rebuilt
+
+    def logical_size_bytes(self) -> Optional[int]:
+        """Database size in bytes as SQLite itself accounts for it.
+
+        ``page_count * page_size`` — the size the main DB file will have once
+        the WAL is checkpointed back into it.
+
+        Prefer this over ``os.path.getsize(db_path)`` when reporting the effect
+        of a VACUUM. In WAL mode a VACUUM's rewrite lands in the ``-wal`` file,
+        and the checkpoint that folds it back is refused while any other
+        connection (a live gateway) holds a read-mark. Until that happens the
+        main file on disk still carries its pre-VACUUM size and keeps growing,
+        so a stat()-based before/after delta understates the win and can go
+        negative — the "reclaimed -3820.1 MB" report on a database that had
+        actually shrunk 60%.
+
+        Returns None if the pragmas cannot be read.
+        """
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return None
+                page_count = self._conn.execute("PRAGMA page_count").fetchone()[0]
+                page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+            return int(page_count) * int(page_size)
+        except Exception as exc:
+            logger.debug("Could not read logical DB size: %s", exc)
+            return None
 
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.

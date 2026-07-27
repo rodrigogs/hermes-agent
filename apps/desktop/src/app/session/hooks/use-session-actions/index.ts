@@ -7,6 +7,7 @@ import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
@@ -52,7 +53,6 @@ import {
   setSelectedStoredSessionId,
   setSessions,
   setSessionStartedAt,
-  setSessionsTotal,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
@@ -224,6 +224,7 @@ export function useSessionActions({
   // by A's delayed session.info event and visibly jump back to A.
   const storedIdRotation = useStore($activeSessionStoredIdRotation)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     if (!storedIdRotation) {
       return
@@ -474,13 +475,14 @@ export function useSessionActions({
    *  list (Cursor-style draft tab); it surfaces on the next refresh once the
    *  first message persists a turn. "Open in split" keeps the listed behavior. */
   const openNewSessionTile = useCallback(
-    async (dir: TileDock = 'right', options?: { listed?: boolean }) => {
+    async (dir: TileDock = 'right', options?: { cwd?: null | string; listed?: boolean }) => {
       const listed = options?.listed ?? true
 
       try {
-        // Fresh tile → the resolved new-session cwd (project/default), not the
-        // primary composer's live cwd.
-        const params = await desktopSessionCreateParams(resolveNewSessionCwd().trim())
+        // Fresh tile → the caller's workspace when one was named (the sidebar
+        // "+" on a project/worktree lane), else the resolved new-session cwd
+        // (project/default) — never the primary composer's live cwd.
+        const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
 
@@ -821,6 +823,10 @@ export function useSessionActions({
       }
 
       let resumedRunning = false
+      // A recovered in-flight tail means the turn already produced output, so
+      // it resumes into the streaming state rather than the "awaiting first
+      // token" spinner.
+      let recoveredInFlightTail = false
 
       try {
         const watchWindow = isWatchWindow()
@@ -912,15 +918,36 @@ export function useSessionActions({
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
 
+        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+
+        // Crash-survivable turn progress: fold a journaled in-flight tail
+        // (persisted by use-session-state-cache while the turn streamed;
+        // survives renderer/app death) back onto the restored transcript. The
+        // backend's own inflight projection is already inside
+        // `preferredMessages` (appendLiveSessionProjection), so this merge only
+        // adds the locally recorded structure — tool calls, sealed interim
+        // rows — that the backend's text-only snapshot cannot carry. A no-op
+        // returns `preferredMessages` by reference, keeping the fast path
+        // below intact.
+        const inFlightRecovery = recoverInFlightTurnJournal(storedSessionId, preferredMessages, {
+          keepPending: resumedRunning
+        })
+
+        recoveredInFlightTail = inFlightRecovery.applied
+
         // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
         // array (already error-merged when `localSnapshot` was built), so reuse
         // the ref instead of rebuilding a throwaway transcript+Map every switch.
         const messagesForView =
-          preferredMessages === currentMessages
+          inFlightRecovery.messages === currentMessages
             ? currentMessages
-            : preserveLocalAssistantErrors(preferredMessages, currentMessages)
+            : preserveLocalAssistantErrors(inFlightRecovery.messages, currentMessages)
 
-        if (sessionShouldHaveTranscript(stored) && messagesForView.length === 0) {
+        // Fail-latch on the PRE-recovery transcript: an orphan journal tail
+        // must not mask a lost transcript (a retry that reloads real history
+        // is safer than surfacing the in-flight turn alone). Recovery only
+        // ever appends, so this matches the final transcript's emptiness.
+        if (sessionShouldHaveTranscript(stored) && preferredMessages.length === 0) {
           setActiveSessionId(null)
           activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)
@@ -935,8 +962,6 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
-
         updateSessionState(
           resumed.session_id,
           state => ({
@@ -944,7 +969,18 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: messagesForView,
             busy: resumedRunning,
-            awaitingResponse: resumedRunning
+            awaitingResponse: resumedRunning && !recoveredInFlightTail,
+            ...(inFlightRecovery.applied
+              ? {
+                  sawAssistantPayload: true,
+                  // Point live deltas at the recovered row when the backend is
+                  // still mid-turn; a settled recovery keeps the stream idle.
+                  streamId: resumedRunning ? inFlightRecovery.streamId : null,
+                  turnStartedAt: resumedRunning
+                    ? (inFlightRecovery.turnStartedAt ?? state.turnStartedAt ?? Date.now())
+                    : state.turnStartedAt
+                }
+              : {})
           }),
           storedSessionId
         )
@@ -982,7 +1018,14 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages))
+          // Resume failed, so there is no live projection — the journal is the
+          // only carrier of a crashed turn's progress on this path.
+          const fallbackRecovery = recoverInFlightTurnJournal(
+            storedSessionId,
+            reconcileAuthoritativeMessages(fallback.messages, previousMessages)
+          )
+
+          setMessages(fallbackRecovery.messages)
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
@@ -1034,7 +1077,7 @@ export function useSessionActions({
         if (isCurrentResume()) {
           busyRef.current = resumedRunning
           setBusy(resumedRunning)
-          setAwaitingResponse(resumedRunning)
+          setAwaitingResponse(resumedRunning && !recoveredInFlightTail)
         }
       }
     },
@@ -1249,9 +1292,6 @@ export function useSessionActions({
       // the delete RPC is in flight, so a racing refresh can't flash it back.
       tombstoneSessions(removedIds)
       beginSessionMutation(removedIds)
-      // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
-      // doesn't keep claiming the removed row is still on the server.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
 
       // Tear down before awaiting so the route effect can't resume the
@@ -1286,7 +1326,6 @@ export function useSessionActions({
       } catch (err) {
         if (removed) {
           setSessions(prev => [removed, ...prev])
-          setSessionsTotal(prev => prev + 1)
         }
 
         untombstoneSessions(removedIds)
@@ -1349,10 +1388,6 @@ export function useSessionActions({
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
-      // Archived sessions are hidden by the listSessions(min_messages=1) query
-      // on the next refresh, so they count as "removed" for the load-more
-      // footer math.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
 
       if (wasSelected) {
@@ -1375,7 +1410,6 @@ export function useSessionActions({
       } catch (err) {
         if (archived) {
           setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
-          setSessionsTotal(prev => prev + 1)
         }
 
         untombstoneSessions(archivedIds)

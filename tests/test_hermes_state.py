@@ -4818,6 +4818,39 @@ class TestListSessionsRich:
         assert db.get_session("delegate") is None
         assert db.get_session("branch") is not None
 
+    def test_delete_session_expected_targets_fail_closed_on_new_delegate(self, db):
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+
+        expected_ids = db.get_session_delete_targets("parent")
+        assert expected_ids == ["parent", "delegate"]
+
+        db.create_session(
+            "late-delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+
+        assert (
+            db.delete_session("parent", expected_delete_ids=expected_ids) is False
+        )
+        assert db.get_session("parent") is not None
+        assert db.get_session("delegate") is not None
+        assert db.get_session("late-delegate") is not None
+        assert db.get_session("branch") is not None
+
     def test_v16_migration_tags_linked_delegate_rows(self, tmp_path):
         """Pre-marker linked subagent rows get tagged, then cascade with parent."""
         import json
@@ -5895,6 +5928,93 @@ class TestFTSExternalContentMigration:
             )
         finally:
             db.close()
+
+    def test_optimize_fts_storage_vacuum_reports_truthful_size(self, tmp_path):
+        """``logical_size_bytes()`` must be truthful the moment optimize returns.
+
+        In WAL mode VACUUM's rewrite lands in the ``-wal`` file, and the
+        checkpoint that folds it back is REFUSED (SQLITE_BUSY) while another
+        connection — a live gateway — holds a read-mark. A caller that sizes
+        the result with ``os.path.getsize()`` therefore reads the stale,
+        still-growing main file: that is how `hermes sessions optimize-storage`
+        reported "reclaimed -3820.1 MB" on a DB that had actually shrunk 60%.
+        SQLite's own page accounting is correct immediately.
+        """
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+
+        # Bulk the DB up so VACUUM actually has pages to move: with only a
+        # handful of rows the whole file fits in the WAL's first frames and the
+        # stale-stat() bug is invisible.
+        bulk = sqlite3.connect(str(db_path))
+        bulk.executemany(
+            "INSERT INTO messages (session_id, timestamp, role, content) "
+            "VALUES ('s1', ?, 'user', ?)",
+            [(time.time(), "filler " + "q" * 2000) for _ in range(4000)],
+        )
+        bulk.commit()
+        bulk.close()
+
+        db = SessionDB(db_path=db_path)
+        reader = None
+        try:
+            if db._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                pytest.skip("WAL unavailable on this SQLite build")
+
+            # A live gateway/CLI session pinning a WAL read-mark, which is what
+            # blocks the post-VACUUM checkpoint.
+            reader = sqlite3.connect(str(db_path))
+            reader.execute("BEGIN")
+            reader.execute("SELECT COUNT(*) FROM messages").fetchone()
+
+            assert db.optimize_fts_storage(vacuum=True)["ok"] is True
+
+            reported = db.logical_size_bytes()
+            assert reported is not None
+            stat_size = db_path.stat().st_size
+
+            # Settle for real: release the reader, then checkpoint.
+            reader.rollback()
+            reader.close()
+            reader = None
+            db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            settled = db_path.stat().st_size
+
+            page_size = db._conn.execute("PRAGMA page_size").fetchone()[0]
+
+            # Precondition for this test to mean anything: stat() must actually
+            # be lagging here, otherwise it isn't exercising the bug.
+            assert stat_size > settled + page_size, (
+                "test precondition failed: stat() did not lag the settled size, "
+                "so this case does not exercise the reporting bug"
+            )
+
+            # The contract: the reported size tracks where the file lands, not
+            # the stale on-disk size.
+            assert abs(reported - settled) <= page_size, (
+                f"logical_size_bytes() reported {reported} but the file settled "
+                f"at {settled} (stale stat() read {stat_size}) — a "
+                f"reclaimed-bytes delta built on this would be wrong"
+            )
+        finally:
+            if reader is not None:
+                reader.close()
+            db.close()
+
+    def test_logical_size_bytes_matches_page_accounting(self, tmp_path):
+        """Sanity: the helper returns page_count * page_size, or None if closed."""
+        db_path = tmp_path / "v22.db"
+        self._build_v22_db(db_path)
+        db = SessionDB(db_path=db_path)
+        try:
+            pc = db._conn.execute("PRAGMA page_count").fetchone()[0]
+            ps = db._conn.execute("PRAGMA page_size").fetchone()[0]
+            assert db.logical_size_bytes() == pc * ps
+        finally:
+            db.close()
+        # After close the connection is gone — must degrade to None, not raise,
+        # so callers can fall back to stat().
+        assert db.logical_size_bytes() is None
 
     def test_optimize_fts_storage_resumable_after_interrupt(self, tmp_path):
         """A partially-completed optimize resumes on re-run: after demote +
@@ -7131,6 +7251,59 @@ def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(d
 
     monkeypatch.setattr(hermes_state.time, "time", lambda: 1016.0)
     assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
+
+
+def test_starved_refresher_revives_its_own_unclaimed_lease(db, monkeypatch):
+    """A live owner past its own TTL must be able to revive an unclaimed row.
+
+    Ownership is decided by ``holder`` alone, deliberately NOT by
+    ``expires_at``. A refresher starved by a GC pause or a slow write can tick
+    after its own lease notionally expired; while nobody else has claimed the
+    row, that owner is still the owner. Requiring ``expires_at >= now`` made
+    the stall permanent — every later refresh matched 0 rows, so the owner kept
+    compressing and rotating with no lease at all, which is exactly the
+    unprotected window a competing path can fork the session lineage in.
+    """
+    db.create_session("s1", "cli")
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock("s1", "holder-a", ttl_seconds=10.0) is True
+
+    # Starved well past the 10s TTL, but the row is still holder-a's.
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1050.0)
+    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) is True
+    revived_expires = db._conn.execute(
+        "SELECT expires_at FROM compression_locks WHERE session_id = ?",
+        ("s1",),
+    ).fetchone()[0]
+    assert revived_expires == 1060.0
+
+    # Reviving must not hand the lease to anyone else.
+    assert db.refresh_compression_lock("s1", "holder-b", ttl_seconds=10.0) is False
+
+
+def test_refresh_cannot_resurrect_a_lock_already_reclaimed(db, monkeypatch):
+    """Once a competitor owns the row, the old holder's refresh must fail.
+
+    The guard is the ``holder`` match, not the clock: a reclaim replaces
+    ``holder``, so the previous owner's UPDATE matches nothing.
+    """
+    db.create_session("s1", "cli")
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1000.0)
+    assert db.try_acquire_compression_lock("s1", "holder-a", ttl_seconds=10.0) is True
+
+    # holder-a's lease lapses and holder-b legitimately reclaims it.
+    monkeypatch.setattr(hermes_state.time, "time", lambda: 1020.0)
+    assert db.try_acquire_compression_lock("s1", "holder-b", ttl_seconds=10.0) is True
+
+    # holder-a coming back late must NOT steal it back.
+    assert db.refresh_compression_lock("s1", "holder-a", ttl_seconds=10.0) is False
+    current = db._conn.execute(
+        "SELECT holder FROM compression_locks WHERE session_id = ?",
+        ("s1",),
+    ).fetchone()[0]
+    assert current == "holder-b"
 
 
 # =========================================================================

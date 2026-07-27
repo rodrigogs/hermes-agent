@@ -182,6 +182,7 @@ export interface CustomEndpointUpdate {
   id?: string
   make_default?: boolean
   model: string
+  models?: string[]
   name: string
 }
 
@@ -513,8 +514,23 @@ export interface SessionMessagesResponse {
 }
 
 export interface SessionResumeResponse {
+  /** Present when the backend found a fresh crash-interrupted turn and
+   *  scheduled its automatic continuation; the turn arrives as a normal
+   *  message.start stream right after this resume. */
+  auto_continue?: {
+    attempt: number
+    interrupted_at: number
+  }
   inflight?: null | {
     assistant?: string
+    /** Mid-turn redirect corrections, oldest first. The turn's original prompt
+     *  stays in `user`; these are the follow-ups typed while it ran. */
+    corrections?: string[]
+    /** Retained failed turn: the error the terminal frame carried (the frame
+     *  itself may have been lost to a disconnect). */
+    error?: string
+    recoverable?: boolean
+    status?: string
     streaming?: boolean
     user?: string
   }

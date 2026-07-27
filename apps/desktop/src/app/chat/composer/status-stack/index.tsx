@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef } from 'rea
 import { useNavigate } from 'react-router-dom'
 
 import { blurComposerInput } from '@/app/chat/composer/focus'
+import { clearSurfaceVar, setSurfaceVar, STATUS_STACK_VAR } from '@/app/chat/surface-vars'
 import { AGENTS_ROUTE } from '@/app/routes'
 import { BillingBanner } from '@/components/billing-banner'
 import { composerDockCard } from '@/components/chat/composer-dock'
@@ -22,6 +23,7 @@ import {
   type StatusGroup,
   stopBackgroundProcess
 } from '@/store/composer-status'
+import { refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
@@ -41,12 +43,25 @@ const isLocalhostPreview = (target: string): boolean => /\b(?:localhost|127\.0\.
 // Real codicons per group (no sparkles): a checklist for todos, the agent glyph
 // for subagents, a background process glyph for background tasks.
 const GROUP_ICON: Record<StatusGroup['type'], string> = {
+  goal: 'target',
   todo: 'checklist',
   subagent: 'agent',
   background: 'server-process'
 }
 
 const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
+  if (group.type === 'goal') {
+    const status = group.items[0]?.goalStatus
+
+    return status === 'paused'
+      ? s.goalPaused
+      : status === 'waiting'
+        ? s.goalWaiting
+        : status === 'done'
+          ? s.goalDone
+          : s.goalActive
+  }
+
   if (group.type === 'todo') {
     return s.todos(group.items.filter(i => i.todoStatus === 'completed').length, group.items.length)
   }
@@ -86,6 +101,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   useEffect(() => {
     if (sessionId) {
       void refreshBackgroundProcesses(sessionId)
+      void refreshSessionGoal(sessionId)
     }
   }, [sessionId])
 
@@ -153,7 +169,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
               </Tip>
             ) : undefined
           }
-          defaultCollapsed={group.type !== 'todo'}
+          defaultCollapsed={group.type !== 'todo' && group.type !== 'goal'}
           icon={<Codicon className="text-muted-foreground/70" name={GROUP_ICON[group.type]} size="0.8rem" />}
           label={groupLabel(group, t.statusStack)}
         >
@@ -197,12 +213,12 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   // height never sees it. Publish our own measured height — bucketed like the
   // composer's, to avoid style invalidation churn — so the thread's
   // last-message clearance can add it and the stack never hides messages.
+  // Scoped to THIS surface: tiles render their own stack (see surface-vars.ts).
   useLayoutEffect(() => {
-    const root = document.documentElement
     const el = stackRef.current
 
     if (!visible || !el) {
-      root.style.removeProperty('--status-stack-measured-height')
+      clearSurfaceVar(el, STATUS_STACK_VAR)
 
       return
     }
@@ -214,7 +230,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
       if (bucket !== last) {
         last = bucket
-        root.style.setProperty('--status-stack-measured-height', `${bucket}px`)
+        setSurfaceVar(el, STATUS_STACK_VAR, `${bucket}px`)
       }
     }
 
@@ -224,7 +240,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
     return () => {
       observer.disconnect()
-      root.style.removeProperty('--status-stack-measured-height')
+      clearSurfaceVar(el, STATUS_STACK_VAR)
     }
   }, [visible])
 
