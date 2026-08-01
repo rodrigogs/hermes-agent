@@ -42,6 +42,7 @@ Payment / credit exhaustion fallback:
 
 import contextlib
 import contextvars
+import functools
 import hashlib
 import inspect
 import json
@@ -50,9 +51,10 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -534,16 +536,17 @@ def _get_aux_model_for_provider(provider_id: str) -> str:
 # plus providers we intentionally keep pinned here (e.g. Anthropic predates
 # profiles). New providers should set default_aux_model on their profile instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
-    "gemini": "gemini-3-flash-preview",
+    "gemini": "gemini-3.6-flash",
     "zai": "glm-4.5-flash",
     "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash",
     "kimi-coding-cn": "kimi-k2-turbo-preview",
     "gmi": "google/gemini-3.1-flash-lite-preview",
     "anthropic": "claude-haiku-4-5-20251001",
+    "ai-gateway": "google/gemini-3-flash",
     "opencode-zen": "gemini-3-flash",
     "opencode-go": "glm-5",
-    "kilocode": "google/gemini-3-flash-preview",
+    "kilocode": "google/gemini-3.6-flash",
     "ollama-cloud": "nemotron-3-nano:30b",
     "tencent-tokenhub": "hy3-preview",
     # NB: no "deepinfra" entry — its aux model lives on the ProviderProfile
@@ -674,15 +677,15 @@ def build_or_headers(or_config: dict | None = None) -> dict:
             Overrides ``openrouter.response_cache_ttl`` in config.yaml.
 
     *or_config* is the ``openrouter`` section from config.yaml.  When *None*,
-    falls back to reading config from disk via ``load_config()``.
+    falls back to reading config from disk via ``load_config_readonly()``.
     """
     headers = dict(_OR_HEADERS_BASE)
 
     # Resolve config from disk if not provided.
     if or_config is None:
         try:
-            from hermes_cli.config import load_config
-            or_config = load_config().get("openrouter", {})
+            from hermes_cli.config import load_config_readonly
+            or_config = load_config_readonly().get("openrouter", {})
         except Exception:
             or_config = {}
 
@@ -727,6 +730,15 @@ def build_nvidia_nim_headers(base_url: str | None) -> dict:
     return {}
 
 
+# Vercel AI Gateway app attribution headers. HTTP-Referer maps to
+# referrerUrl and X-Title maps to appName in the gateway's analytics.
+from hermes_cli import __version__ as _HERMES_VERSION
+
+_AI_GATEWAY_HEADERS = {
+    "HTTP-Referer": "https://hermes-agent.nousresearch.com",
+    "X-Title": "Hermes Agent",
+    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+}
 
 # Nous Portal extra_body for product attribution.
 # Callers should pass this as extra_body in chat.completions.create()
@@ -758,8 +770,8 @@ NOUS_EXTRA_BODY = _nous_extra_body()
 auxiliary_is_nous: bool = False
 
 # Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3-flash-preview"
-_NOUS_MODEL = "google/gemini-3-flash-preview"
+_OPENROUTER_MODEL = "google/gemini-3.6-flash"
+_NOUS_MODEL = "google/gemini-3.6-flash"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -1214,11 +1226,19 @@ class _CodexCompletionsAdapter:
 
             event_stream = self._client.responses.create(**stream_kwargs)
             try:
-                final = _consume_codex_event_stream(
-                    event_stream,
-                    model=resp_kwargs.get("model"),
-                    on_event=_on_each_event,
-                )
+                # Some Codex-compatible hosts accept ``stream=True`` but return
+                # a completed Responses object instead of an SSE iterator. Do
+                # not hand that object to the event consumer: typed Responses
+                # (and compatibility shims such as SimpleNamespace) are not
+                # event streams and may not be iterable at all.
+                if hasattr(event_stream, "output"):
+                    final = event_stream
+                else:
+                    final = _consume_codex_event_stream(
+                        event_stream,
+                        model=str(resp_kwargs.get("model") or model),
+                        on_event=_on_each_event,
+                    )
             finally:
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):
@@ -2315,8 +2335,8 @@ def _read_main_model() -> str:
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str) and model_cfg.strip():
             return model_cfg.strip()
@@ -2342,8 +2362,8 @@ def _read_main_provider() -> str:
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, dict):
             provider = model_cfg.get("provider", "")
@@ -2492,6 +2512,168 @@ _RUNTIME_MAIN_AUTH_MODE: str = ""
 _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
+
+_RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("auxiliary_relay_call", default=None)
+)
+
+
+def _relay_auxiliary_call(callback):
+    """Give every physical retry in one auxiliary call a shared Relay identity."""
+
+    @functools.wraps(callback)
+    def wrapped(*args, **kwargs):
+        task = args[0] if args else kwargs.get("task")
+        token = _RELAY_AUX_CALL_CONTEXT.set({
+            "task": str(task or "unknown"),
+            "request_id": f"aux-{uuid.uuid4().hex}",
+            "attempt_count": 0,
+            "provider": "",
+            "model": "",
+            "api_mode": "chat_completions",
+        })
+        try:
+            return callback(*args, **kwargs)
+        except BaseException:
+            _fail_relay_auxiliary_call()
+            raise
+        finally:
+            _RELAY_AUX_CALL_CONTEXT.reset(token)
+
+    return wrapped
+
+
+def _relay_auxiliary_call_async(callback):
+    """Async counterpart to :func:`_relay_auxiliary_call`."""
+
+    @functools.wraps(callback)
+    async def wrapped(*args, **kwargs):
+        task = args[0] if args else kwargs.get("task")
+        token = _RELAY_AUX_CALL_CONTEXT.set({
+            "task": str(task or "unknown"),
+            "request_id": f"aux-{uuid.uuid4().hex}",
+            "attempt_count": 0,
+            "provider": "",
+            "model": "",
+            "api_mode": "chat_completions",
+        })
+        try:
+            return await callback(*args, **kwargs)
+        except BaseException:
+            _fail_relay_auxiliary_call()
+            raise
+        finally:
+            _RELAY_AUX_CALL_CONTEXT.reset(token)
+
+    return wrapped
+
+
+def _set_relay_auxiliary_route(
+    provider: str | None,
+    model: str | None,
+    api_mode: str | None,
+) -> None:
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is None:
+        return
+    context["provider"] = str(provider or "auxiliary")
+    context["model"] = str(model or "unknown")
+    context["api_mode"] = str(api_mode or "chat_completions")
+
+
+def _relay_auxiliary_metadata(
+    *,
+    provider: str | None = None,
+    api_mode: str | None = None,
+) -> tuple[str, str, dict[str, Any]] | None:
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is None:
+        return None
+    attempt_count = int(context.get("attempt_count") or 0)
+    context["attempt_count"] = attempt_count + 1
+    provider_name = str(provider or context.get("provider") or "auxiliary")
+    model_name = str(context.get("model") or "unknown")
+    return provider_name, model_name, {
+        "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
+        "api_request_id": str(context["request_id"]),
+        "call_role": f"auxiliary:{context['task']}",
+        "retry_count": attempt_count,
+        "auxiliary_task": str(context["task"]),
+    }
+
+
+def _relay_sync_completion(
+    client: Any,
+    kwargs: dict[str, Any],
+    *,
+    provider: str | None = None,
+    api_mode: str | None = None,
+    create: Callable[[dict[str, Any]], Any] | None = None,
+) -> Any:
+    callback = create or (lambda request: client.chat.completions.create(**request))
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if route is None:
+        return callback(kwargs)
+    provider_name, fallback_model, metadata = route
+    from agent import relay_llm
+
+    return relay_llm.execute_current(
+        kwargs,
+        callback,
+        name=provider_name,
+        model_name=str(kwargs.get("model") or fallback_model),
+        metadata=metadata,
+        defer_logical_completion=True,
+    )
+
+
+async def _relay_async_completion(
+    client: Any,
+    kwargs: dict[str, Any],
+    *,
+    provider: str | None = None,
+    api_mode: str | None = None,
+    create: Callable[[dict[str, Any]], Any] | None = None,
+) -> Any:
+    callback = create or (lambda request: client.chat.completions.create(**request))
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if route is None:
+        return await callback(kwargs)
+    provider_name, fallback_model, metadata = route
+    from agent import relay_llm
+
+    return await relay_llm.execute_current_async(
+        kwargs,
+        callback,
+        name=provider_name,
+        model_name=str(kwargs.get("model") or fallback_model),
+        metadata=metadata,
+        defer_logical_completion=True,
+    )
+
+
+def _relay_sync_stream(
+    client: Any,
+    kwargs: dict[str, Any],
+    *,
+    provider: str | None = None,
+    api_mode: str | None = None,
+) -> Any:
+    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    if route is None:
+        return client.chat.completions.create(**kwargs)
+    provider_name, fallback_model, metadata = route
+    from agent import relay_llm
+
+    return relay_llm.stream_current(
+        kwargs,
+        lambda request: client.chat.completions.create(**request),
+        name=provider_name,
+        model_name=str(kwargs.get("model") or fallback_model),
+        finalizer=dict,
+        metadata=metadata,
+        completed_response_predicate=lambda value: hasattr(value, "choices"),
+    )
 _RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
 _RUNTIME_MAIN_COMPAT_LOCK = threading.Lock()
 
@@ -2877,12 +3059,12 @@ def _try_azure_foundry(
     try:
         from hermes_cli.runtime_provider import _resolve_azure_foundry_runtime
         from hermes_cli.auth import AuthError
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
     except ImportError:
         return None, None
 
     try:
-        cfg = load_config()
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
@@ -2996,8 +3178,8 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     # see issue #52608.
     base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         model_cfg = cfg.get("model")
         if isinstance(model_cfg, dict):
             cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -3801,7 +3983,13 @@ def _retry_same_provider_sync(
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
+        _relay_sync_completion(
+            retry_client,
+            retry_kwargs,
+            provider=resolved_provider,
+            api_mode=resolved_api_mode,
+        ),
+        task,
     )
 
 
@@ -3866,7 +4054,13 @@ async def _retry_same_provider_async(
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
-        await retry_client.chat.completions.create(**retry_kwargs), task,
+        await _relay_async_completion(
+            retry_client,
+            retry_kwargs,
+            provider=resolved_provider,
+            api_mode=resolved_api_mode,
+        ),
+        task,
     )
 
 
@@ -4071,7 +4265,7 @@ def _call_fallback_candidate_sync(
         base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
-            fb_client.chat.completions.create(**fb_kwargs), task)
+            _relay_sync_completion(fb_client, fb_kwargs, provider=fb_label), task)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -4088,7 +4282,13 @@ def _call_fallback_candidate_sync(
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
                 try:
                     return _validate_llm_response(
-                        retry_client.chat.completions.create(**retry_kwargs), task)
+                        _relay_sync_completion(
+                            retry_client,
+                            retry_kwargs,
+                            provider=fb_provider,
+                        ),
+                        task,
+                    )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -4137,7 +4337,13 @@ async def _call_fallback_candidate_async(
         base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
-            await fb_client.chat.completions.create(**fb_kwargs), task)
+            await _relay_async_completion(
+                fb_client,
+                fb_kwargs,
+                provider=fb_label,
+            ),
+            task,
+        )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
@@ -4155,7 +4361,13 @@ async def _call_fallback_candidate_async(
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
                 try:
                     return _validate_llm_response(
-                        await retry_client.chat.completions.create(**retry_kwargs), task)
+                        await _relay_async_completion(
+                            retry_client,
+                            retry_kwargs,
+                            provider=fb_provider,
+                        ),
+                        task,
+                    )
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
@@ -4529,14 +4741,15 @@ def _try_configured_fallback_for_unavailable_client(
 
 
 def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
-    """Resolve inline or env-backed API key from a fallback-chain entry."""
-    explicit = str(entry.get("api_key") or "").strip()
-    if explicit:
-        return explicit
-    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
-    if key_env:
-        return os.getenv(key_env, "").strip() or None
-    return None
+    """Resolve inline or env-backed API key from a fallback-chain entry.
+
+    Delegates to the centralized, secret-scope-aware resolver so this path
+    doesn't leak another profile's credential via a raw ``os.getenv`` under
+    gateway multiplexing (see ``hermes_cli.fallback_config.resolve_entry_api_key``).
+    """
+    from hermes_cli.fallback_config import resolve_entry_api_key
+
+    return resolve_entry_api_key(entry)
 
 
 def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
@@ -4571,10 +4784,10 @@ def _try_main_fallback_chain(
     participate in the same order as the main agent.
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
         from hermes_cli.fallback_config import get_fallback_chain
 
-        chain = get_fallback_chain(load_config())
+        chain = get_fallback_chain(load_config_readonly())
     except Exception as exc:
         logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
         return None, None, ""
@@ -5053,7 +5266,16 @@ def resolve_provider_client(
     # sent to Codex after the main lane fell back to gpt-5.5). Let _resolve_auto()
     # return the actual current runtime model when the caller did not explicitly
     # request one. (# compression-current-model)
-    if not model and provider != "auto":
+    #
+    # Nous + vision is the one carve-out: the branch below resolves its model
+    # from the Portal's tier-aware vision recommendation (``_try_nous(vision=
+    # True)``), and ``final_model = model or default`` means anything pre-filled
+    # here wins over that. The main chat model is routinely text-only (e.g. a
+    # ``:free`` chat SKU), so pre-filling it sends the image to a model that
+    # cannot accept one and the Portal 404s. Leave ``model`` unset and let the
+    # Portal slot through; only an explicit caller model may override it.
+    _nous_portal_vision = provider == "nous" and is_vision
+    if not model and provider != "auto" and not _nous_portal_vision:
         model = _get_aux_model_for_provider(provider) or _read_main_model_for_aux() or model
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
@@ -5532,7 +5754,8 @@ def resolve_provider_client(
         else:
             # Fall back to profile.default_headers for providers that declare
             # client-level attribution headers on their profile (e.g. GMI
-            # User-Agent for traffic identification).
+            # User-Agent for traffic identification, Vercel AI Gateway
+            # Referer/Title for analytics).
             try:
                 from providers import get_provider_profile as _gpf_main
                 _ph_main = _gpf_main(provider)
@@ -5793,11 +6016,11 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     """
     try:
         from agent.image_routing import _lookup_supports_vision
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config())
+        supports = _lookup_supports_vision(provider, model, load_config_readonly())
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:
@@ -5975,10 +6198,17 @@ def resolve_vision_provider_client(
             # DeepSeek-V4-Flash default) and _main_model_supports_vision can't be
             # trusted to catch that. Only fall back to the chat model when no
             # provider default is available (catalog unreachable).
-            vision_model = _resolve_provider_vision_default(main_provider) or main_model
+            provider_vision_default = _resolve_provider_vision_default(main_provider)
+            vision_model = provider_vision_default or main_model
             if main_provider == "nous":
+                # Nous resolves its vision model from the Portal's tier-aware
+                # recommended-models slots inside _try_nous(vision=True).
+                # Passing the chat model here overrides that pick, so a
+                # text-only chat default (e.g. a `:free` chat SKU) receives the
+                # image and the upstream rejects it with a 404. Only an
+                # explicit auxiliary.vision.model may override the Portal.
                 sync_client, default_model = _resolve_strict_vision_backend(
-                    main_provider, vision_model
+                    main_provider, resolved_model or provider_vision_default
                 )
                 if sync_client is not None:
                     logger.info(
@@ -6766,8 +6996,8 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     if not task:
         return {}
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
     except ImportError:
         return {}
     aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
@@ -7270,6 +7500,7 @@ def _validate_llm_response(
     except (AttributeError, TypeError, IndexError) as exc:
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
+            _complete_relay_auxiliary_call()
             return recovered
         response_type = type(response).__name__
         response_preview = str(response)[:120]
@@ -7279,7 +7510,32 @@ def _validate_llm_response(
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
         ) from exc
+    _complete_relay_auxiliary_call()
     return response
+
+
+def _complete_relay_auxiliary_call(*, outcome: str = "success") -> None:
+    """Close one auxiliary logical call after acceptance or terminal failure."""
+    context = _RELAY_AUX_CALL_CONTEXT.get()
+    if context is None:
+        return
+    from agent import relay_llm
+
+    relay_llm.complete_logical_call(
+        str(context.get("request_id") or ""),
+        outcome=outcome,
+    )
+
+
+def _fail_relay_auxiliary_call() -> None:
+    """Close a terminally failed call without replacing its original error."""
+    try:
+        _complete_relay_auxiliary_call(outcome="failed")
+    except Exception:
+        logger.warning(
+            "Relay auxiliary failure finalization failed",
+            exc_info=True,
+        )
 
 
 def _recover_aux_response_message(response: Any) -> Optional[Any]:
@@ -7680,6 +7936,7 @@ async def _acreate_with_stream(
     )
 
 
+@_relay_auxiliary_call
 def call_llm(
     task: str = None,
     *,
@@ -7820,6 +8077,11 @@ def call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    _set_relay_auxiliary_route(
+        resolved_provider,
+        final_model,
+        resolved_api_mode,
+    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -7857,7 +8119,22 @@ def call_llm(
         kwargs["stream"] = True
         if stream_options:
             kwargs["stream_options"] = stream_options
-        return client.chat.completions.create(**kwargs)
+        if task == "moa_aggregator" and isinstance(client, CodexAuxiliaryClient):
+            # CodexAuxiliaryClient (openai-codex, xai-oauth, and any other
+            # Responses-shim provider) consumes the provider stream internally
+            # and returns a completed response object. Routing that nested
+            # MoA stream through Relay's generic managed stream makes the
+            # manager iterate the completed SimpleNamespace itself (#55933).
+            # Return the provider call directly; the MoA facade converts a
+            # completed response into a one-chunk delta iterator at its
+            # boundary.
+            return client.chat.completions.create(**kwargs)
+        return _relay_sync_stream(
+            client,
+            kwargs,
+            provider=resolved_provider,
+            api_mode=resolved_api_mode,
+        )
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
@@ -7880,10 +8157,18 @@ def call_llm(
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
             return _validate_llm_response(
-                _create_with_progress(
-                    client, kwargs, task,
-                    force_stream=_provider_requires_stream(
-                        resolved_provider, _base_info or resolved_base_url,
+                _relay_sync_completion(
+                    client,
+                    kwargs,
+                    provider=resolved_provider,
+                    api_mode=resolved_api_mode,
+                    create=lambda request: _create_with_progress(
+                        client,
+                        request,
+                        task,
+                        force_stream=_provider_requires_stream(
+                            resolved_provider, _base_info or resolved_base_url,
+                        ),
                     ),
                 ),
                 task,
@@ -7919,10 +8204,19 @@ def call_llm(
                 time.sleep(_backoff)
                 try:
                     return _validate_llm_response(
-                        _create_with_progress(
-                            client, kwargs, task,
-                            force_stream=_provider_requires_stream(
-                                resolved_provider, _base_info or resolved_base_url,
+                        _relay_sync_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                            create=lambda request: _create_with_progress(
+                                client,
+                                request,
+                                task,
+                                force_stream=_provider_requires_stream(
+                                    resolved_provider,
+                                    _base_info or resolved_base_url,
+                                ),
                             ),
                         ),
                         task)
@@ -7942,7 +8236,12 @@ def call_llm(
             )
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
+                    _relay_sync_completion(
+                        client,
+                        retry_kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -7980,7 +8279,12 @@ def call_llm(
             kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                    _relay_sync_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -8010,7 +8314,12 @@ def call_llm(
                 kwargs["model"] = healed_model
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _relay_sync_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                        ), task)
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -8043,7 +8352,12 @@ def call_llm(
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
-                        refreshed_client.chat.completions.create(**kwargs), task)
+                        _relay_sync_completion(
+                            refreshed_client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                        ), task)
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -8071,7 +8385,12 @@ def call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+                    _relay_sync_completion(
+                        refreshed_client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
 
         # ── Auth refresh retry ───────────────────────────────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -8121,7 +8440,12 @@ def call_llm(
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
                     return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                        _relay_sync_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                        ), task)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -8379,6 +8703,7 @@ def extract_content_or_reasoning(response) -> str:
     return ""
 
 
+@_relay_auxiliary_call_async
 async def async_call_llm(
     task: str = None,
     *,
@@ -8470,6 +8795,11 @@ async def async_call_llm(
                 f"Run: hermes setup")
 
     effective_timeout = _effective_aux_timeout(task, timeout)
+    _set_relay_auxiliary_route(
+        resolved_provider,
+        final_model,
+        resolved_api_mode,
+    )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -8508,7 +8838,14 @@ async def async_call_llm(
 
         try:
             return _validate_llm_response(
-                await _acreate(kwargs), task,
+                await _relay_async_completion(
+                    client,
+                    kwargs,
+                    provider=resolved_provider,
+                    api_mode=resolved_api_mode,
+                    create=_acreate,
+                ),
+                task,
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
@@ -8529,7 +8866,14 @@ async def async_call_llm(
                 task or "call", transient_err,
             )
             return _validate_llm_response(
-                await _acreate(kwargs), task)
+                await _relay_async_completion(
+                    client,
+                    kwargs,
+                    provider=resolved_provider,
+                    api_mode=resolved_api_mode,
+                    create=_acreate,
+                ),
+                task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -8540,7 +8884,12 @@ async def async_call_llm(
             )
             try:
                 return _validate_llm_response(
-                    await client.chat.completions.create(**retry_kwargs), task)
+                    await _relay_async_completion(
+                        client,
+                        retry_kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (
@@ -8574,7 +8923,12 @@ async def async_call_llm(
             kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
-                    await client.chat.completions.create(**kwargs), task)
+                    await _relay_async_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -8603,7 +8957,12 @@ async def async_call_llm(
                 kwargs["model"] = healed_model
                 try:
                     return _validate_llm_response(
-                        await client.chat.completions.create(**kwargs), task)
+                        await _relay_async_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                        ), task)
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -8635,7 +8994,12 @@ async def async_call_llm(
                     kwargs["model"] = refreshed_model
                 try:
                     return _validate_llm_response(
-                        await refreshed_client.chat.completions.create(**kwargs), task)
+                        await _relay_async_completion(
+                            refreshed_client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                        ), task)
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -8662,7 +9026,12 @@ async def async_call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 return _validate_llm_response(
-                    await refreshed_client.chat.completions.create(**kwargs), task)
+                    await _relay_async_completion(
+                        refreshed_client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                    ), task)
 
         # ── Auth refresh retry (mirrors sync call_llm) ───────────────
         auth_refresh_provider = _auth_refresh_provider_for_route(
@@ -8706,7 +9075,12 @@ async def async_call_llm(
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
                     return _validate_llm_response(
-                        await client.chat.completions.create(**kwargs), task)
+                        await _relay_async_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                        ), task)
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise

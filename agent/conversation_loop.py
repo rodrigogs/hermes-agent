@@ -22,9 +22,7 @@ import os
 import random
 import re
 import ssl
-import threading
 import time
-import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -40,7 +38,6 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
-from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -140,6 +137,19 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     incomplete by definition; the model regenerates it on the retried turn.
     If a future path needs to preserve interrupted thinking, carry it in a
     provider-gated reasoning *field*, never in content.
+    INVARIANT — the scaffolding is provider-replay text, not transcript text.
+    ``[This response was interrupted by a user correction.]`` and its
+    ``Visible response before the interruption:`` header exist so the MODEL
+    understands its own reply was cut off. They are not prose the user wrote
+    or the agent said. Persisting them into ``content`` painted the raw
+    machinery as an assistant bubble on every reload (and merged it into the
+    preceding tool-call bubble), which is what made a steered transcript
+    unreadable. Carry the scaffolded form in the ``api_content`` sidecar --
+    the exact bytes replayed to the provider -- and keep ``content`` clean.
+    When nothing was on screen there is no clean form at all, so the row is
+    marked ``display_kind="hidden"``: still replayed to the model, dropped by
+    every transcript surface (desktop, TUI, CLI resume), exactly like the
+    compaction-reference rows.
     """
     visible = agent._strip_think_blocks(
         getattr(agent, "_current_streamed_assistant_text", "") or ""
@@ -162,13 +172,74 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             f"{checkpoint}\n\n"
             f"{text}"
         )
-        messages.append({"role": "user", "content": correction})
+        # Transcript shows the user's own words; the provider replays the
+        # scaffolded form so it still sees the interrupted context.
+        messages.append(
+            {"role": "user", "content": text, "api_content": correction}
+        )
     else:
-        messages.append({"role": "assistant", "content": checkpoint})
+        entry: Dict[str, Any] = {
+            "role": "assistant",
+            "content": visible or checkpoint,
+            "api_content": checkpoint,
+        }
+        if not visible:
+            # Nothing reached the screen — this row carries no assistant prose
+            # at all, only the cut-off notice for the model.
+            entry["display_kind"] = "hidden"
+        messages.append(entry)
         messages.append({"role": "user", "content": text})
 
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
+
+
+def _is_copilot_provider(agent: Any) -> bool:
+    """Delegate to ``AIAgent._is_copilot_provider`` (single owner of the check).
+
+    ``agent.provider`` is not always the normalized ``copilot`` slug —
+    ``/model`` and profile configs can leave the alias ``github-copilot`` (or
+    ``github``) in place, and a bare ``provider == "copilot"`` gate silently
+    skips credential recovery for those spellings.
+    """
+    try:
+        return bool(agent._is_copilot_provider())
+    except Exception:
+        return (getattr(agent, "provider", "") or "").strip().lower() in {
+            "copilot",
+            "github-copilot",
+            "github",
+        }
+
+
+def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
+    """Detect a Copilot 400 that is really a STALE / DEGRADED credential.
+
+    Copilot surfaces a stale or degraded credential as an HTTP 400 rather than a
+    clean 401. Two body markers indicate this class:
+
+    - ``model_not_available_for_integrator`` — the request reached the
+      restricted ``copilot-language-server`` integrator (the server's fallback
+      when it receives a raw OAuth token instead of an exchanged API token),
+      whose model allowlist omits enterprise-only models.
+    - ``model_not_supported`` / "the requested model is not supported" — the
+      cached bearer's Copilot entitlement rotated out from under a long-lived
+      process.
+
+    Matched narrowly (status 400 AND a specific marker) so a genuinely wrong
+    model name — a real 400 — never triggers the single-shot re-exchange. The
+    caller enforces copilot-provider scoping and the single-shot guard.
+    """
+    lowered = (error_message or "").lower()
+    is_400 = status_code == 400 or "error code: 400" in lowered
+    if not is_400:
+        return False
+    return (
+        "model_not_available_for_integrator" in lowered
+        or "not available for integrator" in lowered
+        or "model_not_supported" in lowered
+        or "the requested model is not supported" in lowered
+    )
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -494,7 +565,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _invoke_hook(
             "on_session_start",
             session_id=agent.session_id,
@@ -1067,6 +1138,8 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -1085,6 +1158,13 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
+        persist_user_display_kind: Optional presentation type for a
+            synthesized user turn (``auto_continue``, ``model_switch``, …).
+            Display-only: transcript surfaces render the row as a timeline
+            event instead of a user bubble, while the model still receives
+            the message unchanged.
+        persist_user_display_metadata: Optional payload for that event
+            (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
 
     Returns:
@@ -1127,6 +1207,8 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_display_kind=persist_user_display_kind,
+        persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -1349,10 +1431,23 @@ def run_conversation(
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
+        # Per-agent validation cursor: skips re-json.loads-ing tool_call
+        # arguments on history messages already validated in a previous
+        # iteration. Identity-keyed (strong refs) — compression/undo/repair
+        # rewriting the list breaks the prefix match and forces a re-scan
+        # from the divergence point. See sanitize_tool_call_arguments.
+        _sanitize_cursor = getattr(agent, "_sanitize_args_cursor", None)
+        if _sanitize_cursor is None:
+            _sanitize_cursor = {}
+            try:
+                agent._sanitize_args_cursor = _sanitize_cursor
+            except Exception:
+                pass
         repaired_tool_calls = agent._sanitize_tool_call_arguments(
             messages,
             logger=request_logger,
             session_id=agent.session_id,
+            cursor=_sanitize_cursor,
         )
         if repaired_tool_calls > 0:
             request_logger.info(
@@ -1397,6 +1492,12 @@ def run_conversation(
             # event row enters the live history.
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
+
+            # Durable row identity stamped by _rows_to_conversation so the
+            # desktop can address a specific persisted message (reactions).
+            # Bookkeeping, never a provider field — only the chat-completions
+            # transport strips underscore keys, so drop it centrally here.
+            api_msg.pop("_row_id", None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -2030,6 +2131,7 @@ def run_conversation(
                         api_kwargs,
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
+                        sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2063,7 +2165,7 @@ def run_conversation(
                     _llm_middleware_trace = []
 
                 try:
-                    from hermes_cli.plugins import (
+                    from hermes_cli.lifecycle import (
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
@@ -2104,6 +2206,7 @@ def run_conversation(
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
+                            retry_count=retry_count,
                             request_messages=list(request_messages)
                             if isinstance(request_messages, list)
                             else [],
@@ -2188,12 +2291,34 @@ def run_conversation(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
+                            sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    from agent import relay_llm
+
+                    return relay_llm.execute(
+                        next_api_kwargs,
+                        agent._interruptible_api_call,
+                        session_id=str(agent.session_id or ""),
+                        name=str(agent.provider or "provider"),
+                        model_name=str(agent.model or ""),
+                        metadata={
+                            "api_mode": agent.api_mode,
+                            "api_request_id": api_request_id,
+                            "call_role": (
+                                "delegated"
+                                if getattr(agent, "is_subagent", False)
+                                else "fallback"
+                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                else "primary"
+                            ),
+                            "retry_count": retry_count,
+                        },
+                        defer_logical_completion=True,
+                    )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -2487,6 +2612,17 @@ def run_conversation(
                     _backoff_touch_counter = 0
                     while time.time() < sleep_end:
                         if agent._interrupt_requested:
+                            # A redirect uses the interrupt machinery to cancel
+                            # only the live request. Aborting the retry here
+                            # with clear_interrupt() would DESTROY the pending
+                            # correction and kill the turn with "Operation
+                            # interrupted" — the exact mid-stream steer loss
+                            # users hit when a redirect lands during provider
+                            # backoff. Rebuild from the correction instead,
+                            # mirroring the InterruptedError handler.
+                            if agent.clear_interrupt(preserve_redirect=True):
+                                _retry.restart_with_redirected_messages = True
+                                break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
@@ -2508,6 +2644,8 @@ def run_conversation(
                                 f"retry backoff ({retry_count}/{max_retries}), "
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
+                    if _retry.restart_with_redirected_messages:
+                        break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
@@ -3167,7 +3305,12 @@ def run_conversation(
                                     _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
                                 except (TypeError, ValueError):  # pragma: no cover
                                     pass
-                            agent._session_db.update_token_counts(
+                            # Enqueued, not written: the background writer
+                            # applies the delta off the turn thread (a cold
+                            # state.db UPDATE here stalled the tool loop for
+                            # up to hundreds of ms per API call). Drained at
+                            # turn finalize via _persist_session.
+                            agent._session_db.queue_token_counts(
                                 agent.session_id,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
@@ -3233,6 +3376,12 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
+                from agent import relay_llm
+
+                relay_llm.complete_logical_call(
+                    api_request_id,
+                    outcome="success",
+                )
                 agent._touch_activity(f"API call #{api_call_count} completed")
                 break  # Success, exit retry loop
 
@@ -3760,7 +3909,7 @@ def run_conversation(
                     print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
                     print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
                 if (
-                    agent.provider == "copilot"
+                    _is_copilot_provider(agent)
                     and status_code == 401
                     and not _retry.copilot_auth_retry_attempted
                 ):
@@ -4000,6 +4149,12 @@ def run_conversation(
 
                 # Check for interrupt before deciding to retry
                 if agent._interrupt_requested:
+                    # Preserve a pending redirect (mid-stream correction): the
+                    # user is steering, not stopping. Rebuild the turn from the
+                    # correction instead of aborting with a dead-end interrupt.
+                    if agent.clear_interrupt(preserve_redirect=True):
+                        _retry.restart_with_redirected_messages = True
+                        break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
@@ -4593,6 +4748,13 @@ def run_conversation(
                             provider=agent.provider,
                             api_mode=agent.api_mode,
                         )
+                        # Persist an explicit provider-reported limit before
+                        # compression/retry. The next request can be rate
+                        # limited, omit usage, or the process can restart; none
+                        # of those should discard metadata the provider already
+                        # confirmed. Keep the probe flags as a best-effort
+                        # post-success retry if this write cannot complete.
+                        save_context_length(agent.model, agent.base_url, new_ctx)
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This
                         # value came from the provider, so it is safe to cache.
@@ -4760,6 +4922,32 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    # Copilot self-heal BEFORE fallback: a stale/degraded
+                    # credential surfaces as a 400
+                    # ``model_not_available_for_integrator`` /
+                    # ``model_not_supported`` (not a clean 401), so the 401
+                    # refresh path above never fired. Force a fresh token
+                    # exchange + client rebuild and retry once on the SAME
+                    # provider — a fresh 437-char API token routes to the
+                    # correct integrator and the model becomes available again.
+                    # Single-shot guard prevents looping on a genuinely
+                    # unavailable model. Copilot-scoped so other providers'
+                    # real 400s are untouched.
+                    if (
+                        _is_copilot_provider(agent)
+                        and not _retry.copilot_stale_cred_retry_attempted
+                        and _is_stale_copilot_credential_error(
+                            status_code, str(getattr(api_error, "message", "") or api_error)
+                        )
+                    ):
+                        _retry.copilot_stale_cred_retry_attempted = True
+                        if agent._try_recover_stale_copilot_credential():
+                            agent._buffer_vprint(
+                                "🔐 Copilot credential re-exchanged after "
+                                "model_not_available 400. Retrying request..."
+                            )
+                            retry_count = 0
+                            continue
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
                     # announce the attempt when a fallback chain actually
@@ -5236,6 +5424,12 @@ def run_conversation(
                 _backoff_touch_counter = 0
                 while time.time() < sleep_end:
                     if agent._interrupt_requested:
+                        # Same preserve-redirect rule as the retry-wait above:
+                        # a steering correction must survive backoff, not die
+                        # as "Operation interrupted".
+                        if agent.clear_interrupt(preserve_redirect=True):
+                            _retry.restart_with_redirected_messages = True
+                            break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
@@ -5257,6 +5451,11 @@ def run_conversation(
                             f"error retry backoff ({retry_count}/{max_retries}), "
                             f"{int(sleep_end - time.time())}s remaining"
                         )
+                if _retry.restart_with_redirected_messages:
+                    # Leave the retry loop — the check right below rebuilds this
+                    # iteration from the correction instead of re-firing the
+                    # stale request.
+                    break
         
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
@@ -5360,7 +5559,7 @@ def run_conversation(
                     assistant_message.content = str(raw)
 
             try:
-                from hermes_cli.plugins import (
+                from hermes_cli.lifecycle import (
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
@@ -6693,7 +6892,8 @@ def run_conversation(
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
                 try:
                     from agent.verify_hooks import max_verify_nudges
-                    from hermes_cli.plugins import get_pre_verify_continue_message, has_hook
+                    from hermes_cli.lifecycle import has_hook
+                    from hermes_cli.plugins import get_pre_verify_continue_message
 
                     if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
                         # Posture is fixed for the session — resolve once + cache.

@@ -15,8 +15,18 @@ import type { GroupNode, LayoutNode } from '../model'
 import { allPaneIds } from '../model'
 
 import type { DoubleTapContext } from './drag-session'
+import type { FloatingAnchor } from './floating-rect'
 
 export const MIN_PANE_PX = 80
+
+/**
+ * The floor for a TOOL PANEL zone (terminal / logs) instead of `MIN_PANE_PX`.
+ * A tool panel is meant to be draggable down to nothing — the minimized rail
+ * (its header strip, `h-7`) is the smallest meaningful form, so the sash lets
+ * it shrink to exactly that and then collapses the zone rather than jamming
+ * against an 80px floor with a sliver of unusable content still showing.
+ */
+export const COLLAPSED_ZONE_PX = 28
 
 /** Optional CSS sizing a pane contributes (`data.width` / `data.minWidth`…).
  *  Applied to the pane's GROUP along the axis of the split that contains it —
@@ -34,13 +44,20 @@ export interface PaneSizing {
 }
 
 /** Chrome behavior flags a pane contributes. Read via `paneChrome`. */
-interface PaneChrome {
+interface PaneChrome extends PaneSizing {
   /** Leaves the grid on narrow viewports; revealed as an edge overlay. */
   collapsible?: boolean
   /** Extra ids accepted from PANE_TOGGLE_REVEAL_EVENT (the real app's pane
    *  ids, e.g. `chat-sidebar` for `sessions`). */
   revealAliases?: string[]
+  /** Tiling role in the tree, or `'floating'` — the one NON-tiling placement:
+   *  the pane is excluded from the tree entirely and rendered as a fixed card
+   *  above it (see renderer/floating-panes.tsx). A floating pane takes no
+   *  space from any zone, has no tab, and can't be docked or split. */
   placement?: string
+  /** Spawn corner for `placement: 'floating'` (default `'top-right'`). The
+   *  pane also TRACKS that corner's edges when the window resizes. */
+  anchor?: FloatingAnchor
   /** No Close in the tab menu — the one surface the app can't lose (the
    *  main workspace). Session tiles share `placement: 'main'` but close. */
   uncloseable?: boolean
