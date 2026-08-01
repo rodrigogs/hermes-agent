@@ -716,13 +716,49 @@ class HolographicMemoryProvider(MemoryProvider):
 
         _PREF_PATTERNS = [
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bEu\s+(?:prefiro|gosto|adoro|uso|quero|preciso)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
         ]
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
+            re.compile(r'\b(?:nós|nos)\s+(?:decidimos|concordamos|escolhemos)\s+(?:por\s+|usar\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
         ]
+
+        def _meaningful_tokens(text: str) -> set[str]:
+            folded = unicodedata.normalize("NFKD", text.lower())
+            folded = "".join(char for char in folded if not unicodedata.combining(char))
+            stopwords = {
+                "a", "ainda", "apenas", "as", "at", "by", "com", "da", "de", "do",
+                "e", "em", "exclusivamente", "for", "from", "i", "me", "minha", "meu",
+                "nos", "no", "na", "nós", "o", "of", "only", "or", "os", "para", "por",
+                "que", "the", "to", "um", "uma", "us", "we", "with", "you", "eu",
+                "decidiu", "decidimos", "agreed", "chose", "concordamos", "decided",
+                "deve", "must", "ser", "usar", "use", "usado", "used",
+            }
+            return {
+                token
+                for token in re.findall(r"[a-z0-9][a-z0-9_-]*", folded)
+                if len(token) >= 4 and token not in stopwords
+            }
+
+        def _duplicates_existing_fact(claim: str) -> bool:
+            claim_tokens = _meaningful_tokens(claim)
+            if not claim_tokens:
+                return False
+            for fact in self._store.list_facts(min_trust=0.0, limit=500):
+                existing_tokens = _meaningful_tokens(str(fact.get("content", "")))
+                # Deduplication must be asymmetric and loss-averse: a claim is
+                # a paraphrase only when it introduces *no* meaningful term that
+                # is absent from the existing fact. A percentage/Jaccard cutoff
+                # wrongly collapsed “SQLite for a local cache” and “PostgreSQL
+                # for a local cache”, because their shared context outweighed the
+                # one changed entity. A redundant record is recoverable; losing a
+                # distinct project decision is not.
+                if len(claim_tokens) >= 2 and claim_tokens <= existing_tokens:
+                    return True
+            return False
 
         extracted = 0
         for msg in messages:
@@ -751,6 +787,8 @@ class HolographicMemoryProvider(MemoryProvider):
                     claim = _harvestable_claim(content, match)
                     if claim is None:
                         break
+                    if _duplicates_existing_fact(claim):
+                        break
                     try:
                         result = json.loads(
                             self._handle_fact_store(
@@ -771,6 +809,8 @@ class HolographicMemoryProvider(MemoryProvider):
                 if match:
                     claim = _harvestable_claim(content, match)
                     if claim is None:
+                        break
+                    if _duplicates_existing_fact(claim):
                         break
                     try:
                         result = json.loads(
