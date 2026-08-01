@@ -9,6 +9,35 @@ class TestTipsCorpus:
     def test_has_at_least_200_tips(self):
         assert len(TIPS) >= 200, f"Expected 200+ tips, got {len(TIPS)}"
 
+    def test_no_tip_promises_that_data_stays_local(self):
+        """A tip is documentation, and a false security claim is worse than none.
+
+        One tip read "zero data leaves localhost" about `hermes dashboard`. Both
+        halves are wrong: the dashboard talks to whichever LLM provider is
+        configured, so data leaves the machine by design, and the product itself
+        documents `hermes dashboard --host 0.0.0.0`, which makes the bind reachable
+        from the network. An operator deciding whether to expose the dashboard is
+        exactly who reads these tips.
+
+        Describing the default bind is fine. Promising confinement is not.
+        """
+        forbidden = (
+            "zero data leaves",
+            "no data leaves",
+            "data never leaves",
+            "nothing leaves your machine",
+            "stays on your machine",
+            "100% local",
+            "fully offline",
+        )
+        for i, tip in enumerate(TIPS):
+            low = tip.lower()
+            for phrase in forbidden:
+                assert phrase not in low, (
+                    f"Tip {i} promises data confinement the product does not "
+                    f"guarantee: {tip!r}"
+                )
+
     def test_no_duplicates(self):
         assert len(TIPS) == len(set(TIPS)), "Duplicate tips found"
 
