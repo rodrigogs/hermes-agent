@@ -103,6 +103,15 @@ class FactRetriever:
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
+        # The query vector is loop-invariant — encode it at most once, on
+        # the first candidate that actually carries an HRR vector. Lazy on
+        # purpose: migrated stores can have FTS candidates whose hrr_vector
+        # was never backfilled, and those must not pay for an encode nothing
+        # will use. encode_text is deterministic (SHA-256 counter blocks),
+        # so the hoisted vector is bit-identical to per-candidate encodes.
+        # The role atom is likewise hoisted and reused for the bind.
+        query_vec = None
+        role_content = None
         scored = []
 
         for fact in candidates:
@@ -120,8 +129,10 @@ class FactRetriever:
                 # stores content (content is bound to role_content, not bare).
                 # Comparing a bare query vector against role-bound content is
                 # pure noise (~0.5 for every fact) — see audit 2026-07.
-                role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-                query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), role_content)
+                if role_content is None:
+                    role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
+                if query_vec is None:
+                    query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), role_content)
                 hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
             else:
                 hrr_sim = 0.5  # neutral
@@ -237,6 +248,10 @@ class FactRetriever:
 
         # Score each fact by how much the entity's atom appears in its vector
         # This catches both role-bound entity matches AND content word matches
+        # Both role atoms are loop-invariant — encode them once here
+        # (deterministic SHA-256-based atoms) instead of per fact row.
+        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
+        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
         scored = []
         for row in rows:
             fact = dict(row)
@@ -246,9 +261,6 @@ class FactRetriever:
             residual = hrr.unbind(fact_vec, entity_vec)
             # A high-similarity residual to ANY known role vector means this entity
             # plays a structural role in the fact
-            role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
-
             entity_role_sim = hrr.similarity(residual, role_entity)
             content_role_sim = hrr.similarity(residual, role_content)
             # Take the max — entity could appear in either role
@@ -443,17 +455,17 @@ class FactRetriever:
     # four unanswerable questions returned memories, which is fabrication, not
     # recall.
     #
-    # The two distributions OVERLAP (lowest true positive 0.458, highest
-    # unanswerable 0.495), so no single threshold is clean. 0.50 is the measured
-    # best trade: 23 of 24 real questions still answered, 4 of 4 unanswerable
-    # rejected. The one sacrificed positive ("is there anything about flying
-    # machines", 0.458) is the vaguest question in the set — losing a vague
-    # question is the right side of this trade, because the alternative is the
-    # agent confidently recalling something irrelevant.
+    # 0.53 is recalibrated for qwen3-embedding:0.6b (supersedes the 0.50 that
+    # was measured with nomic-embed-text, whose similarity distribution sits
+    # ~0.05 lower). Measured on the real 104-fact corpus with qwen3:
+    # unanswerable max 0.5071, answerable min 0.5788 — a clean gap, so 0.53
+    # rejects every unanswerable question and keeps every answerable one.
+    # The earlier 0.50 let domain-plausible distractors through ("which AWS
+    # region hosts the postgres primary", 0.54) with the stronger model.
     #
     # A fact the LEXICAL stage found is never subject to this floor: overlapping
     # words are independent evidence, and the dense score only reweights it.
-    _DENSE_MIN_SIM = 0.50
+    _DENSE_MIN_SIM = 0.53
 
     def _fuse_dense(
         self,

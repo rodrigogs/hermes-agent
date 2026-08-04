@@ -168,7 +168,9 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     """Parity: hoisted search() must produce the exact pre-fix results.
 
     Replicates the pre-fix loop (query vector encoded per candidate) as the
-    reference and compares full scored output for exact equality.
+    reference and compares full scored output for exact equality. The
+    reference includes the ROLE_CONTENT bind (the 2026-07 HRR retrieval fix:
+    content is stored role-bound, so a bare query vector is pure noise).
     """
     r = hoisted_retriever
     query = "deploy target setting"
@@ -177,6 +179,7 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     # --- pre-fix reference ---
     candidates = r._fts_candidates(query, None, 0.3, 10 * 3)
     query_tokens = r._tokenize(query)
+    role_content = hrr.encode_atom("__hrr_role_content__", r.hrr_dim)
     scored = []
     for fact in candidates:
         content_tokens = r._tokenize(fact["content"])
@@ -186,7 +189,7 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
         fts_score = fact.get("fts_rank", 0.0)
         if r.hrr_weight > 0 and fact.get("hrr_vector"):
             fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
-            query_vec = hrr.encode_text(query, r.hrr_dim)  # per-candidate
+            query_vec = hrr.bind(hrr.encode_text(query, r.hrr_dim), role_content)  # per-candidate
             hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0
         else:
             hrr_sim = 0.5
@@ -200,7 +203,15 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     for fact in old_results:
         fact.pop("hrr_vector", None)
 
-    assert new_results == old_results
+    # Normalize counters: the real search() increments retrieval_count for
+    # hits, the reference replica does not. Compare scored output only.
+    def _normalize(results):
+        return [
+            {k: v for k, v in f.items() if k != "retrieval_count"}
+            for f in results
+        ]
+
+    assert _normalize(new_results) == _normalize(old_results)
 
 
 def test_related_encodes_role_atoms_once(hoisted_retriever, monkeypatch):
@@ -217,13 +228,15 @@ def test_related_encodes_role_atoms_once(hoisted_retriever, monkeypatch):
 
 def test_probe_encodes_role_atom_once(hoisted_retriever, monkeypatch):
     calls = _counting_spy(monkeypatch, "encode_atom")
+    # Honest-memory probe abstains (returns []) for entities with no
+    # persisted SQL link — it must NOT fall through to a per-fact HRR
+    # loop, so no role atoms are encoded at all.
     results = hoisted_retriever.probe("entity_1")
-    assert results
     role_content_calls = [a for a in calls
                           if a and a[0] == "__hrr_role_content__"]
-    assert len(role_content_calls) == 1, (
-        f"role_content atom encoded {len(role_content_calls)}x in one "
-        "probe() — loop-invariant hoist regressed"
+    assert role_content_calls == [], (
+        f"role_content atom encoded {len(role_content_calls)}x in an "
+        "abstaining probe() — honest-memory abstain regressed to an HRR loop"
     )
 
 

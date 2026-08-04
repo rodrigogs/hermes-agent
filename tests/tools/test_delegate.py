@@ -88,8 +88,11 @@ class TestDelegateRequirements(unittest.TestCase):
         from tools.delegate_tool import _build_top_level_description
 
         desc = _build_top_level_description()
-        # Compaction ceiling: the old description was ~4,000 chars.
-        self.assertLessEqual(len(desc), 2200)
+        # Fork keeps the runtime limits (max_concurrent_children,
+        # max_spawn_depth, allowed_profiles) IN the top-level description so
+        # the model self-caps at the real ceilings, not framework defaults.
+        # That makes the description longer than upstream's compact form;
+        # the contract tests below (keyword presence) are the invariant.
         # Contracts only the top-level text carries:
         for keyword in (
             "background",          # async semantics
@@ -108,9 +111,9 @@ class TestDelegateRequirements(unittest.TestCase):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
 
     def test_dynamic_limits_moved_to_param_descriptions(self):
-        """Concurrency and nesting ceilings must reach the model through the
-        tasks/role parameter descriptions (the top-level text no longer
-        carries them)."""
+        """Concurrency and nesting ceilings reach the model through the
+        tasks/role parameter descriptions (fork keeps them in the top-level
+        text as well — both paths must carry the real limits)."""
         from tools.delegate_tool import _build_dynamic_schema_overrides
         from tools.registry import registry
 
@@ -127,9 +130,10 @@ class TestDelegateRequirements(unittest.TestCase):
             self.assertIn(
                 "max_spawn_depth=4", parameters["properties"]["role"]["description"]
             )
-        # Static top-level text must not embed stale limits.
-        self.assertNotIn("up to 7", overrides["description"])
-        self.assertNotIn("max_spawn_depth", overrides["description"])
+        # Fork keeps the runtime limits in the top-level description too
+        # (deliberate divergence — see test_top_level_description).
+        self.assertIn("up to 7", overrides["description"])
+        self.assertIn("max_spawn_depth", overrides["description"])
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
@@ -140,8 +144,11 @@ class TestChildSystemPrompt(unittest.TestCase):
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
+        # Fork divergence (local policy): code_execution IS stripped from
+        # delegated leaf children — the fork denies execute_code in leaf
+        # subagents (security posture), unlike upstream main.
         result = _strip_blocked_tools(["terminal", "file", "delegation", "clarify", "memory", "code_execution"])
-        self.assertEqual(sorted(result), ["code_execution", "file", "terminal"])
+        self.assertEqual(sorted(result), ["file", "terminal"])
 
     def test_strips_cronjob_toolset(self):
         """Regression for issue #43466: child subagents must not inherit
@@ -195,9 +202,9 @@ class TestStripBlockedTools(unittest.TestCase):
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
-        # code_execution is deliberately NOT denied — children keep
-        # execute_code for programmatic tool calling (Teknium, Jul 2026).
-        self.assertNotIn("code_execution", disabled)
+        # code_execution IS denied — fork policy strips execute_code from
+        # leaf children (security posture; divergence from upstream).
+        self.assertIn("code_execution", disabled)
 
         definitions = model_tools.get_tool_definitions(
             enabled_toolsets=kwargs["enabled_toolsets"],
@@ -430,10 +437,9 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(entry["tool_trace"][0]["tool"], "web_search")
             self.assertIn("args_bytes", entry["tool_trace"][0])
             self.assertIn("result_bytes", entry["tool_trace"][0])
-            self.assertEqual(
-                entry["tool_trace"][0]["input_summary"],
-                {"argument_keys": ["query"], "targets": {}},
-            )
+            # Fork trace entries carry status; input_summary is an upstream
+            # addition the fork's trace builder does not emit.
+            self.assertNotIn("input_summary", entry["tool_trace"][0])
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
 
     def test_tool_trace_handles_list_content_blocks(self):
@@ -637,10 +643,10 @@ class TestSubagentCostRollup(unittest.TestCase):
 class TestBlockedTools(unittest.TestCase):
 
     def test_execute_code_not_blocked(self):
-        """Children retain execute_code (programmatic tool calling) so they
-        can batch mechanical work instead of burning reasoning iterations
-        (Teknium, Jul 2026)."""
-        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
+        """Fork policy: leaf children DO strip execute_code (security
+        posture — the fork denies programmatic code execution in delegated
+        subagents, divergence from upstream main)."""
+        self.assertIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""

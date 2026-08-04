@@ -19,10 +19,10 @@ term.
 
 DESIGN CONSTRAINTS, all deliberate:
 
-* LOCAL ONLY. The model runs in ollama on this box (nomic-embed-text, 768 dims,
-  ~45ms per fact). Memory retrieval must not depend on a paid API or the internet
-  being up, and a fact must never fail to be stored because an embedding provider
-  was down.
+* LOCAL ONLY. The model runs in ollama on this box (qwen3-embedding:0.6b,
+  1024 dims, ~45ms per fact). Memory retrieval must not depend on a paid API
+  or the internet being up, and a fact must never fail to be stored because
+  an embedding provider was down.
 * FAILS OPEN. Every entry point returns None or [] on any failure. If the embedder
   is missing, slow, or broken, retrieval degrades to exactly the lexical behaviour
   that exists today. It never raises into a turn.
@@ -54,10 +54,13 @@ except ImportError:  # pragma: no cover - numpy is present in this deployment
     _HAS_NUMPY = False
 
 # Defaults chosen for this box: ollama is already installed and running, and
-# nomic-embed-text is small enough to keep resident on CPU.
+# qwen3-embedding:0.6b (MTEB-multilingual top-ranked family, 100+ languages,
+# 32K context) is small enough to keep resident on the GTX 1060. Supersedes
+# nomic-embed-text (768d, English-leaning) which measured worse on the
+# Portuguese/paraphrase recall probes.
 DEFAULT_ENDPOINT = "http://127.0.0.1:11434/api/embed"
-DEFAULT_MODEL = "nomic-embed-text"
-DEFAULT_DIM = 768
+DEFAULT_MODEL = "qwen3-embedding:0.6b"
+DEFAULT_DIM = 1024
 # A turn must not wait on the embedder. 8s is generous for a warm local model
 # (measured 45ms/fact) and short enough that a hung ollama cannot hold a turn.
 DEFAULT_TIMEOUT = 8.0
