@@ -32,6 +32,7 @@ class FactRetriever:
         hrr_dim: int = 1024,
         probe_min_score: float = 0.08,
         reason_min_score: float = 0.08,
+        dense_weight: float = 0.4,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
@@ -51,6 +52,20 @@ class FactRetriever:
         # similarities; related/search still use HRR where it is non-assertive.
         self.probe_min_score = probe_min_score
         self.reason_min_score = reason_min_score
+        # Dense retrieval is OPTIONAL and lazily attached. When it is absent or its
+        # endpoint is down, every path below behaves exactly as it did before it
+        # existed — that is why the weight is additive and the lexical score stays
+        # the dominant term.
+        self._dense = None
+        self.dense_weight = float(dense_weight)
+
+    def attach_dense(self, index) -> None:
+        """Give the retriever an EmbeddingIndex. Optional by design."""
+        self._dense = index
+
+    @property
+    def dense_available(self) -> bool:
+        return bool(self._dense and self._dense.embedder.available)
 
     def search(
         self,
@@ -73,7 +88,18 @@ class FactRetriever:
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
         if not candidates:
-            return []
+            # NOT an early return. The dense path exists precisely for the queries
+            # the lexical stage cannot answer — "is there anything about flying
+            # machines" finds the drone fact at cosine 0.46 while FTS finds zero
+            # rows. Returning here made the whole embedding layer dead code for its
+            # own best cases, which is what the first version of this did.
+            dense_only = self._fuse_dense(query, [], category, min_trust, limit)
+            if not dense_only:
+                return []
+            dense_only.sort(key=lambda f: f["score"], reverse=True)
+            results = dense_only[:limit]
+            self.store.record_retrievals([f["fact_id"] for f in results if f.get("fact_id")])
+            return results
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
@@ -115,12 +141,28 @@ class FactRetriever:
             fact["score"] = score
             scored.append(fact)
 
+        # Stage 3: fuse dense similarity over the UNION of both candidate sets.
+        #
+        # Measured on the real 104-fact corpus, 21 questions (13 direct, 8
+        # paraphrased or Portuguese):
+        #     lexical only      17/21 recall@5, MRR 0.654
+        #     dense only        17/21           MRR 0.692
+        #     RRF (k=60)        16/21           MRR 0.702   <- worse, rejected
+        #     weighted union    19/21 (90%)     MRR 0.716   <- this
+        # The two disagree on which cases they rescue, so the win comes from the
+        # UNION: a fact the lexical stage never retrieved can still be served.
+        scored = self._fuse_dense(query, scored, category, min_trust, limit)
+
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        # Count what was actually served. This is the ONLY live retrieval path,
+        # so if it does not record use, retrieval_count stays zero forever and a
+        # never-once-useful memory is indistinguishable from a load-bearing one.
+        self.store.record_retrievals([f["fact_id"] for f in results if f.get("fact_id")])
         return results
 
     def probe(
@@ -393,6 +435,106 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
+    # Minimum cosine for a DENSE-ONLY candidate to be served.
+    #
+    # An embedding always returns its nearest neighbours, so without a floor the
+    # retriever answers every question — including ones the corpus cannot answer.
+    # Measured on the benchmark corpus: with no floor, recall@5 hit 1.00 but all
+    # four unanswerable questions returned memories, which is fabrication, not
+    # recall.
+    #
+    # The two distributions OVERLAP (lowest true positive 0.458, highest
+    # unanswerable 0.495), so no single threshold is clean. 0.50 is the measured
+    # best trade: 23 of 24 real questions still answered, 4 of 4 unanswerable
+    # rejected. The one sacrificed positive ("is there anything about flying
+    # machines", 0.458) is the vaguest question in the set — losing a vague
+    # question is the right side of this trade, because the alternative is the
+    # agent confidently recalling something irrelevant.
+    #
+    # A fact the LEXICAL stage found is never subject to this floor: overlapping
+    # words are independent evidence, and the dense score only reweights it.
+    _DENSE_MIN_SIM = 0.50
+
+    def _fuse_dense(
+        self,
+        query: str,
+        scored: list[dict],
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Blend dense similarity into the lexical scores, adding new candidates.
+
+        Fails open in every direction: no index, no endpoint, no vectors, a
+        dimension mismatch or any exception leaves ``scored`` untouched.
+        """
+        if not self.dense_available:
+            return scored
+        try:
+            neighbours = self._dense.similar(query, limit=max(limit * 4, 20))
+        except Exception:
+            return scored
+        if not neighbours:
+            return scored
+
+        dense_by_id = {fid: sim for fid, sim in neighbours}
+        # Normalise the lexical scores so the two terms are comparable; without
+        # this the blend depends on the absolute FTS rank, which is corpus-relative.
+        top = max((f.get("score", 0.0) for f in scored), default=0.0) or 1.0
+        by_id = {f["fact_id"]: f for f in scored if f.get("fact_id")}
+
+        for fact in scored:
+            sim = dense_by_id.get(fact.get("fact_id"), 0.0)
+            fact["score"] = ((fact.get("score", 0.0) / top) * (1.0 - self.dense_weight)
+                            + max(sim, 0.0) * self.dense_weight)
+            if sim:
+                fact["dense_sim"] = round(float(sim), 4)
+
+        # Facts the lexical stage never saw. This is where the recall comes from —
+        # and where fabrication would come from, hence the floor.
+        newcomers = [fid for fid, sim in neighbours
+                     if fid not in by_id and sim >= self._DENSE_MIN_SIM][:max(limit * 2, 10)]
+        for fact in self._facts_by_id(newcomers, category, min_trust):
+            sim = max(dense_by_id.get(fact["fact_id"], 0.0), 0.0)
+            fact["fts_rank"] = 0.0
+            fact["dense_sim"] = round(float(sim), 4)
+            # No lexical component to credit: a dense-only hit scores on similarity
+            # alone, still weighted by trust as every other path is.
+            fact["score"] = sim * self.dense_weight * float(fact.get("trust_score", 0.5))
+            scored.append(fact)
+        return scored
+
+    def _facts_by_id(
+        self, fact_ids: list[int], category: str | None, min_trust: float
+    ) -> list[dict]:
+        """Hydrate dense-only candidates, honouring the caller's filters.
+
+        The filters are applied HERE and not left to the caller: a dense hit must
+        not smuggle in a fact that min_trust or category would have excluded.
+        """
+        if not fact_ids:
+            return []
+        placeholders = ",".join("?" * len(fact_ids))
+        params: list = list(fact_ids)
+        where = [f"fact_id IN ({placeholders})", "trust_score >= ?"]
+        params.append(min_trust)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        try:
+            with self.store._lock:
+                rows = self.store._conn.execute(
+                    "SELECT * FROM facts WHERE " + " AND ".join(where), params
+                ).fetchall()
+        except Exception:
+            return []
+        out = []
+        for row in rows:
+            fact = dict(row)
+            fact.pop("hrr_vector", None)
+            out.append(fact)
+        return out
+
     def _fts_candidates(
         self,
         query: str,
@@ -440,11 +582,19 @@ class FactRetriever:
             try:
                 rows = conn.execute(sql, params).fetchall()
             except Exception:
-                # FTS5 MATCH can fail on malformed queries — fall back to empty
-                return []
+                # A malformed MATCH must not silently erase the memory: FTS5
+                # rejects bare operators ("AND", "*", "a-b OR c"), which a human
+                # types often. Scan instead of giving up.
+                rows = []
 
         if not rows:
-            return []
+            # FTS is lexical: it only finds a fact whose stored WORDS overlap the
+            # query. Ask "how do I reach the Oracle machine" and every candidate
+            # is dropped when the facts say "araponga"/"ssh" instead — measured
+            # on the live store, that query returned zero of 104 facts. Falling
+            # through to a token scan keeps a vocabulary mismatch from reading
+            # as "the agent knows nothing about this".
+            return self._scan_candidates(query, category, min_trust, limit)
 
         # Normalize FTS5 rank: rank is negative, lower = better
         # Convert to positive score in [0, 1] range
@@ -460,6 +610,107 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    # Minimum Jaccard for the fallback to call a fact a candidate. Low enough
+    # that a short query against a long fact still matches (a 4-token question
+    # against a 40-token fact tops out near 0.1), high enough to reject a single
+    # incidental word in common.
+    _SCAN_MIN_OVERLAP = 0.04
+
+    # Longest query tokens used for the SQL prefilter. Bounded so a rambling
+    # question cannot build a 40-clause OR.
+    _SCAN_MAX_TOKENS = 6
+
+    def _scan_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Last-resort candidate pass when FTS5 yields nothing.
+
+        Deliberately dumb and bounded: pull the eligible facts and rank them by
+        token overlap in Python. At the scale this store actually operates
+        (hundreds to low thousands of facts) that costs microseconds, and it is
+        the difference between "no memory matched your words" and "no memory
+        exists". Candidates come back with ``fts_rank`` at 0.0, so the caller's
+        scoring is driven by Jaccard and HRR — the FTS term contributes nothing
+        it did not earn.
+        """
+        params: list = []
+        where = ["trust_score >= ?"]
+        params.append(min_trust)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        # Narrow in SQL FIRST, then cap. Capping a plain "newest 200" scan threw
+        # away the answer: with 301 facts where the ONLY match was the oldest, the
+        # fallback returned nothing — defeating the entire reason it exists. A LIKE
+        # over each query token is a coarse prefilter (SQLite has no index for it,
+        # but this only runs when FTS already found nothing), after which the cap
+        # bounds the number of CANDIDATES rather than truncating the corpus.
+        tokens = sorted(
+            {t for t in self._tokenize(query) if t not in self._FTS_STOPWORDS},
+            key=len, reverse=True,
+        )[: self._SCAN_MAX_TOKENS]
+        if tokens:
+            where.append("(" + " OR ".join("lower(content) LIKE ?" for _ in tokens)
+                         + " OR " + " OR ".join("lower(tags) LIKE ?" for _ in tokens) + ")")
+            params.extend([f"%{t}%" for t in tokens] * 2)
+        sql = (
+            "SELECT * FROM facts WHERE " + " AND ".join(where)
+            # Newest first: when several facts match, a recent one is the likelier
+            # answer. The cap is a stall guard, not a filter.
+            + " ORDER BY updated_at DESC, fact_id DESC LIMIT ?"
+        )
+        params.append(max(limit * 20, 200))
+
+        with self.store._lock:
+            try:
+                rows = self.store._conn.execute(sql, params).fetchall()
+            except Exception:
+                return []
+
+        # Stopwords must not be evidence. Matching on "the"/"do"/"and" made this
+        # fallback surface whatever fact happened to contain a function word —
+        # measured: "how do I reach the Oracle machine" returned a note about
+        # Python formatting, matched on {"i", "the"}. Noise the model then trusts
+        # is worse than an honest miss.
+        query_tokens = {t for t in self._tokenize(query) if t not in self._FTS_STOPWORDS}
+        if not query_tokens:
+            return []
+
+        # A category-centroid tie-breaker was tried here and MEASURED AS HARMFUL:
+        # asking each of the 104 live facts to identify its own category from its
+        # own content, the bundled centroid ranked the true category first only
+        # 3.8% of the time — worse than the 14.3% a uniform guess over 7
+        # categories would score. Bundling hundreds of HRR vectors into one
+        # destroys the signal. So ranking here uses token overlap alone;
+        # store.rank_categories() remains available as a diagnostic, and the
+        # dead-weight of maintaining memory_banks is noted in its docstring.
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            fact = dict(row)
+            fact_tokens = {
+                t for t in self._tokenize(fact.get("content", ""))
+                | self._tokenize(fact.get("tags", ""))
+                if t not in self._FTS_STOPWORDS
+            }
+            shared = query_tokens & fact_tokens
+            if not shared:
+                continue
+            # Require a content word in common, not merely a nonzero Jaccard: a
+            # long fact sharing one incidental token scores above zero yet has
+            # nothing to do with the question.
+            overlap = self._jaccard_similarity(query_tokens, fact_tokens)
+            if overlap < self._SCAN_MIN_OVERLAP:
+                continue
+            fact["fts_rank"] = 0.0
+            scored.append((overlap, fact))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [fact for _, fact in scored[:limit]]
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
@@ -514,24 +765,47 @@ class FactRetriever:
         """
         if not query:
             return ""
-        # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
-        _FTS_SPECIAL = '"()*^:-+'
+        # Strip FTS5 operator characters from EACH token to avoid accidentally
+        # creating a malformed query.
+        #
+        # The hyphen is deliberately NOT in this set. Deleting it turned
+        # "copilot-acp" into "copilotacp", which matches nothing: measured on the
+        # live store, every hyphenated term scored zero — copilot-acp (present in
+        # 9 facts), capability-router (4), gpt-5.6-terra (5), deepseek-v3.2 (2).
+        # Those are precisely the provider, model and plugin names the agent asks
+        # about most, so the single most common class of query could not retrieve
+        # anything. Inside a quoted FTS5 phrase a hyphen is literal, so keeping it
+        # is safe; what is unsafe is a BARE hyphen, which FTS5 reads as NOT.
+        _FTS_SPECIAL = '"()*^:+'
         tokens: list[str] = []
+        seen: set[str] = set()
+
+        def push(term: str) -> None:
+            if len(term) < 2 or term in cls._FTS_STOPWORDS or term in seen:
+                return
+            seen.add(term)
+            # Phrase-literal so no special char can escape as an operator.
+            tokens.append(f'"{term}"')
+
         for raw in query.lower().split():
-            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
+            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
                 str.maketrans("", "", _FTS_SPECIAL)
             )
-            if len(cleaned) < 2:
+            # A stray leading/trailing hyphen is punctuation, not part of a name.
+            cleaned = cleaned.strip("-")
+            if not cleaned:
                 continue
-            if cleaned in cls._FTS_STOPWORDS:
-                continue
-            # FTS5 phrase-literal each token to ensure no special chars
-            # sneak through as operators.
-            tokens.append(f'"{cleaned}"')
+            push(cleaned)
+            if "-" in cleaned:
+                # Also offer the components: the tokenizer may have indexed
+                # "capability" and "router" separately, and either should hit.
+                for part in cleaned.split("-"):
+                    push(part)
         if not tokens:
-            # Fallback: raw query (likely returns 0, but never crashes)
-            return query
+            # Nothing survived (pure punctuation, or all stopwords). Returning the
+            # raw query here used to raise OperationalError on ordinary input like
+            # "AND" or "*"; an empty phrase matches nothing and never throws.
+            return '""'
         return " OR ".join(tokens)
 
     @staticmethod

@@ -655,7 +655,9 @@ class MemoryStore:
                     "success": False,
                     "error": (
                         f"After applying all {len(operations)} operations, memory would be at "
-                        f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
+                        f"{new_total:,}/{limit:,} chars -- over the limit. This `memory` store is for "
+                        f"compact always-in-context facts only. If this is bulk data or knowledge, put "
+                        f"it in `fact_store` instead (unlimited). Otherwise remove/shorten stale "
                         f"entries in the same batch (see current_entries below), then retry."
                     ),
                     "current_entries": self._entries_for(target),
@@ -1152,8 +1154,16 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
 MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
-        "Save durable facts to persistent memory that survive across sessions. Memory is "
-        "injected into every future turn, so keep entries compact and high-signal.\n\n"
+        "Compact, ALWAYS-IN-CONTEXT working memory (LIMITED SIZE, ~3000 chars). Saves durable "
+        "facts that survive across sessions; injected into every future turn, so keep entries "
+        "compact and high-signal.\n\n"
+        "TIER ROUTING (read first): this store is SMALL and size-capped. Use it ONLY for a few "
+        "high-signal, always-relevant facts + short pointers. For bulk data, datasets, rosters, "
+        "catalogs, logs, or any body of knowledge you will query later, use the `fact_store` tool "
+        "instead (unlimited, searched on demand) -- writing large content here WILL overflow and "
+        "fail. If a big item has a few always-needed highlights, keep those here (with a pointer "
+        "like \"full X -> fact_store\") and put the full detail in `fact_store`. When asked to "
+        "\"remember\" or \"form memories\" about a large dataset, that means `fact_store`, not this.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
         "{action, content?, old_text?}). The batch applies atomically and the char limit is "
         "checked only on the FINAL result — so a single call can remove/replace stale entries "

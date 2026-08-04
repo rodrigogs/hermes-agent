@@ -1,0 +1,22 @@
+{
+  "k": 5,
+  "known_misses": [
+    "q004",
+    "q013",
+    "q027"
+  ],
+  "known_negative_leaks": [
+    "n004",
+    "n005",
+    "n006",
+    "n007",
+    "n008"
+  ],
+  "lexical_free_share": 0.5,
+  "mrr_at_k": 0.7393,
+  "n_negative": 8,
+  "n_positive": 28,
+  "negative_precision": 0.375,
+  "precision_at_1": 0.6429,
+  "recall_at_k": 0.8929
+}

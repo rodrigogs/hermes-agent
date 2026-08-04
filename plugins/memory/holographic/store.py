@@ -79,15 +79,70 @@ CREATE TABLE IF NOT EXISTS memory_banks (
 # Trust adjustment constants
 _HELPFUL_DELTA   =  0.05
 _UNHELPFUL_DELTA = -0.10
+# Feedback-driven trust bottoms out here rather than at 0.0.
+#
+# Retrieval filters at min_trust=0.3 by default, so three downvotes took a fact
+# from 0.5 to 0.2 and it was never served again — and a fact that is never served
+# can never be upvoted back. That is a one-way trap: an honest correction of a
+# once-wrong memory permanently deleted it from recall while leaving the row on
+# disk, so nobody could see what had been lost. The floor keeps a distrusted fact
+# reachable (it still ranks last, since score scales with trust) so the trap
+# becomes a demotion.
+#
+# Deliberate removal is unaffected: remove_fact() deletes, and update_fact() can
+# still drive trust to 0.0 explicitly via trust_delta.
+_TRUST_FEEDBACK_MIN = 0.3
+# How many facts audit() probes for lexical recall. One was not enough: with a
+# single probe, destroying 19 of 20 facts' index rows still reported healthy.
+_FTS_PROBE_SAMPLES = 8
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
 # Entity extraction patterns
 _RE_CAPITALIZED  = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+# A single capitalised word, but NOT at the start of a sentence or line — that
+# position is grammatical capitalisation, not a name, and accepting it produced
+# 446 one-off junk entities ("Full", "Keep", "Please", "Todos") on the live
+# store. Requiring a preceding word means "on Bedrock" is captured while
+# "Bedrock (Mac, ...)" at position 0 is left to the other patterns.
+_RE_PROPER_NOUN  = re.compile(r'(?<=[a-z,;)]\s)([A-Z][a-z]{2,})\b')
+# Technical identifiers the agent is asked about by name: copilot-acp,
+# gpt-5.6-terra, us-west-2, glm-4.7-flash, hermes-delegate-profile, z.ai.
+# Captures the WHOLE dotted/hyphenated run — an earlier attempt let \b match
+# after a hyphen and truncated "us-west-2" to "west-2", "glm-4.7-flash" to
+# "glm-4.7".
+_RE_SLUG = re.compile(r'(?<![\w.-])([a-z][a-z0-9]*(?:[-.][a-z0-9]+)+)(?![\w-])')
+
+# Hyphenated English compounds share the slug SHAPE but name no entity. A
+# heuristic (digit present, part count, dot count) was tried and misjudged in
+# both directions — it rejected "openai-codex" and accepted "read-only" — so the
+# distinction is drawn explicitly. Anything unlisted is treated as a name, which
+# is the right default for a store whose subject IS technical identifiers.
+_SLUG_STOPWORDS = frozenset({
+    "self-hosted", "self-host", "zero-key", "end-to-end", "access-verified",
+    "high-volume", "family-estimated", "best-value", "not-trust",
+    "do-not-trust", "evidence-based", "always-in-context", "last-resort",
+    "read-only", "write-only", "host-key", "ff-only", "up-to-date",
+    "out-of-date", "brave-free", "well-known", "free-models-per-day",
+    "case-insensitive", "cross-platform", "open-source", "real-time",
+    "per-day", "per-turn", "per-call", "one-way", "two-way", "built-in",
+    "opt-in", "opt-out", "fail-closed", "fail-open", "read-write",
+    "auto-extraction", "in-context", "non-claude", "e2e",
+})
 _RE_DOUBLE_QUOTE = re.compile(r'"([^"]+)"')
-_RE_SINGLE_QUOTE = re.compile(r"'([^']+)'")
+# Require a word boundary outside both quotes, so an apostrophe inside a word
+# ("user's", "it's") cannot pair with the next one. Verified on the live shape:
+# "The user's shell is zsh and it's persistent" previously yielded the entity
+# "s shell is zsh and it", which validated and persisted permanently.
+_RE_SINGLE_QUOTE = re.compile(r"(?<![\w'])'([^'\n]{2,40})'(?![\w'])")
+# Bounded on both sides. The original `(\w+(?:\s+\w+)*)` backtracks quadratically:
+# measured at 1873ms on a 2000-word fact and 730ms on a 5000-char run of one
+# letter, all of it inside add_fact's transaction, holding the write lock. An alias
+# is a name — a few short words — never a paragraph, so capping the run at 4 words
+# of <=30 chars loses nothing real and brings both cases under 10ms.
 _RE_AKA          = re.compile(
-    r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
+    r'((?:\w{1,30}\s+){0,3}\w{1,30})\s+(?:aka|also known as)\s+'
+    r'((?:\w{1,30}\s+){0,3}\w{1,30})',
     re.IGNORECASE,
 )
 
@@ -102,7 +157,28 @@ _ENTITY_STOPWORDS = frozenset({
     "pass", "fail", "done", "todo", "fixme", "warning", "error", "info",
     "started", "stopped", "enabled", "disabled", "blocked", "suspicious",
     "protocol", "gateway", "gate", "unknown", "windows", "linux", "mac",
+    # Fragments of multi-word names the single-word pattern also matches:
+    # "Claude Code" yields "Code", "Hermes One" yields "One". Both are captured
+    # whole by _RE_CAPITALIZED, so the fragment is a duplicate that splits one
+    # entity's facts across two nodes. Measured on the live store: "Code" 14
+    # facts and "one" 11, shadowing "Claude Code" and "Hermes One".
+    "code", "one", "two", "web", "full", "keep", "final", "other", "only",
+    "canonical", "highest", "cost", "please", "commit", "patches", "discovery",
+    "config", "detalhes", "busca", "todos", "zerar", "teste", "fluxo", "limite",
 })
+# Only these may not START an entity. Verbs, auxiliaries and sentence glue — a
+# name beginning with one is a fragment. Product-name heads (windows, linux, mac,
+# gateway, protocol, status) stay OUT of this set and remain in the all-words
+# check below, so "Windows Server" is a name while "Windows" alone is not.
+_ENTITY_HEAD_STOPWORDS = frozenset({
+    "running", "admin", "created", "wait", "waiting", "note", "using", "used",
+    "set", "get", "run", "started", "stopped", "enabled", "disabled", "blocked",
+    "the", "this", "that", "when", "where", "while", "after", "before", "then",
+    "now", "also", "ok", "pass", "fail", "done", "todo", "fixme",
+    # Possessive fragments left by an apostrophe split.
+    "s", "t", "re", "ll", "ve", "d", "m",
+})
+
 # Shell / command noise: if a quoted term looks like a command line or
 # contains shell metacharacters, it's not an entity. NOTE: does NOT reject
 # a plain '.' — identifiers like "glm-5.2" and "Z.AI" are valid entities.
@@ -125,11 +201,17 @@ def _is_valid_entity(name: str) -> bool:
     # a comma anywhere -> sentence fragment, not an entity ("Wait, thats ...")
     if "," in n:
         return False
+    # Hyphenated English compounds look like slugs but name nothing.
+    if low in _SLUG_STOPWORDS:
+        return False
     # strip surrounding punctuation from each word before stopword checks
     words = [re.sub(r"^[\W_]+|[\W_]+$", "", w) for w in low.split()]
     words = [w for w in words if w]
-    # first word is a stopword/verb -> sentence fragment, not an entity
-    if words and words[0] in _ENTITY_STOPWORDS:
+    # A leading VERB means a sentence fragment ("Running Windows ..."). A leading
+    # noun does not: rejecting the whole set made "Gateway API", "Windows Server",
+    # "Linux Mint" and "Mac Studio" invalid while "API Gateway" passed — the same
+    # two words, accepted or refused by order alone.
+    if words and words[0] in _ENTITY_HEAD_STOPWORDS:
         return False
     # every word is a stopword (e.g. "Running Windows") -> junk
     if words and all(w in _ENTITY_STOPWORDS for w in words):
@@ -152,6 +234,11 @@ def _clamp_trust(value: float) -> float:
 
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring."""
+
+    # Exposed so a test can assert it is NOT relying on the stopword list when it
+    # means to test the sentence-position guard. Those two rejections overlap, and
+    # a test that confuses them passes against a broken pattern.
+    _ENTITY_STOPWORDS_FOR_TEST = _ENTITY_STOPWORDS
 
     # --- Process-wide shared connection registry -------------------------
     # SQLite permits only one writer at a time. Each MemoryStore instance used
@@ -311,14 +398,28 @@ class MemoryStore:
 
             # Explicit entities are authoritative. Heuristic extraction remains
             # the fallback for callers that do not provide them.
-            entity_names = entities if entities is not None else self._extract_entities(content)
-            for name in self._normalize_entities(entity_names):
+            #
+            # A name the CALLER chose is validated strictly — a refused link is
+            # something they must hear about. A name a REGEX guessed is not: this
+            # runs inside the atomic group, so raising on one junk candidate rolled
+            # back the fact itself. Losing a memory because a heuristic misfired is
+            # the worst possible trade.
+            explicit = entities is not None
+            entity_names = entities if explicit else self._extract_entities(content)
+            for name in self._normalize_entities(entity_names, strict=explicit):
                 entity_id = self._resolve_entity(name)
                 self._set_entity_aliases(entity_id, self._aliases_for(name, aliases))
                 self._link_fact_entity(fact_id, entity_id)
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
+            # Inside the atomic group ON PURPOSE. A failure here rolls the whole
+            # write back, and that is correct: a fact stored without its entity
+            # links or HRR vector is a half-written memory, and the existing suite
+            # pins this (test_failed_add_rolls_back_fact_entities_and_vector uses
+            # a failing bank as its atomicity canary). Making it best-effort was
+            # tried and reverted — it traded a strong consistency guarantee for a
+            # weaker durability one and left the store quietly inconsistent.
             self._rebuild_bank(category)
 
             return fact_id
@@ -380,6 +481,122 @@ class MemoryStore:
                 self._commit_if_needed()
 
             return results
+
+    def rank_categories(self, query: str, dim: int | None = None) -> list[tuple[str, float]]:
+        """Rank categories by how much a query resembles each one's centroid.
+
+        ``memory_banks`` holds one bundled HRR vector per category, rebuilt on
+        every write — 66% of add_fact's time, measured.
+
+        MEASURED QUALITY, so nobody has to guess: asking each of 104 real facts
+        to identify its own category from its own content, this ranked the true
+        category first 3.8% of the time, against 14.3% for a uniform guess over
+        7 categories. Bundling hundreds of HRR vectors into a single superposition
+        destroys the signal. It is therefore NOT used to influence retrieval; it
+        is kept as a diagnostic, and the write cost it imposes is a standing
+        argument for either raising hrr_dim or dropping the banks entirely.
+
+        Returns ``(category, similarity)`` best-first, or [] when HRR is
+        unavailable or no bank exists. Never raises: a ranking hint that fails
+        must degrade to "no hint", not break retrieval.
+        """
+        if not self._hrr_available or not query:
+            return []
+        dim = dim or self.hrr_dim
+        try:
+            query_vec = hrr.encode_text(query, dim)
+        except Exception:
+            return []
+
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT bank_name, vector, dim FROM memory_banks"
+                ).fetchall()
+            except sqlite3.Error:
+                return []
+
+        ranked: list[tuple[str, float]] = []
+        for row in rows:
+            # A bank built at a different dimension cannot be compared; skip it
+            # rather than producing a meaningless number.
+            if row["dim"] != dim:
+                continue
+            name = str(row["bank_name"] or "")
+            category = name[4:] if name.startswith("cat:") else name
+            try:
+                sim = hrr.similarity(query_vec, hrr.bytes_to_phases(row["vector"]))
+            except Exception:
+                continue
+            ranked.append((category, float(sim)))
+
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        return ranked
+
+    def record_retrievals(self, fact_ids: list[int]) -> None:
+        """Count that these facts were actually served to the model.
+
+        ``search_facts`` already did this, but nothing calls it: live retrieval
+        goes through ``HybridRetriever``, which issues its own SELECT. The result
+        was a usage column that stayed at zero (3 of 104 facts on the live store)
+        while the agent retrieved on every turn — so nobody could tell a
+        load-bearing memory from one that has never once been useful.
+
+        Best-effort by design, and NON-BLOCKING. This runs on the prefetch path,
+        which used to be a pure read — and in WAL mode a reader is never blocked by
+        a writer, but a WRITER is. Measured: with one concurrent add_fact process,
+        a prefetch-shaped search went from 2.7ms to 10020ms, the entire
+        busy_timeout, and then swallowed the error so the counter it waited for was
+        never even recorded. Waiting ten seconds to write telemetry, and losing the
+        telemetry anyway, is the worst of both.
+
+        So the counter takes the lock only if it is free, and abandons the count
+        otherwise. A usage statistic is allowed to be approximate; a turn is not
+        allowed to hang.
+        """
+        if not fact_ids:
+            return
+        # Coercion is INSIDE the guard: int(None) and int("x") raise TypeError and
+        # ValueError, neither of which is a sqlite3.Error, so a malformed id would
+        # have propagated out of search() and killed the turn that was about to use
+        # the memory — the exact opposite of what this method promises.
+        try:
+            ids = [int(f) for f in fact_ids]
+        except (TypeError, ValueError):
+            return
+        # Never queue behind another writer: give up immediately if the in-process
+        # lock is held, and tell SQLite not to wait either.
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._conn.execute("PRAGMA busy_timeout = 0")
+            # Chunked: SQLite's variable limit is build-dependent (999 on older
+            # builds, 32766 on 3.53) and a single IN (...) over a large result set
+            # trips "too many SQL variables".
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                self._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1"
+                    f" WHERE fact_id IN ({placeholders})",
+                    chunk,
+                )
+            self._commit_if_needed()
+        except sqlite3.Error:
+            # SQLITE_BUSY lands here now instead of after a ten-second wait. The
+            # count is telemetry, not the memory: losing one is invisible, and
+            # stalling the turn that was about to use the memory is not.
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+        finally:
+            # Restore the timeout every other caller depends on.
+            try:
+                self._conn.execute("PRAGMA busy_timeout = 10000")
+            except sqlite3.Error:
+                pass
+            self._lock.release()
 
     def update_fact(
         self,
@@ -520,7 +737,26 @@ class MemoryStore:
         with self._lock:
             one = lambda sql: self._conn.execute(sql).fetchone()[0]
             facts = one("SELECT COUNT(*) FROM facts")
+            # COUNT(*) on an external-content FTS5 table scans the CONTENT table
+            # (facts), not the inverted index, so "fts_rows == facts" was a
+            # tautology that could never fail. Verified: wiping the index with
+            # delete-all left audit() reporting healthy=True while every search
+            # returned nothing — the one check an operator would trust was
+            # structurally blind to total loss of lexical recall.
             fts_rows = one("SELECT COUNT(*) FROM facts_fts")
+            # FTS5's own integrity-check is NOT enough: measured, it reports "ok"
+            # for a wiped index, because empty is a *consistent* state. The only
+            # signal that recall actually works is that a term known to be in the
+            # corpus still matches, so probe one.
+            fts_integrity = "ok"
+            try:
+                self._conn.execute(
+                    "INSERT INTO facts_fts(facts_fts) VALUES('integrity-check')"
+                )
+            except sqlite3.Error as exc:
+                fts_integrity = f"integrity-check failed: {exc}"
+            else:
+                fts_integrity = self._probe_fts_recall(facts)
             facts_with_hrr = one(
                 "SELECT COUNT(*) FROM facts WHERE hrr_vector IS NOT NULL"
             )
@@ -559,7 +795,8 @@ class MemoryStore:
                 (
                     integrity_check == "ok",
                     foreign_keys,
-                    fts_rows == facts,
+                    # The real index self-test, not the tautological row count.
+                    fts_integrity == "ok",
                     facts_without_hrr == 0 if self._hrr_available else True,
                     orphan_entities == 0,
                     orphan_links == 0,
@@ -569,6 +806,7 @@ class MemoryStore:
             return {
                 "path": str(self.db_path),
                 "integrity_check": integrity_check,
+                "fts_integrity": fts_integrity,
                 "foreign_keys": foreign_keys,
                 "hrr_available": self._hrr_available,
                 "facts": facts,
@@ -583,6 +821,85 @@ class MemoryStore:
                 "bank_fact_count": bank_fact_count,
                 "healthy": healthy,
             }
+
+    def _probe_fts_recall(self, fact_count: int) -> str:
+        """Confirm the index can still find terms the corpus definitely contains.
+
+        Returns "ok", or a description of the failure. Caller holds the lock.
+
+        An empty external-content index is internally consistent, so FTS5's
+        integrity-check passes while every search silently returns nothing — the
+        exact failure that made audit() report healthy=True on a store that had
+        lost all lexical recall.
+
+        SAMPLES SEVERAL FACTS, not one. A single-fact probe was blind to partial
+        desync: deleting 19 of 20 facts' index rows while leaving the probe target
+        intact still reported healthy=True. Spread the sample across the id range,
+        because rows are usually lost in blocks (a failed batch, an interrupted
+        migration), not at random.
+        """
+        if fact_count == 0:
+            return "ok"  # nothing to find; not a fault
+        rows = self._conn.execute(
+            "SELECT fact_id, content FROM facts WHERE content <> ''"
+            # Spread over the id range: first, last and a few in between.
+            " ORDER BY fact_id"
+        ).fetchall()
+        if not rows:
+            return "ok"
+        step = max(1, len(rows) // _FTS_PROBE_SAMPLES)
+        sample = rows[::step][:_FTS_PROBE_SAMPLES]
+        # Always include the newest fact: an interrupted write leaves the tail
+        # unindexed, and that is the most recent thing the agent learned.
+        if rows[-1] not in sample:
+            sample.append(rows[-1])
+
+        checked = 0
+        for row in sample:
+            # \w with re.UNICODE, NOT [A-Za-z0-9]: the ASCII class truncated at
+            # the first accent, so "Coração" yielded the fragment "Cora", which is
+            # not a token in the index — and audit() then reported a perfectly
+            # healthy Portuguese store as desynced and demanded a rebuild that
+            # could not clear it. This store is full of Portuguese.
+            words = [w for w in re.findall(r"[^\W\d_]{4,}|\w{4,}", row["content"] or "",
+                                           re.UNICODE)]
+            if not words:
+                continue  # cannot form a probe from this fact; do not cry wolf
+            checked += 1
+            try:
+                # Constrain to THIS fact's rowid. Matching the term alone was
+                # useless: the first long word is usually shared across facts, so
+                # one surviving index row satisfied every probe — 19 of 20 facts
+                # could be missing and the audit still passed.
+                hits = self._conn.execute(
+                    "SELECT COUNT(*) FROM facts_fts"
+                    " WHERE facts_fts MATCH ? AND rowid = ?",
+                    (f'"{words[0].lower()}"', row["fact_id"]),
+                ).fetchone()[0]
+            except sqlite3.Error as exc:
+                return f"probe query failed: {exc}"
+            if hits == 0:
+                return (
+                    f"fact {row['fact_id']} is not findable by {words[0]!r}, a term"
+                    f" in its own content — the index is out of sync with"
+                    f" {len(rows)} facts; run rebuild_fts()"
+                )
+        if checked == 0:
+            return "ok"  # no probeable content anywhere
+        return "ok"
+
+    def rebuild_fts(self) -> str:
+        """Rebuild the FTS5 index from the facts table.
+
+        The repair for what _probe_fts_recall detects. Nothing in the plugin could
+        do this before, so a desynced index was permanent.
+        """
+        with self._lock:
+            self._conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            self._commit_if_needed()
+        return self._probe_fts_recall(
+            self._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+        )
 
     def list_facts(
         self,
@@ -634,6 +951,12 @@ class MemoryStore:
             old_trust: float = row["trust_score"]
             delta = _HELPFUL_DELTA if helpful else _UNHELPFUL_DELTA
             new_trust = _clamp_trust(old_trust + delta)
+            # Downvotes demote, they do not delete. Never push a fact below the
+            # retrieval floor, or it can never be served again and so can never
+            # earn its trust back. A fact already below the floor (set explicitly,
+            # or by an older build) is left where it is rather than promoted.
+            if not helpful and old_trust >= _TRUST_FEEDBACK_MIN:
+                new_trust = max(new_trust, _TRUST_FEEDBACK_MIN)
 
             helpful_increment = 1 if helpful else 0
             self._conn.execute(
@@ -659,16 +982,33 @@ class MemoryStore:
     # Entity helpers
     # ------------------------------------------------------------------
 
-    def _normalize_entities(self, entities: list[str]) -> list[str]:
-        """Validate and case-insensitively deduplicate entity names."""
+    def _normalize_entities(
+        self, entities: list[str], *, strict: bool = True
+    ) -> list[str]:
+        """Validate and case-insensitively deduplicate entity names.
+
+        ``strict=True`` (the default, for entities a caller named explicitly)
+        raises on a rejected name: the caller asked for a specific link and
+        deserves to hear that it was refused.
+
+        ``strict=False`` skips rejects instead. That is for HEURISTIC candidates,
+        where raising is catastrophic: _extract_entities runs inside add_fact's
+        atomic group, so one junk candidate from a regex — an apostrophe
+        cross-pair such as "s shell is zsh and it" — rolled the whole write back
+        and silently discarded the fact the agent was told to remember.
+        """
         normalized: list[str] = []
         seen: set[str] = set()
         for raw in entities:
             if not isinstance(raw, str):
-                raise ValueError("entities must contain only strings")
+                if strict:
+                    raise ValueError("entities must contain only strings")
+                continue
             name = raw.strip()
             if not _is_valid_entity(name):
-                raise ValueError(f"invalid entity name: {raw!r}")
+                if strict:
+                    raise ValueError(f"invalid entity name: {raw!r}")
+                continue
             key = name.casefold()
             if key not in seen:
                 seen.add(key)
@@ -763,6 +1103,22 @@ class MemoryStore:
                 candidates.append(stripped)
 
         for m in _RE_CAPITALIZED.finditer(text):
+            _add(m.group(1))
+
+        # A one-word proper noun is still a proper noun. _RE_CAPITALIZED demands
+        # TWO consecutive capitalised words, so "Bedrock", "Claude", "Avell",
+        # "Hermes" — the entities this store is mostly ABOUT — were never
+        # extracted. Measured: 20 of 104 facts had no entity at all, and every
+        # one of them named a single-word product or vendor. _is_valid_entity
+        # already rejects sentence-initial verbs and status words, so this is
+        # generous at the pattern and strict at the filter.
+        for m in _RE_PROPER_NOUN.finditer(text):
+            _add(m.group(1))
+
+        # Technical slugs are the other half of the gap: copilot-acp, us-west-2,
+        # glm-4.7-flash, gpt-5.6-terra. These are the names the agent is asked
+        # about most, and no pattern saw them.
+        for m in _RE_SLUG.finditer(text):
             _add(m.group(1))
 
         for m in _RE_DOUBLE_QUOTE.finditer(text):

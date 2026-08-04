@@ -26,12 +26,17 @@ from plugins.memory.holographic.store import MemoryStore
         ("what happened with the deployment rollback", {"happened", "deployment", "rollback"}),
         # single content word passes through
         ("compaction", {"compaction"}),
-        # all stopwords → falls back to raw
-        ("the and of", None),  # None = sentinel for fallback-to-raw
+        # All stopwords → a matchless phrase, NOT the raw query. Returning the
+        # raw query made FTS5 throw OperationalError, which _fts_candidates then
+        # swallowed into []; '""' matches nothing without raising.
+        ("the and of", "MATCHLESS"),
         # empty string → empty output
         ("", ""),
-        # FTS5 operator characters stripped
-        ("context: length-probe", {"context", "lengthprobe"}),
+        # FTS5 operator characters stripped, but the hyphen is KEPT: deleting it
+        # glued "copilot-acp" into "copilotacp", and every hyphenated provider,
+        # model and plugin name scored zero on the live store. The whole term and
+        # its components are both offered, since either may be indexed.
+        ("context: length-probe", {"context", "length-probe", "length", "probe"}),
         # trailing punctuation stripped by tokenizer
         ("hello, world!", {"hello", "world"}),
     ],
@@ -43,9 +48,8 @@ def test_sanitize_fts_query_extracts_content_tokens(query, expected_tokens):
         assert result == ""
         return
 
-    if expected_tokens is None:
-        # Pathological case: all stopwords — should fall back to raw query
-        assert result == query
+    if expected_tokens == "MATCHLESS":
+        assert result == '""', f"got {result!r}"
         return
 
     # OR-joined phrase literals: `"tok1" OR "tok2" OR ...`

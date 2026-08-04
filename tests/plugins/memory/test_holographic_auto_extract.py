@@ -122,6 +122,45 @@ def test_real_user_messages_still_extracted_alongside_summary(tmp_path):
     provider.shutdown()
 
 
+def test_portuguese_preference_is_auto_extracted(tmp_path):
+    """Portuguese is a first-class conversation language, not an extraction gap."""
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("Eu prefiro respostas concisas e diretas.")])
+    facts = _fact_contents(provider)
+    assert facts == ["Eu prefiro respostas concisas e diretas."]
+    provider.shutdown()
+
+
+def test_portuguese_project_decision_is_auto_extracted(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("Nós decidimos usar SQLite para a memória local.")])
+    facts = _fact_contents(provider)
+    assert facts == ["Nós decidimos usar SQLite para a memória local."]
+    provider.shutdown()
+
+
+def test_auto_extract_skips_semantic_duplicate_of_explicit_fact(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider._store.add_fact(
+        "Rodrigo decidiu que Holographic deve ser usado exclusivamente para validar a memória."
+    )
+    provider.on_session_end(
+        [_user("Nós decidimos usar Holographic apenas para validar a memória.")]
+    )
+    assert len(_fact_contents(provider)) == 1
+    provider.shutdown()
+
+
+def test_auto_extract_keeps_distinct_decision_with_different_entity(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider._store.add_fact("Nós decidimos usar SQLite para cache de memória local.")
+    provider.on_session_end(
+        [_user("Nós decidimos usar PostgreSQL para cache de memória local.")]
+    )
+    assert len(_fact_contents(provider)) == 2
+    provider.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # is_compaction_summary_message — public helper contract
 # ---------------------------------------------------------------------------

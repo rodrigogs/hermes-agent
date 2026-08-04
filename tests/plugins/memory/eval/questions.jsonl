@@ -1,0 +1,36 @@
+{"id": "q001", "kind": "paraphrase", "lang": "en", "query": "how do I ssh into the WSL box from outside the house", "expect": [151], "note": "fact 151 tailscale funnel sshd 2222"}
+{"id": "q002", "kind": "paraphrase", "lang": "en", "query": "how does the bridge find the Mac address when the DHCP lease changes", "expect": [129], "note": "fact 129 discovery sweep"}
+{"id": "q003", "kind": "paraphrase", "lang": "en", "query": "why can I not restart the gateway from a tool call", "expect": [147, 76], "note": "NoNewPrivs sandbox"}
+{"id": "q004", "kind": "paraphrase", "lang": "en", "query": "the chat stopped showing replies but my commands still run", "expect": [150], "note": "PT-BR fact, EN query - cross-lingual"}
+{"id": "q005", "kind": "paraphrase", "lang": "en", "query": "why did context compaction stall and never shrink history", "expect": [144], "note": "summarizer quota"}
+{"id": "q006", "kind": "paraphrase", "lang": "en", "query": "can the free OpenRouter tier be the last resort fallback", "expect": [118, 139], "note": "429"}
+{"id": "q007", "kind": "keyword", "lang": "en", "query": "default model in the Hermes config", "expect": [132], "note": "gpt-5.6-terra"}
+{"id": "q008", "kind": "keyword", "lang": "en", "query": "what should T1 high volume traffic route to", "expect": [141], "note": "glm-4.7-flash"}
+{"id": "q009", "kind": "paraphrase", "lang": "en", "query": "how should my Python code be formatted", "expect": [121], "note": "black line length 100"}
+{"id": "q010", "kind": "paraphrase", "lang": "en", "query": "which author email must the deploy commit use", "expect": [80], "note": "vercel unverified author"}
+{"id": "q011", "kind": "paraphrase", "lang": "en", "query": "what address does the drone expose over the USB cable", "expect": [45], "note": "192.168.2.1"}
+{"id": "q012", "kind": "keyword", "lang": "en", "query": "how many button presses put the Mambo into debug mode", "expect": [43], "note": "shortpress_4"}
+{"id": "q013", "kind": "paraphrase", "lang": "en", "query": "why will the drone not take off", "expect": [46], "note": "vertical camera; takeoff is one token in the fact"}
+{"id": "q014", "kind": "paraphrase", "lang": "en", "query": "which port is the self hosted search engine listening on", "expect": [94, 97], "note": "searxng 8888"}
+{"id": "q015", "kind": "paraphrase", "lang": "en", "query": "why was the Claude Code provider sending so many tokens every request", "expect": [98], "note": "settingSources"}
+{"id": "q016", "kind": "paraphrase", "lang": "en", "query": "what happens to my local commits when I run hermes update", "expect": [123], "note": "origin/main"}
+{"id": "q017", "kind": "paraphrase", "lang": "en", "query": "an MCP server keeps flapping on startup", "expect": [122], "note": "absolute path"}
+{"id": "q018", "kind": "keyword", "lang": "en", "query": "where do hermes cron scripts live", "expect": [125], "note": "profiles scripts dir"}
+{"id": "q019", "kind": "keyword", "lang": "en", "query": "current compaction threshold in tokens", "expect": [149], "note": "650000 track B"}
+{"id": "q020", "kind": "paraphrase", "lang": "en", "query": "how do I run a Windows command as administrator from WSL", "expect": [10], "note": "HermesElevated"}
+{"id": "q021", "kind": "paraphrase", "lang": "en", "query": "how was the laptop wifi card re-enabled", "expect": [51], "note": "EC bits"}
+{"id": "q022", "kind": "paraphrase", "lang": "en", "query": "is the ACPI fix in the registry or on the EFI partition", "expect": [49, 127, 18], "note": "HKLM override"}
+{"id": "q023", "kind": "paraphrase", "lang": "en", "query": "is the Claude Code bridge enabled right now", "expect": [138, 66], "note": "active, supersedes removal"}
+{"id": "q024", "kind": "keyword", "lang": "en", "query": "how many models were access verified in the roster", "expect": [140, 119], "note": "176"}
+{"id": "q025", "kind": "paraphrase", "lang": "en", "query": "did the Mac MCP servers leak into the agent", "expect": [73], "note": "CLAUDE_CONFIG_DIR"}
+{"id": "q026", "kind": "paraphrase", "lang": "en", "query": "was my sudo password ever exposed", "expect": [30], "note": "SUDO_PASSWORD removed"}
+{"id": "q027", "kind": "paraphrase", "lang": "pt", "query": "qual e o modelo padrao configurado", "expect": [132], "note": "cross-lingual PT query, EN fact"}
+{"id": "q028", "kind": "paraphrase", "lang": "pt", "query": "como reinicio o gateway com seguranca", "expect": [148, 147], "note": "safe restart"}
+{"id": "n001", "kind": "negative", "lang": "en", "query": "what is the capital of Mongolia", "expect": [], "note": "world knowledge"}
+{"id": "n002", "kind": "negative", "lang": "en", "query": "how many calories are in a banana", "expect": [], "note": "world knowledge"}
+{"id": "n003", "kind": "negative", "lang": "en", "query": "what is my dentist phone number", "expect": [], "note": "plausible personal, never stored"}
+{"id": "n004", "kind": "negative", "lang": "en", "query": "show me the kubernetes ingress config for the staging cluster", "expect": [], "note": "domain-plausible distractor"}
+{"id": "n005", "kind": "negative", "lang": "en", "query": "which AWS region hosts the postgres primary for billing", "expect": [], "note": "domain-plausible distractor"}
+{"id": "n006", "kind": "negative", "lang": "pt", "query": "qual a receita de feijoada da minha avo", "expect": [], "note": "world knowledge PT"}
+{"id": "n007", "kind": "negative", "lang": "en", "query": "what did I name the redis cache eviction policy", "expect": [], "note": "domain-plausible distractor"}
+{"id": "n008", "kind": "negative", "lang": "en", "query": "who is the on call engineer this week", "expect": [], "note": "plausible ops question"}
