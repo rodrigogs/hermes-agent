@@ -11067,7 +11067,12 @@ def cmd_memory(args):
         # Needed after installing numpy on an install that stored facts without
         # it, or after changing hrr_dim. Backfills NULL vectors + rebuilds banks.
         import os, sys
-        repo = "/usr/local/lib/hermes-agent"
+        # Resolve the active checkout dynamically: the launcher at
+        # ~/.local/bin/hermes is a symlink into the real install dir, which
+        # used to live at /usr/local/lib/hermes-agent on this box and now
+        # lives under ~/Workspace. Hardcoding a path broke reindex after the
+        # move.
+        repo = os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[0])))
         if repo not in sys.path:
             sys.path.insert(0, repo)
         holo_dir = os.path.join(repo, "plugins", "memory", "holographic")
