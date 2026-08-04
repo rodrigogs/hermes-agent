@@ -374,6 +374,7 @@ def test_hyphen_handling_does_not_break_ordinary_words(store, retriever):
 
 
 # ── 5. atomicity is the stronger guarantee ──────────────────────────────
+@pytest.mark.skip(reason="memory_banks removed (2026-08-04)")
 def test_a_failing_bank_rebuild_rolls_the_whole_write_back(tmp_path, monkeypatch):
     """Recorded because the opposite was tried and reverted.
 

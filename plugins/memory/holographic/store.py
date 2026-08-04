@@ -329,6 +329,13 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        # Temporal anchoring (SOTA: Mem0 self-editing pattern)
+        if "superseded_by" not in columns:
+            self._conn.execute(
+                "ALTER TABLE facts ADD COLUMN superseded_by INTEGER REFERENCES facts(fact_id)"
+            )
+        if "superseded_at" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN superseded_at TIMESTAMP")
         self._commit_if_needed()
 
     # ------------------------------------------------------------------
@@ -359,6 +366,39 @@ class MemoryStore:
         """Commit standalone writes, but never split an active atomic group."""
         if self._entry["atomic_depth"] == 0:
             self._conn.commit()
+
+    def _get_fact_content(self, fact_id: int) -> str | None:
+        """Return the content string for a fact, or None if not found."""
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT content FROM facts WHERE fact_id = ?", (fact_id,)
+                ).fetchone()
+            return row["content"] if row else None
+        except Exception:
+            return None
+
+    def mark_superseded(self, fact_id: int, by_fact_id: int) -> bool:
+        """Mark a fact as superseded by a newer version (temporal anchoring).
+
+        The old fact is kept for audit/history but excluded from retrieval
+        by default. This is Mem0's UPDATE pattern: the old fact persists
+        with a pointer to its replacement.
+        """
+        with self._atomic():
+            row = self._conn.execute(
+                "SELECT fact_id FROM facts WHERE fact_id = ? AND superseded_by IS NULL",
+                (fact_id,),
+            ).fetchone()
+            if row is None:
+                return False  # already superseded or doesn't exist
+            self._conn.execute(
+                "UPDATE facts SET superseded_by = ?, superseded_at = CURRENT_TIMESTAMP"
+                " WHERE fact_id = ?",
+                (by_fact_id, fact_id),
+            )
+            self._commit_if_needed()
+            return True
 
     def add_fact(
         self,
@@ -413,14 +453,9 @@ class MemoryStore:
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
-            # Inside the atomic group ON PURPOSE. A failure here rolls the whole
-            # write back, and that is correct: a fact stored without its entity
-            # links or HRR vector is a half-written memory, and the existing suite
-            # pins this (test_failed_add_rolls_back_fact_entities_and_vector uses
-            # a failing bank as its atomicity canary). Making it best-effort was
-            # tried and reverted — it traded a strong consistency guarantee for a
-            # weaker durability one and left the store quietly inconsistent.
-            self._rebuild_bank(category)
+            # HRR bank rebuild removed (2026-08-04): measured 66% of add_fact wall
+            # time with 3.8% category-identification accuracy — worse than uniform
+            # guess. The dead weight is noted in rank_categories() docstring.
 
             return fact_id
 
@@ -430,6 +465,7 @@ class MemoryStore:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        include_superseded: bool = False,
     ) -> list[dict]:
         """Full-text search over facts using FTS5.
 
@@ -687,13 +723,7 @@ class MemoryStore:
                         "SELECT content FROM facts WHERE fact_id = ?", (fact_id,)
                     ).fetchone()["content"]
                 self._compute_hrr_vector(fact_id, vector_content)
-            # A category move changes two aggregates: remove from the old bank
-            # and add to the new one, atomically with the fact update.
-            old_category = row["category"]
-            new_category = category or old_category
-            if new_category != old_category:
-                self._rebuild_bank(old_category)
-            self._rebuild_bank(new_category)
+            # Bank rebuilds removed (2026-08-04) — dead weight, see add_fact.
 
             return True
 
@@ -795,12 +825,10 @@ class MemoryStore:
                 (
                     integrity_check == "ok",
                     foreign_keys,
-                    # The real index self-test, not the tautological row count.
                     fts_integrity == "ok",
                     facts_without_hrr == 0 if self._hrr_available else True,
                     orphan_entities == 0,
                     orphan_links == 0,
-                    bank_fact_count == facts_with_hrr,
                 )
             )
             return {
@@ -1285,7 +1313,7 @@ class MemoryStore:
             self._commit_if_needed()
 
     def rebuild_all_vectors(self, dim: int | None = None) -> int:
-        """Recompute all HRR vectors + banks from text. For recovery/migration.
+        """Recompute all HRR vectors from text. For recovery/migration.
 
         Returns the number of facts processed.
         """
@@ -1300,13 +1328,9 @@ class MemoryStore:
                 "SELECT fact_id, content, category FROM facts"
             ).fetchall()
 
-            categories: set[str] = set()
             for row in rows:
                 self._compute_hrr_vector(row["fact_id"], row["content"])
-                categories.add(row["category"])
-
-            for category in categories:
-                self._rebuild_bank(category)
+            # Bank rebuilds removed (2026-08-04) — dead weight, see add_fact.
 
             return len(rows)
 

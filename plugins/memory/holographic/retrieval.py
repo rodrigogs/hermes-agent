@@ -166,6 +166,15 @@ class FactRetriever:
 
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
+
+        # -- Entity boost (Mem0 "entity matching" signal) --
+        # When the query mentions a known entity, facts linked to that entity
+        # get a small multiplicative boost (1.15x). This is the semantic
+        # equivalent of "if the user asked about X, X's facts rank higher" —
+        # independent of lexical overlap. The boost is small so it nudges but
+        # never overrides the primary signals.
+        scored = self._boost_by_entity_match(query, scored)
+
         results = scored[:limit]
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
@@ -270,7 +279,106 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+
+        # ── Multi-hop graph traversal ──
+        # If we have room (fewer than limit results), expand to facts
+        # connected via shared entities (2-hop). Each hop halves the score
+        # penalty so direct connections always outrank indirect ones.
+        if len(scored) < limit:
+            scored = self._related_multi_hop(
+                entity, scored, category, limit, max_hops=2
+            )
+
         return scored[:limit]
+
+    def _related_multi_hop(
+        self,
+        entity: str,
+        scored: list[dict],
+        category: str | None,
+        limit: int,
+        max_hops: int = 2,
+    ) -> list[dict]:
+        """Expand related() results via entity-link graph traversal.
+
+        Starting from facts directly connected to ``entity``, follow entity
+        links to discover facts 2 hops away. Each hop applies a 0.5x score
+        penalty so direct connections always rank first.
+        """
+        conn = self.store._conn
+        seen: set[int] = {f["fact_id"] for f in scored if f.get("fact_id")}
+
+        hop_entities: set[int] = set()
+        if seen:
+            placeholders = ",".join("?" * len(seen))
+            with self.store._lock:
+                rows = conn.execute(
+                    f"SELECT DISTINCT entity_id FROM fact_entities WHERE fact_id IN ({placeholders})",
+                    list(seen),
+                ).fetchall()
+            hop_entities = {int(r["entity_id"]) for r in rows}
+
+        if not hop_entities:
+            return scored
+
+        for hop in range(2, max_hops + 1):
+            if len(scored) >= limit:
+                break
+
+            placeholders_e = ",".join("?" * len(hop_entities))
+            seen_ph = ",".join("?" * len(seen)) if seen else "0"
+            params: list = list(hop_entities) + list(seen)
+
+            where = [
+                f"fe.entity_id IN ({placeholders_e})",
+                f"f.fact_id NOT IN ({seen_ph})",
+                "f.superseded_by IS NULL",
+            ]
+            if category:
+                where.append("f.category = ?")
+                params.append(category)
+
+            with self.store._lock:
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT f.fact_id, f.content, f.category, f.tags,
+                           f.trust_score, f.retrieval_count, f.helpful_count,
+                           f.created_at, f.updated_at
+                    FROM facts f
+                    JOIN fact_entities fe ON fe.fact_id = f.fact_id
+                    WHERE {' AND '.join(where)}
+                    ORDER BY f.trust_score DESC
+                    LIMIT ?
+                    """,
+                    params + [limit * 2],
+                ).fetchall()
+
+            if not rows:
+                break
+
+            penalty = 0.5 ** (hop - 1)
+            new_ids = []
+            for row in rows:
+                fact = dict(row)
+                fact["score"] = float(fact["trust_score"]) * penalty * 0.3
+                fact["hop"] = hop
+                scored.append(fact)
+                new_ids.append(int(fact["fact_id"]))
+                seen.add(int(fact["fact_id"]))
+
+            if hop < max_hops and new_ids:
+                placeholders_n = ",".join("?" * len(new_ids))
+                with self.store._lock:
+                    erows = conn.execute(
+                        f"SELECT DISTINCT entity_id FROM fact_entities WHERE fact_id IN ({placeholders_n})",
+                        new_ids,
+                    ).fetchall()
+                hop_entities = {int(r["entity_id"]) for r in erows} - hop_entities
+                if not hop_entities:
+                    break
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored
 
     def reason(
         self,
@@ -296,8 +404,6 @@ class FactRetriever:
                 fact["retrieval_method"] = "entity_sql_intersection"
             return exact[:limit]
 
-        # A relation is only asserted when one persisted fact links every
-        # requested entity. HRR similarity cannot establish that conjunction.
         return []
 
     def contradict(
@@ -530,6 +636,7 @@ class FactRetriever:
         params: list = list(fact_ids)
         where = [f"fact_id IN ({placeholders})", "trust_score >= ?"]
         params.append(min_trust)
+        where.append("superseded_by IS NULL")  # temporal anchoring
         if category:
             where.append("category = ?")
             params.append(category)
@@ -577,6 +684,7 @@ class FactRetriever:
 
         where_clauses.append("f.trust_score >= ?")
         params.append(min_trust)
+        where_clauses.append("f.superseded_by IS NULL")  # temporal anchoring
 
         where_sql = " AND ".join(where_clauses)
 
@@ -653,6 +761,7 @@ class FactRetriever:
         params: list = []
         where = ["trust_score >= ?"]
         params.append(min_trust)
+        where.append("superseded_by IS NULL")  # temporal anchoring
         if category:
             where.append("category = ?")
             params.append(category)
@@ -723,6 +832,61 @@ class FactRetriever:
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [fact for _, fact in scored[:limit]]
+
+    # Multiplier for entity-name match in search(). Kept small so a named
+    # entity nudges but never overrides the primary retrieval signals.
+    _ENTITY_BOOST = 1.15
+
+    def _boost_by_entity_match(
+        self, query: str, scored: list[dict]
+    ) -> list[dict]:
+        """Boost facts linked to entities mentioned in the query.
+
+        Mem0's "entity matching" retrieval signal: when the user asks about X,
+        facts about X rank higher, independent of lexical overlap. This catches
+        the case where a query says "Hermes" but the fact says "the agent" --
+        the entity link bridges the vocabulary gap.
+
+        The boost is small (1.15x) and applied multiplicatively, so it nudges an
+        otherwise-strong match above a weak one but never promotes an irrelevant
+        fact over a relevant one.
+        """
+        if not scored:
+            return scored
+        q = " ".join(query.lower().split())
+        if len(q) < 2:
+            return scored
+        try:
+            with self.store._lock:
+                rows = self.store._conn.execute(
+                    "SELECT entity_id, name, aliases FROM entities"
+                ).fetchall()
+        except Exception:
+            return scored
+        boosted_fids: set[int] = set()
+        for row in rows:
+            name = str(row["name"] or "").lower()
+            aliases = str(row["aliases"] or "").lower()
+            if (name and name in q) or any(
+                a.strip() and a.strip() in q for a in aliases.split(",")
+            ):
+                try:
+                    with self.store._lock:
+                        links = self.store._conn.execute(
+                            "SELECT fact_id FROM fact_entities WHERE entity_id = ?",
+                            (row["entity_id"],),
+                        ).fetchall()
+                    boosted_fids.update(int(r["fact_id"]) for r in links)
+                except Exception:
+                    continue
+        if not boosted_fids:
+            return scored
+        for fact in scored:
+            if fact.get("fact_id") in boosted_fids:
+                fact["score"] = fact.get("score", 0.0) * self._ENTITY_BOOST
+                fact["entity_boost"] = True
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
