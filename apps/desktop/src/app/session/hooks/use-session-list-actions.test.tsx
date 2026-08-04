@@ -1,8 +1,17 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SessionInfo } from '@/hermes'
-import { $sessions, $sessionsLoading, setSessions, setSessionsLoading } from '@/store/session'
+import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import {
+  $cronSessions,
+  $messagingSessions,
+  $sessions,
+  $sessionsLoading,
+  setCronSessions,
+  setMessagingSessions,
+  setSessions,
+  setSessionsLoading
+} from '@/store/session'
 
 import { useSessionListActions } from './use-session-list-actions'
 
@@ -29,29 +38,59 @@ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
     ...over
   }) as SessionInfo
 
+// Batched sidebar response builder. `refreshSessions` now makes ONE
+// listSidebarSessions call that returns all three slices, replacing the three
+// separate listAllProfileSessions calls (each of which reopened every profile
+// DB) — #66377-adjacent perf work from the desktop audit canvas.
+const sidebar = (
+  recents: { sessions: SessionInfo[]; profiles_truncated?: Record<string, boolean> },
+  cron: SessionInfo[] = [],
+  messaging: SessionInfo[] = []
+): SidebarSessionsResponse => ({
+  recents: { sessions: recents.sessions, profiles_truncated: recents.profiles_truncated },
+  cron: { sessions: cron },
+  messaging: { sessions: messaging }
+})
+
+const listSidebarSessions = vi.fn()
 const listAllProfileSessions = vi.fn()
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   getCronJobs: vi.fn(async () => []),
-  listAllProfileSessions: (...args: unknown[]) => listAllProfileSessions(...args)
+  listAllProfileSessions: (...args: unknown[]) => listAllProfileSessions(...args),
+  listSidebarSessions: (...args: unknown[]) => listSidebarSessions(...args)
+}))
+
+// The refresh only reads the optimistic tombstone set; stub it so we don't pull
+// the whole projects store (gateway / fs / git) into this hook's test.
+const removed = vi.hoisted(() => ({ ids: new Set<string>() }))
+
+vi.mock('@/store/projects', () => ({
+  $removedSessionIds: { get: () => removed.ids }
 }))
 
 beforeEach(() => {
+  listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  removed.ids = new Set()
   setSessions([])
+  setCronSessions([])
+  setMessagingSessions([])
   setSessionsLoading(false)
 })
 
 afterEach(() => {
   setSessions([])
+  setCronSessions([])
+  setMessagingSessions([])
   setSessionsLoading(false)
 })
 
 describe('refreshSessions identity + loading hygiene', () => {
   it('keeps the previous $sessions array when the refresh is content-identical', async () => {
     const rows = [row('a'), row('b')]
-    listAllProfileSessions.mockResolvedValue({ sessions: rows, total: 2, profile_totals: { default: 2 } })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows }))
 
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
@@ -63,11 +102,7 @@ describe('refreshSessions identity + loading hygiene', () => {
     expect(first.map(s => s.id)).toEqual(['a', 'b'])
 
     // Second refresh returns fresh (but equal) row objects, as the API does.
-    listAllProfileSessions.mockResolvedValue({
-      sessions: [row('a'), row('b')],
-      total: 2,
-      profile_totals: { default: 2 }
-    })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a'), row('b')] }))
 
     await act(async () => {
       await result.current.refreshSessions()
@@ -77,7 +112,7 @@ describe('refreshSessions identity + loading hygiene', () => {
   })
 
   it('swaps the array when rows actually changed', async () => {
-    listAllProfileSessions.mockResolvedValue({ sessions: [row('a')], total: 1, profile_totals: {} })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
     await act(async () => {
@@ -86,11 +121,7 @@ describe('refreshSessions identity + loading hygiene', () => {
 
     const first = $sessions.get()
 
-    listAllProfileSessions.mockResolvedValue({
-      sessions: [row('a', { last_active: 2000, title: 'Renamed' })],
-      total: 1,
-      profile_totals: {}
-    })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a', { last_active: 2000, title: 'Renamed' })] }))
 
     await act(async () => {
       await result.current.refreshSessions()
@@ -101,7 +132,7 @@ describe('refreshSessions identity + loading hygiene', () => {
   })
 
   it('does not flicker the loading flag over a populated list', async () => {
-    listAllProfileSessions.mockResolvedValue({ sessions: [row('a')], total: 1, profile_totals: {} })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
     await act(async () => {
@@ -120,8 +151,28 @@ describe('refreshSessions identity + loading hygiene', () => {
     expect(loadingStates).toEqual([false])
   })
 
+  it('drops rows the user just deleted, even when the backend page still lists them', async () => {
+    // A delete RPC is in flight: the row is tombstoned optimistically but the
+    // batched refresh still carries it (and a lineage-tip variant). Both must be
+    // filtered so the optimistic removal never flashes back.
+    removed.ids = new Set(['b', 'root-c'])
+    listSidebarSessions.mockResolvedValue(
+      sidebar({
+        sessions: [row('a'), row('b'), row('c', { _lineage_root_id: 'root-c' } as Partial<SessionInfo>)]
+      })
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(s => s.id)).toEqual(['a'])
+  })
+
   it('still shows loading for the initial (empty-list) fetch', async () => {
-    listAllProfileSessions.mockResolvedValue({ sessions: [row('a')], total: 1, profile_totals: {} })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
     const loadingStates: boolean[] = []
@@ -133,5 +184,68 @@ describe('refreshSessions identity + loading hygiene', () => {
 
     off()
     expect(loadingStates).toEqual([false, true, false])
+  })
+})
+
+describe('refreshSessions batches slices into one request', () => {
+  it('makes a single sidebar call and distributes recents / cron / messaging', async () => {
+    const recents = [row('a'), row('b')]
+    const cron = [row('c1', { source: 'cron', title: 'nightly' })]
+    const messaging = [row('m1', { source: 'telegram', title: 'tg chat' })]
+
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: recents }, cron, messaging))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    // One batched call, not three separate listAllProfileSessions reads.
+    expect(listSidebarSessions).toHaveBeenCalledTimes(1)
+    expect(listAllProfileSessions).not.toHaveBeenCalled()
+
+    // Each slice landed in its own store.
+    expect($sessions.get().map(s => s.id)).toEqual(['a', 'b'])
+    expect($cronSessions.get().map(s => s.id)).toEqual(['c1'])
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['m1'])
+  })
+
+  it('forwards the active profile scope + section limits to the batched call', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listSidebarSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recentsProfile: 'work',
+        recentsExclude: expect.arrayContaining(['cron']),
+        messagingExclude: expect.arrayContaining(['cron'])
+      })
+    )
+  })
+
+  it('scopes the cron-jobs fetch to the active profile (all → unified view)', async () => {
+    const { getCronJobs } = await import('@/hermes')
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+
+    const scoped = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await scoped.result.current.refreshCronJobs()
+    })
+
+    expect(getCronJobs).toHaveBeenLastCalledWith('work')
+
+    const unified = renderHook(() => useSessionListActions({ profileScope: '__all__' }))
+
+    await act(async () => {
+      await unified.result.current.refreshCronJobs()
+    })
+
+    expect(getCronJobs).toHaveBeenLastCalledWith('all')
   })
 })
