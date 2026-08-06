@@ -2845,15 +2845,13 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
-    if normalized in {"copilot", "copilot-acp"}:
+    if normalized == "copilot":
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
                 return live
         except Exception:
             pass
-        if normalized == "copilot-acp":
-            return list(_PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:
@@ -3061,6 +3059,23 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         pass
 
     curated_static = list(_PROVIDER_MODELS.get(normalized, []))
+    if not curated_static:
+        # No hardcoded catalog for this provider: fall back to whatever its
+        # profile declares. This is the only route by which a provider that
+        # cannot expose an HTTP /models endpoint (auth_type="external_process",
+        # driven as a local subprocess) can describe itself — the live-fetch
+        # branch above is gated on auth_type == "api_key", so it never runs for
+        # them. Without this, such a provider is describable only by editing
+        # _PROVIDER_MODELS in this file, which defeats the out-of-tree plugin
+        # override that providers/__init__.py documents.
+        try:
+            from providers import get_provider_profile
+
+            _profile = get_provider_profile(normalized)
+            if _profile and _profile.fallback_models:
+                curated_static = list(_profile.fallback_models)
+        except Exception:
+            pass
     if normalized in _MODELS_DEV_PREFERRED:
         return _merge_with_models_dev(normalized, curated_static)
     return curated_static
