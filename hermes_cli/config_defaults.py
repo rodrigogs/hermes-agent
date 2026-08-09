@@ -2169,6 +2169,12 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/
+        # .cursorrules, project-local .hermes config) always require human
+        # approval — even under auto-approve/yolo. Extra patterns are
+        # fnmatch globs matched against the basename (e.g. "*.mdc").
+        "protected_instruction_files": True,
+        "protected_instruction_extra_patterns": [],
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
@@ -2354,6 +2360,12 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Orphaned-card reconciliation: each dispatcher tick, requeue
+        # 'running' cards whose claim bookkeeping is broken (claim_lock or
+        # claim_expires NULL with a dead/gone worker) — zombies invisible
+        # to the TTL/crash/stale recovery paths. Set false to keep orphans
+        # frozen for manual forensics.
+        "reconcile_orphans": True,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
