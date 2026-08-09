@@ -176,7 +176,18 @@ def test_top_level_profile_is_inherited_and_per_task_profile_wins():
     ):
         dt.delegate_task(
             profile="reviewer",
-            tasks=[{"goal": "a"}, {"goal": "b", "profile": "coder"}],
+            # Goals must clear upstream's batch quality gate
+            # (_validate_batch_tasks / _MIN_BATCH_GOAL_LEN, added in
+            # 94bc3194b): placeholder-short goals are rejected before any
+            # child is built. The profile-inheritance behaviour under test
+            # is independent of goal length.
+            tasks=[
+                {"goal": "Review the delegation profile inheritance path"},
+                {
+                    "goal": "Implement the per-task profile override path",
+                    "profile": "coder",
+                },
+            ],
             parent_agent=_parent(),
         )
 
