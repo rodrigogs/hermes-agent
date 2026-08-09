@@ -471,12 +471,53 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
 
-    state = _coerce_job_text(normalized.get("state")).strip()
-    if not state:
-        state = "scheduled" if normalized.get("enabled", True) else "paused"
-    normalized["state"] = state
+    # Display state is derived from the scheduler-honoured ``enabled`` flag so a
+    # half-paused record (enabled=true + state/paused_at) cannot render as
+    # "paused" while the fleet is still live. See effective_job_state().
+    normalized["state"] = effective_job_state(normalized)
 
     return normalized
+
+
+def _has_pause_marker(job: Dict[str, Any]) -> bool:
+    """True when the record carries any operator-facing pause signal."""
+    if _coerce_job_text(job.get("state")).strip() == "paused":
+        return True
+    return bool(job.get("paused_at"))
+
+
+def is_job_runnable(job: Dict[str, Any]) -> bool:
+    """True iff the scheduler may fire this job.
+
+    ``enabled`` is the scheduler-honoured flag. Pause markers (``state`` /
+    ``paused_at``) are a second gate so a contradictory half-paused record
+    never fires even before self-heal runs.
+    """
+    if not job.get("enabled", True):
+        return False
+    if _has_pause_marker(job):
+        return False
+    return True
+
+
+def effective_job_state(job: Dict[str, Any]) -> str:
+    """Operator-facing state derived from the scheduler-honoured flag.
+
+    A job with ``enabled=true`` must never display as paused — that was the
+    07-30 outage failure mode (list looked frozen, fleet kept merging).
+    Terminal states (completed/error) are preserved regardless of enabled.
+    """
+    stored = _coerce_job_text(job.get("state")).strip()
+    if stored in {"completed", "error"}:
+        return stored
+    if not job.get("enabled", True):
+        if _has_pause_marker(job) or stored == "paused":
+            return "paused"
+        return stored or "paused"
+    # enabled=true is authoritative: never claim paused
+    if stored == "paused" or job.get("paused_at"):
+        return "scheduled"
+    return stored or "scheduled"
 
 
 def _secure_dir(path: Path):
@@ -1493,6 +1534,36 @@ def _normalized_inference_axes(job: Dict[str, Any]) -> Tuple[Optional[str], Opti
     )
 
 
+def _validate_job_mode_invariants(
+    monitor_script: Optional[str],
+    monitor_url: Optional[str],
+    no_agent: bool,
+    script: Optional[str],
+) -> None:
+    """Shared create/update validation for job execution-mode invariants.
+
+    ONE owner for the class: create_job and update_job both call this so an
+    invariant enforced at create time cannot be violated through the update
+    door (monitor jobs silently degrading when no_agent is flipped on, etc.).
+    """
+    if monitor_script and monitor_url:
+        raise ValueError(
+            "monitor_script and monitor_url are mutually exclusive — a job "
+            "can only have one monitor source."
+        )
+    if (monitor_script or monitor_url) and no_agent:
+        raise ValueError(
+            "monitor_script/monitor_url cannot be combined with no_agent=True — "
+            "the whole point of a monitor job is to suppress or wake the AGENT "
+            "based on source changes. Use a plain no_agent script job instead."
+        )
+    if no_agent and not script:
+        raise ValueError(
+            "no_agent=True requires a script — with no agent and no script "
+            "there is nothing for the job to run."
+        )
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1609,26 +1680,16 @@ def create_job(
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
-    if normalized_monitor_script and normalized_monitor_url:
-        raise ValueError(
-            "monitor_script and monitor_url are mutually exclusive — a job "
-            "can only have one monitor source."
-        )
-    if (normalized_monitor_script or normalized_monitor_url) and normalized_no_agent:
-        raise ValueError(
-            "monitor_script/monitor_url cannot be combined with no_agent=True — "
-            "the whole point of a monitor job is to suppress or wake the AGENT "
-            "based on source changes. Use a plain no_agent script job instead."
-        )
-
     # no_agent jobs are meaningless without a script — the script IS the job.
-    # Surface this as a clear ValueError at create time so bad configs never
-    # reach the scheduler.
-    if normalized_no_agent and not normalized_script:
-        raise ValueError(
-            "no_agent=True requires a script — with no agent and no script "
-            "there is nothing for the job to run."
-        )
+    # Surface these as clear ValueErrors at create time so bad configs never
+    # reach the scheduler (shared with update_job, see
+    # _validate_job_mode_invariants).
+    _validate_job_mode_invariants(
+        normalized_monitor_script,
+        normalized_monitor_url,
+        normalized_no_agent,
+        normalized_script,
+    )
 
     # Normalize context_from: accept str or list of str, store as list or None
     if isinstance(context_from, str):
@@ -1818,8 +1879,33 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            # Normalize monitor fields the same way create_job does (empty
+            # string clears the field).
+            for _mon_field in ("monitor_script", "monitor_url"):
+                if _mon_field in updates:
+                    _mv = updates[_mon_field]
+                    _mv = str(_mv).strip() if isinstance(_mv, str) else None
+                    updates[_mon_field] = _mv or None
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            # Re-check execution-mode invariants on the MERGED record when
+            # any participating field changes, so create-time invariants
+            # can't be violated through the update door (e.g. flipping
+            # no_agent=True on a monitor job would silently disable the
+            # monitor: the scheduler's no_agent short-circuit runs before
+            # the monitor gate). Scoped to changed fields so legacy records
+            # untouched by this update keep loading.
+            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+                _upd_script = updated.get("script")
+                _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
+                _validate_job_mode_invariants(
+                    updated.get("monitor_script") or None,
+                    updated.get("monitor_url") or None,
+                    bool(updated.get("no_agent")),
+                    _upd_script or None,
+                )
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -1970,6 +2056,17 @@ def remove_job(job_id: str) -> bool:
             # Clean up output directory to prevent orphaned dirs accumulating
             if job_output_dir.exists():
                 shutil.rmtree(job_output_dir)
+            # Clean up the job's durable notepad (cron/notepad.db) — without
+            # this, removed jobs orphan their KV rows forever. Best effort:
+            # a notepad failure must never block the removal itself.
+            try:
+                from cron.notepad import clear_notepad
+                clear_notepad(canonical_id)
+            except Exception:
+                logger.debug(
+                    "Failed to clear notepad for removed job %s",
+                    canonical_id, exc_info=True,
+                )
             return True
     return False
 
@@ -2382,7 +2479,9 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
         for job in jobs:
             if job["id"] != job_id:
                 continue
-            if not job.get("enabled", True) or job.get("state") == "paused":
+            # enabled + pause markers must both clear — a half-paused record
+            # (enabled=true, state=paused/paused_at set) must not claim.
+            if not is_job_runnable(job):
                 return False
             now = _hermes_now()
             existing = job.get("fire_claim")
@@ -2635,6 +2734,34 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+
+            # Contradiction self-heal: enabled=true with pause markers means the
+            # operator believes the job is frozen while the scheduler would still
+            # fire it (07-30 outage). Refuse to run and force enabled=false so
+            # the next list/report is honest. Log loudly — this should be rare
+            # after pause_job sets both fields atomically.
+            if _has_pause_marker(job):
+                jid = job.get("id")
+                logger.error(
+                    "Job '%s' (%s) has pause markers while enabled=true; "
+                    "self-disabling so it cannot fire (pause must be authoritative).",
+                    job.get("name", jid),
+                    jid,
+                )
+                for rj in raw_jobs:
+                    if rj.get("id") != jid:
+                        continue
+                    rj["enabled"] = False
+                    rj["state"] = "paused"
+                    if not rj.get("paused_at"):
+                        rj["paused_at"] = now.isoformat()
+                    if not rj.get("paused_reason"):
+                        rj["paused_reason"] = (
+                            "auto-disabled: enabled+paused contradiction"
+                        )
+                    needs_save = True
+                    break
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler

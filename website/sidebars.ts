@@ -71,6 +71,7 @@ const sidebars: SidebarsConfig = {
           label: 'Core',
           items: [
             'user-guide/features/tools',
+            'user-guide/features/document-extraction',
             'user-guide/features/tool-search',
             'user-guide/features/skills',
             'user-guide/features/lsp',
@@ -200,6 +201,7 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-email',
                   collapsed: true,
                   items: [
+                    'user-guide/skills/bundled/email/email-email-inbox-triage',
                     'user-guide/skills/bundled/email/email-himalaya',
                   ],
                 },
@@ -257,6 +259,7 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/productivity/productivity-airtable',
+                    'user-guide/skills/bundled/productivity/productivity-document-to-action-items',
                     'user-guide/skills/bundled/productivity/productivity-docx',
                     'user-guide/skills/bundled/productivity/productivity-google-workspace',
                     'user-guide/skills/bundled/productivity/productivity-maps',

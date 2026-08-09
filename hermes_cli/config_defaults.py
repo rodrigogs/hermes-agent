@@ -279,6 +279,12 @@ DEFAULT_CONFIG = {
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
+        # Remote-backend graceful degradation: when a connection-class
+        # infrastructure failure occurs (SSH host unreachable, Docker daemon
+        # down), "warn" (default) returns a structured degraded tool result
+        # with a reason + retry hint so the model can act on it; "fail"
+        # preserves the historical error + traceback behavior.
+        "degraded_mode": "warn",
         "cwd": ".",  # Use current directory
         # Terminal font family for the desktop app's embedded xterm.js terminal.
         # When set (e.g. "'CaskaydiaCoveNerdFont', 'JetBrains Mono', monospace"),
@@ -2776,6 +2782,17 @@ DEFAULT_CONFIG = {
         # attributable per query shape. 0 logs every search. Bridged to
         # HERMES_SEARCH_SLOW_MS (internal carrier).
         "search_slow_ms": 1000,
+        # Transcript safety limits. A runaway session (hundreds of thousands
+        # of rows) can exhaust memory when its transcript is materialized in
+        # one shot, so interactive resume and in-memory export are guarded by
+        # bounded row counts. Set a limit to 0 to disable that guard.
+        # Max active messages (across the full compression lineage) a session
+        # may hold and still be resumed interactively (CLI/TUI/desktop).
+        "max_resume_messages": 20000,
+        # Max active messages a single session may hold for an in-memory
+        # (non-streaming) export such as `hermes sessions export`. Checked
+        # per session, so full-DB backups of many small sessions still work.
+        "max_export_messages": 20000,
     },
 
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
@@ -2797,6 +2814,13 @@ DEFAULT_CONFIG = {
         "shared_metrics": {
             "enabled": False,
         },
+    },
+
+    # ``hermes doctor`` behaviour.
+    "doctor": {
+        # Per-probe timeout (seconds) for the opt-in `hermes doctor --live`
+        # real-call backend probes (Firecrawl/FAL/browser/MCP/TTS/STT).
+        "live_probe_timeout": 10,
     },
 
     # ``hermes update`` behaviour.
