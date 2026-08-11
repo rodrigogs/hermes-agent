@@ -83,6 +83,47 @@ def test_a_tool_result_says_which_call_it_answers() -> None:
     assert "c2" in search_block.rsplit("Tool:", 1)[-1]
 
 
+def test_an_empty_tool_result_still_appears() -> None:
+    """"No output" must read as "completed", not as "never ran".
+
+    An empty result was dropped by the same ``if not rendered: continue`` that
+    dropped the assistant turn, so the model saw its own call with no answer at
+    all, concluded the tool had not run, and called again. Measured through the
+    gateway: a write_file returning "" was retried 12 times until a guardrail
+    halted the loop — while the file had been written correctly on the first
+    attempt. Writes, deletes and setters succeed silently all the time.
+    """
+    messages = [
+        {"role": "user", "content": "Write X into /tmp/a.txt."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "write_file", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "name": "write_file", "content": ""},
+    ]
+    body = _transcript(acp._format_messages_as_prompt(messages, tools=[]))
+
+    assert "Tool:" in body, "the empty result vanished, so the call looks unanswered"
+    tool_block = body.rsplit("Tool:", 1)[-1]
+    assert "write_file" in tool_block and "c1" in tool_block
+    assert "no output" in tool_block, "nothing tells the model the call completed"
+
+
+def test_a_whitespace_only_tool_result_also_appears() -> None:
+    """Same defect, one step subtler: content that renders down to "" after strip."""
+    messages = [
+        {"role": "user", "content": "Delete /tmp/a.txt."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "delete_file", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "name": "delete_file", "content": "   \n  "},
+    ]
+    body = _transcript(acp._format_messages_as_prompt(messages, tools=[]))
+    assert "Tool:" in body
+    assert "no output" in body.rsplit("Tool:", 1)[-1]
+
+
 def test_the_sdk_object_shape_round_trips_too() -> None:
     """An agent loop may replay this module's own return value rather than dicts,
     so the renderer has to read attributes as well as keys."""

@@ -296,16 +296,26 @@ def _format_messages_as_prompt(
         # A tool result is only interpretable if it says which call it answers.
         # Two results from two different tools arrived as two anonymous `Tool:`
         # blocks, leaving the model to guess the pairing.
+        #
+        # An EMPTY result must still appear. `if not rendered: continue` below used
+        # to delete it, so the model saw its own call with no answer at all,
+        # concluded the tool had not run, and called again — measured: a write_file
+        # that returned "" was retried 12 times until a guardrail stopped the loop,
+        # even though the file had been written correctly on the first attempt.
+        # Plenty of real tools (writes, deletes, setters) succeed silently, so
+        # "no output" has to read as "completed, nothing to report".
         if role == "tool":
             tool_name = str(message.get("name") or "").strip()
             call_id = str(message.get("tool_call_id") or "").strip()
-            if rendered and (tool_name or call_id):
-                attribution = " ".join(
-                    part for part in (
-                        f"name={tool_name}" if tool_name else "",
-                        f"id={call_id}" if call_id else "",
-                    ) if part
-                )
+            if not rendered:
+                rendered = "(completed with no output)"
+            attribution = " ".join(
+                part for part in (
+                    f"name={tool_name}" if tool_name else "",
+                    f"id={call_id}" if call_id else "",
+                ) if part
+            )
+            if attribution:
                 rendered = f"[{attribution}]\n{rendered}"
 
         if not rendered:
