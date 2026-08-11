@@ -298,13 +298,54 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "openai-codex": _codex_curated_models(),
     "xai-oauth": _xai_curated_models(),
+    # This install points the ACP executor at Claude Code on a Mac over SSH
+    # (HERMES_COPILOT_ACP_COMMAND -> hermes-claude-acp-remote.sh), so the models
+    # reachable through it are the ones that host's gate allows — not GitHub
+    # Copilot's catalogue. Listing them here is what lets the picker offer a model
+    # the far side will actually accept; the executor receives the choice through
+    # HERMES_ACP_MODEL and validates it against the same allowlist, so an id from
+    # this list can never turn into an arbitrary invocation.
+    #
+    # The slug still reads "copilot-acp" because it is the ACP transport this fork
+    # inherited, and renaming it would mean touching auth, oauth, onboarding,
+    # providers and config in both repos — recurring merge conflict surface on a
+    # fork that is already far behind upstream. If GitHub Copilot ACP is ever
+    # wanted alongside this, the two cannot share one slug and it needs its own.
+    #
+    # Kept in sync by hand with ACP_USABLE_MODELS in the Mac's hermes-mcp-gate.sh
+    # (WORKING_MODELS minus ACP_EXCLUDED_MODELS, which drops the Claude 3 models
+    # that cannot do prompt caching).
     "copilot-acp": [
-        "copilot-acp",
+        "us.anthropic.claude-opus-5",
+        "us.anthropic.claude-sonnet-5",
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-opus-4-5-20251101-v1:0",
+        "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "us.anthropic.claude-sonnet-4-6",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
     ],
     "copilot": [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5-mini",
+        "gpt-5.3-codex",
+        "gpt-5.2-codex",
         "gpt-4.1",
         "gpt-4o",
         "gpt-4o-mini",
+        "claude-sonnet-4.6",
+        "claude-sonnet-5",
+        "claude-sonnet-4",
+        "claude-sonnet-4.5",
+        "claude-haiku-4.5",
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
+        "gemini-2.5-pro",
     ],
     "gemini": [
         "gemini-3.1-pro-preview",
@@ -316,14 +357,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "glm-5.2",
         "glm-5.1",
         "glm-5",
+        "glm-5v-turbo",
         "glm-5-turbo",
         "glm-4.7",
-        "glm-4.6",
         "glm-4.5",
         "glm-4.5-flash",
-        "glm-4.6v",
-        "glm-4.5v",
-        "glm-4.5-air",
     ],
     "xai": _xai_curated_models(),
     "nvidia": [
@@ -410,6 +448,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "xiaomi": [
         "mimo-v2.5-pro",
         "mimo-v2.5",
+        "mimo-v2-pro",
+        "mimo-v2-omni",
+        "mimo-v2-flash",
     ],
     "tencent-tokenhub": [
         "hy3-preview",
@@ -1115,7 +1156,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("tencent-tokenhub", "Tencent TokenHub",       "Tencent TokenHub (Hy3 Preview via tokenhub.tencentmaas.com)"),
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
-    ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("copilot-acp",    "Claude Code (ACP)",        "ACP executor over stdio; this install routes it to Claude Code"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -1194,7 +1235,12 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "openai":   ("OpenAI",          "Codex CLI or direct OpenAI API",                  ["openai-codex", "openai-api"]),
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
-    "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
+    "copilot":  ("GitHub Copilot",  "GitHub token API",                                ["copilot"]),
+    # Its own group, not a member of "copilot". Grouped together, the picker showed
+    # GitHub Copilot's 17 model ids under the ACP label — measured on the live
+    # /api/models — so every option offered for this provider was one the ACP
+    # executor could not serve.
+    "copilot-acp": ("Claude Code (ACP)", "ACP executor over stdio (this install: Claude Code)", ["copilot-acp"]),
 }
 
 # Reverse index: member slug -> group_id. Built once at import.
@@ -2872,15 +2918,21 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return get_codex_model_ids(access_token=access_token)
     if normalized == "xai-oauth":
         return list(_PROVIDER_MODELS.get("xai-oauth", _PROVIDER_MODELS.get("xai", [])))
-    if normalized in {"copilot", "copilot-acp"}:
+    if normalized == "copilot-acp":
+        # NOT the GitHub catalogue. This branch used to fetch GitHub's live model
+        # list and fall back to _PROVIDER_MODELS["copilot"], which is where the 17
+        # gpt-* ids under the ACP label came from — every one unusable, because the
+        # ACP executor here is Claude Code on another host. Its own curated list is
+        # the only honest answer, and there is nothing live to query: the ACP
+        # handshake reports capabilities, not a model catalogue.
+        return list(_PROVIDER_MODELS.get("copilot-acp", []))
+    if normalized == "copilot":
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
                 return live
         except Exception:
             pass
-        if normalized == "copilot-acp":
-            return list(_PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:

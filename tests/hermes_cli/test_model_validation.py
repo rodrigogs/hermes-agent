@@ -93,7 +93,12 @@ class TestProviderLabel:
         assert provider_label("kimi") == "Kimi / Kimi Coding Plan"
         assert provider_label("stepfun") == "StepFun Step Plan"
         assert provider_label("copilot") == "GitHub Copilot"
-        assert provider_label("copilot-acp") == "GitHub Copilot ACP"
+        # This fork points the ACP stdio transport at Claude Code on another
+        # host rather than at the GitHub Copilot CLI, so the label names what
+        # actually answers. The slug stays `copilot-acp` because renaming it
+        # would touch auth, oauth, onboarding, providers and config in two
+        # repos — recurring merge-conflict surface on a fork already far behind.
+        assert provider_label("copilot-acp") == "Claude Code (ACP)"
         assert provider_label("auto") == "Auto"
 
 

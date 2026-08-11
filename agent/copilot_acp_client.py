@@ -99,7 +99,7 @@ def _resolve_home_dir() -> str:
     return "/tmp"
 
 
-def _build_subprocess_env() -> dict[str, str]:
+def _build_subprocess_env(model: str | None = None) -> dict[str, str]:
     # Copilot ACP is a model-driving CLI executor: it legitimately needs LLM
     # provider credentials. Route through the central helper so Tier-1 secrets
     # (gateway bot tokens, GitHub auth, infra) are still stripped (#29157).
@@ -108,6 +108,21 @@ def _build_subprocess_env() -> dict[str, str]:
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+
+    # Pass the requested model to the ACP executor.
+    #
+    # Without this the selected model was decorative: it labelled the prompt and
+    # the returned completion, but the subprocess argv is a fixed
+    # ["--acp", "--stdio"] and nothing carried the id, so the executor always ran
+    # its own default. Measured by replacing the executor with a recorder — it saw
+    # `argv: [--acp --stdio]` and no model variable at all, for every model the
+    # UI offered.
+    #
+    # HERMES_ACP_MODEL is the agreed channel: an executor that understands it
+    # selects that model, and one that does not ignores an unknown variable and
+    # keeps its default, so this cannot break the GitHub Copilot CLI.
+    if model:
+        env["HERMES_ACP_MODEL"] = str(model)
     return env
 
 
@@ -473,6 +488,7 @@ class CopilotACPClient:
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
             timeout_seconds=_effective_timeout,
+            model=model,
         )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
@@ -501,7 +517,13 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+    ) -> tuple[str, str]:
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
@@ -515,7 +537,7 @@ class CopilotACPClient:
                 text=True, encoding='utf-8', errors='replace',
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_build_subprocess_env(model),
                 creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as exc:
