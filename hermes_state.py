@@ -6886,6 +6886,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     )
     _session_compact_cols_sql: Optional[str] = None
 
+    def usage_totals(self, *, min_message_count: int = 1, include_archived: bool = False) -> Dict[str, float]:
+        """Tokens and spend across this store, as one aggregate.
+
+        The sidebar shows a profile's totals beside a page of its sessions, so
+        summing the rows it happens to have loaded would report a fraction of
+        the truth and shrink as paging changed. SQLite adds the columns up over
+        every row instead, at the cost of one scan.
+
+        Spend is the billed figure when the provider returned one and the
+        estimate otherwise — the same precedence a single row renders.
+        """
+        where = ["parent_session_id IS NULL", "message_count >= ?"]
+        params: List[Any] = [min_message_count]
+        if not include_archived:
+            where.append("COALESCE(archived, 0) = 0")
+
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                       COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0)
+                  FROM sessions
+                 WHERE {' AND '.join(where)}
+                """,
+                params,
+            ).fetchone()
+
+        return {"tokens": int(row[0] or 0), "cost_usd": float(row[1] or 0.0)}
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -7974,6 +8003,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         messages: List[Dict[str, Any]],
         active_only: bool = False,
+        archive_dropped: bool = False,
     ) -> None:
         """Atomically replace the stored messages for a session.
 
@@ -7994,6 +8024,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         full-history rewrite doesn't wipe the rows the agent deliberately
         archived. ``message_count``/``tool_call_count`` then track the live set,
         matching :meth:`archive_and_compact`.
+
+        Pass ``archive_dropped=True`` to SOFT-archive the live rows instead of
+        DELETEing them: the replaced turns stay on disk with ``active = 0``,
+        ``compacted = 0`` — the same "the user took it back" marking
+        :meth:`rewind_to_message` applies — and stay readable via
+        :meth:`get_messages` with ``include_inactive=True``. This is the mode a
+        rewind/edit/regenerate must use: those flows overwrite a transcript the
+        user may not have meant to drop, and a plain DELETE also evicts the rows
+        from the FTS index, leaving nothing to recover from (#82756). It implies
+        active-only handling — already-archived rows are never touched — so
+        ``active_only`` is redundant with it. The rewritten set is inserted as
+        fresh active rows exactly as in the destructive path, so the live view
+        is identical either way; only the durability of the dropped turns
+        differs.
         """
 
         active_clause = " AND active = 1" if active_only else ""
@@ -8009,10 +8053,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["end_reason"] == "compression"
             ):
                 raise CompressionSessionClosedError(session_id)
-            conn.execute(
-                f"DELETE FROM messages WHERE session_id = ?{active_clause}",
-                (session_id,),
-            )
+            if archive_dropped:
+                # Content-preserving UPDATE: the rows keep their FTS entries
+                # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
+                # of content columns, not on `active`), so the replaced turns
+                # stay readable via get_messages(include_inactive=True) and
+                # searchable with include_inactive=True after the rewrite.
+                conn.execute(
+                    "UPDATE messages SET active = 0 "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                )
+            else:
+                conn.execute(
+                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
+                    (session_id,),
+                )
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),

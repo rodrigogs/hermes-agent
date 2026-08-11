@@ -2894,6 +2894,13 @@ def _persist_branch_seed(session: dict) -> None:
                         "reasoning_details": msg.get("reasoning_details"),
                         "codex_reasoning_items": msg.get("codex_reasoning_items"),
                         "codex_message_items": msg.get("codex_message_items"),
+                        # Timeline markers (model_switch, personality_switch,
+                        # auto_continue, …) ride as role=user; dropping the tag
+                        # here re-planted them as bare user turns after a
+                        # restart, corrupting the truncate ordinal address
+                        # space the same way #82756 did.
+                        "display_kind": msg.get("display_kind"),
+                        "display_metadata": msg.get("display_metadata"),
                         # Preserve the parent's original message timestamps —
                         # append_message would otherwise stamp time.time() and the
                         # branch's copied history would all appear authored "now".
@@ -5127,7 +5134,9 @@ def _current_profile_name() -> str:
 # v3: adds approvals.mode config RPCs and session.info reconciliation.
 # v4: session.create fast=false is an explicit per-session normal-tier override.
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
-DESKTOP_BACKEND_CONTRACT = 5
+# v6: plugins.manage list rows carry the canonical registry key; toggles are
+#     key-addressed (keyless rows render read-only in Desktop Settings).
+DESKTOP_BACKEND_CONTRACT = 6
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -6065,8 +6074,17 @@ def _apply_personality_to_session(
                 "[System: The user has cleared the personality overlay. "
                 "From this point forward, respond in your normal default style.]"
             )
+        # Tagged like the model-switch marker (`_append_model_switch_marker`):
+        # the marker rides as role=user so strict OpenAI-compatible providers
+        # accept it mid-conversation, but `display_kind` keeps it out of the
+        # `truncate_before_user_ordinal` addressing space. Untagged, it counts
+        # as a real user turn on the gateway side while no client counts it, so
+        # every later rewind resolves one turn too early and `replace_messages`
+        # hard-deletes the difference (#82756).
         with session["history_lock"]:
-            session["history"].append({"role": "user", "content": marker})
+            session["history"].append(
+                {"role": "user", "content": marker, "display_kind": "personality_switch"}
+            )
             session["history_version"] = int(session.get("history_version", 0)) + 1
         info = _session_info(agent)
         _emit("session.info", sid, info)
@@ -8065,6 +8083,12 @@ def _fallback_session_info(session: dict) -> dict:
         "model": _resolve_model(),
         "skills": {},
         "tools": {},
+        # A lazy session (agent not built yet) is still served by *this* backend,
+        # so it must advertise the current contract. Desktop feeds this straight
+        # into reportBackendContract(); a missing field is read as contract 0 and
+        # a current backend is falsely flagged "out of date" (#68392). The sibling
+        # session.create shape (_lazy_resume_info) already carries it (#36112).
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
 
 
@@ -11912,6 +11936,11 @@ def _project_tree_row(r: dict) -> dict:
         "tool_call_count": r.get("tool_call_count") or 0,
         "input_tokens": r.get("input_tokens") or 0,
         "output_tokens": r.get("output_tokens") or 0,
+        # Cost is one of the fields SidebarSessionRow renders, so a lane row has
+        # to carry it too — without it, switching Show → cost filled in every
+        # figure in Recents and left the same sessions blank under a project.
+        "actual_cost_usd": r.get("actual_cost_usd"),
+        "estimated_cost_usd": r.get("estimated_cost_usd"),
         "model": r.get("model"),
         "is_active": False,
         "cwd": r.get("cwd"),
