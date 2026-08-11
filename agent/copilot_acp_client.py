@@ -149,6 +149,50 @@ def _permission_denied(message_id: Any) -> dict[str, Any]:
     }
 
 
+def _render_assistant_tool_calls(tool_calls: Any) -> str:
+    """Render an assistant turn's tool calls back into the transcript.
+
+    Accepts both the dict shape a caller replays from history and the SDK object
+    shape this module returns, because an agent loop may feed back either.
+
+    Emitted in the same <tool_call>{...}</tool_call> form the model is asked to
+    produce, so the transcript shows a consistent protocol rather than one syntax
+    for output and another for history.
+    """
+    if not isinstance(tool_calls, (list, tuple)) or not tool_calls:
+        return ""
+
+    lines: list[str] = []
+    for call in tool_calls:
+        if isinstance(call, dict):
+            call_id = call.get("id")
+            fn = call.get("function") or {}
+            name = fn.get("name") if isinstance(fn, dict) else None
+            args = fn.get("arguments") if isinstance(fn, dict) else None
+        else:
+            call_id = getattr(call, "id", None)
+            fn = getattr(call, "function", None)
+            name = getattr(fn, "name", None)
+            args = getattr(fn, "arguments", None)
+
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args if args is not None else {}, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args = "{}"
+        payload = {
+            "id": call_id if isinstance(call_id, str) and call_id.strip() else "",
+            "type": "function",
+            "function": {"name": name.strip(), "arguments": args},
+        }
+        if not payload["id"]:
+            payload.pop("id")
+        lines.append(f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>")
+    return "\n".join(lines)
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -190,8 +234,40 @@ def _format_messages_as_prompt(
                 + json.dumps(tool_specs, ensure_ascii=False)
             )
 
+    # tool_choice is a contract, not a hint. OpenAI semantics: "required" and
+    # {"type":"function","function":{"name":X}} MEAN the next message must be a
+    # call, and "none" means it must not be. Appending the raw JSON under the word
+    # "hint" left the model free to answer in prose instead — measured: forcing
+    # get_weather produced a friendly greeting and zero calls.
     if tool_choice is not None:
-        sections.append(f"Tool choice hint: {json.dumps(tool_choice, ensure_ascii=False)}")
+        forced_name = ""
+        if isinstance(tool_choice, dict):
+            fn = tool_choice.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                forced_name = fn["name"].strip()
+        if forced_name:
+            sections.append(
+                f"REQUIRED: this turn MUST call the tool `{forced_name}` and nothing else. "
+                "Emit exactly one <tool_call>{...}</tool_call> block for it. Do not answer "
+                "in prose, do not ask a clarifying question, and do not call any other tool. "
+                "If a required argument is genuinely unknown, choose the most reasonable "
+                "value rather than skipping the call."
+            )
+        elif tool_choice == "required":
+            sections.append(
+                "REQUIRED: this turn MUST call one of the available tools. Emit at least one "
+                "<tool_call>{...}</tool_call> block and no prose answer."
+            )
+        elif tool_choice == "none":
+            sections.append(
+                "Tool use is DISABLED for this turn: answer in prose and emit no "
+                "<tool_call> blocks, even if a tool would help."
+            )
+        else:
+            sections.append(
+                "Tool use is optional this turn: call a tool if one applies, otherwise "
+                "answer normally."
+            )
 
     transcript: list[str] = []
     for message in messages:
@@ -205,6 +281,33 @@ def _format_messages_as_prompt(
 
         content = message.get("content")
         rendered = _render_message_content(content)
+
+        # An assistant message that made a tool call carries content=None and the
+        # calls in `tool_calls`. Rendering only `content` made it empty, so the
+        # whole message was skipped and the model saw a bare `Tool:` result with no
+        # idea which tool ran, with which arguments, or under which id — the agent
+        # loop's second turn was reasoning about an orphan. Render the calls so the
+        # transcript reads as a real exchange.
+        if role == "assistant":
+            rendered_calls = _render_assistant_tool_calls(message.get("tool_calls"))
+            if rendered_calls:
+                rendered = f"{rendered}\n{rendered_calls}".strip() if rendered else rendered_calls
+
+        # A tool result is only interpretable if it says which call it answers.
+        # Two results from two different tools arrived as two anonymous `Tool:`
+        # blocks, leaving the model to guess the pairing.
+        if role == "tool":
+            tool_name = str(message.get("name") or "").strip()
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if rendered and (tool_name or call_id):
+                attribution = " ".join(
+                    part for part in (
+                        f"name={tool_name}" if tool_name else "",
+                        f"id={call_id}" if call_id else "",
+                    ) if part
+                )
+                rendered = f"[{attribution}]\n{rendered}"
+
         if not rendered:
             continue
 
