@@ -1907,8 +1907,13 @@ def run_conversation(
             # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
             if "finish_reason" in api_msg:
                 api_msg.pop("finish_reason")
-            # Strip internal thinking-prefill marker
-            api_msg.pop("_thinking_prefill", None)
+            # ``_thinking_prefill`` deliberately survives here. The reasoning
+            # fields it accompanies were just stripped above, which leaves
+            # ``_is_thinking_only_assistant`` no way to recognize the stub, so
+            # ``_drop_thinking_only_and_merge_users`` below could never fire on
+            # it. The transport strips every leading-underscore key before the
+            # wire (agent/transports/chat_completions.py), so keeping it costs
+            # nothing.
             # Strip length-continuation marks; not every transport drops underscore keys.
             api_msg.pop("_length_continuation_fragment", None)
             api_msg.pop("_length_continuation_nudge", None)
@@ -7613,7 +7618,24 @@ def run_conversation(
                     continue
 
                 messages.append(final_msg)
-                
+                # Make the completed answer durable before leaving the loop —
+                # a session torn down before finalize_turn's _persist_session
+                # otherwise loses a reply the user already saw (#81641). Same
+                # contract as the tool-call exit (#49045) and the verify exits
+                # above; _DB_PERSISTED_MARKER keeps _persist_session idempotent.
+                # Unlike the tool-call exit, failure must NOT abort the turn:
+                # no side effect follows and _persist_session retries the write.
+                # Full incident narrative: tests/run_agent/test_81641_*.py.
+                try:
+                    agent._flush_messages_to_session_db(messages, conversation_history)
+                except Exception:
+                    logger.warning(
+                        "final text-turn flush failed (session=%s) — reply is "
+                        "not yet durable; relying on finalize_turn retry",
+                        getattr(agent, "session_id", None) or "none",
+                        exc_info=True,
+                    )
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
