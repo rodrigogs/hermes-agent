@@ -261,3 +261,46 @@ def test_a_reply_with_no_call_is_left_as_prose() -> None:
     calls, cleaned = acp._extract_tool_calls_from_text("It is 21C and clear in Lisbon.")
     assert calls == []
     assert cleaned == "It is 21C and clear in Lisbon."
+
+
+# ---------------------------------------------------------------------------
+# narrating instead of acting
+# ---------------------------------------------------------------------------
+
+def test_the_prompt_forbids_announcing_an_action_instead_of_taking_it() -> None:
+    """An agent loop cannot tell "planning" apart from "finished".
+
+    The preamble used to say "If no tool is needed, answer normally", which reads
+    as blanket permission to reply in prose — and a turn that describes its own
+    next step qualifies. Measured on a long session: 5 of 5 ending turns said
+    "Vou verificar…" and stopped, so the loop halted and the session looked dead
+    while the work itself was correct.
+
+    Prose still has to be allowed, or the model cannot answer a question or report
+    a blocker. What must be ruled out is narrating an action in place of taking it.
+    """
+    prompt = acp._format_messages_as_prompt(
+        [{"role": "user", "content": "Read /etc/hostname and tell me the first line."}],
+        tools=[WEATHER_TOOL],
+    )
+    lowered = prompt.lower()
+
+    assert "if no tool is needed, answer normally" not in lowered, (
+        "the blanket permission that produced narrate-then-stop is back"
+    )
+    # The instruction has to name the failure mode, not merely ask for diligence.
+    assert "rather than describing it" in lowered
+    assert "halts the loop" in lowered
+    # And prose must remain legitimate for the three cases that need it.
+    for legitimate in ("answer", "question", "blocker"):
+        assert legitimate in lowered, f"prose no longer allowed for a {legitimate}"
+
+
+def test_the_prompt_asks_for_multi_step_work_in_one_turn() -> None:
+    """Reporting before each step is the same halt in a friendlier voice."""
+    prompt = acp._format_messages_as_prompt(
+        [{"role": "user", "content": "Do the three things."}], tools=[WEATHER_TOOL],
+    )
+    lowered = prompt.lower()
+    assert "keep calling tools until the task is done" in lowered
+    assert "not before each step" in lowered

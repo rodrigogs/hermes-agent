@@ -203,7 +203,23 @@ def _format_messages_as_prompt(
         "You are being used as the active ACP agent backend for Hermes.",
         "Use ACP capabilities to complete tasks.",
         "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
+        # The previous line here was "If no tool is needed, answer normally." — read
+        # as blanket permission to reply in prose, and a turn that describes its own
+        # next step qualifies. Measured on a long agent session: 5 of 5 ending turns
+        # said "Vou verificar…" and then stopped, so the loop halted and the operator
+        # reported the session as dead. The work was correct; the turn just handed
+        # control back before doing it.
+        #
+        # Prose is still allowed — for an answer, a question, or a genuine blocker.
+        # What is ruled out is announcing an action instead of taking it, which in an
+        # agent loop is indistinguishable from stopping.
+        "Prose is for an ANSWER, a question you cannot proceed without, or a blocker "
+        "you cannot get past. It is not for narrating what you are about to do: if "
+        "your next step is a tool call, emit the tool call in THIS turn rather than "
+        "describing it and ending. Ending a turn with 'I will now check X' halts the "
+        "loop, and the operator sees a stalled session.",
+        "When several steps are needed, keep calling tools until the task is done or "
+        "genuinely blocked; report once at the end, not before each step.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
