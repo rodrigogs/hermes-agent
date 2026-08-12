@@ -325,6 +325,7 @@ gateway:
     state_no:              "No"
     queued:                "**Seguimientos en cola:** {count}"
     platforms:             "**Plataformas conectadas:** {platforms}"
+    code_skew:             "⚠️ Code skew: boot `{boot}` ≠ disk `{disk}` — the gateway still runs boot code. Restart to load the new code (`/restart`)."
 
   stop:
     stopped_pending:       "⚡ Detenido. El agente aún no había comenzado — puedes continuar esta sesión."

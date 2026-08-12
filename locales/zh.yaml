@@ -328,6 +328,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "否"
     queued:                "**排队的后续：** {count}"
     platforms:             "**已连接平台：** {platforms}"
+    code_skew:             "⚠️ Code skew: boot `{boot}` ≠ disk `{disk}` — the gateway still runs boot code. Restart to load the new code (`/restart`)."
 
   stop:
     stopped_pending:       "⚡ 已停止。代理尚未启动 — 你可以继续此会话。"

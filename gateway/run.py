@@ -10459,6 +10459,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
+    def _maybe_code_skew_auto_restart(self) -> None:
+        """Post-turn idle auto-restart on code skew (config- and supervisor-gated).
+
+        Fires only when ALL of:
+          (a) ``agent.code_skew_auto_restart`` is enabled,
+          (b) the checkout differs from the boot revision,
+          (c) NO session slot is busy — ``_running_agents`` empty — the
+              property that guarantees a turn is never cut by this path,
+          (d) a supervising service manager owns this process, because
+              exit 75 is only meaningful to one (``RestartForceExitStatus``).
+        The in-band restart (``request_restart``) then refuses new work and
+        drains ALL active work — messaging, cron, API runs — before
+        ``stop()``, so even the race of a turn starting between this check
+        and ``_draining = True`` finishes naturally, never amputated.
+        Best-effort: any failure here must never break the turn unwind that
+        just completed.
+        """
+        try:
+            from gateway.code_skew import (
+                detect_code_skew,
+                record_auto_restart,
+                should_auto_restart,
+                watch_config,
+            )
+            from gateway.restart import is_gateway_supervisor_process
+
+            if not watch_config()[1]:
+                return
+            if self._restart_requested or self._draining or not self._running:
+                return
+            if not is_gateway_supervisor_process():
+                logger.debug(
+                    "code-skew auto-restart skipped: no supervisor owns this "
+                    "process (exit 75 is meaningless to a bare process)"
+                )
+                return
+            skew = detect_code_skew()
+            if not should_auto_restart(
+                skew=skew,
+                running_agents_empty=len(self._running_agents) == 0,
+                enabled=True,
+            ):
+                return
+            boot_rev, disk_rev = skew
+            # Record WHY before exiting — the ledger survives the restart
+            # itself, so the next boot can explain the previous life's exit.
+            record_auto_restart(boot_rev, disk_rev)
+            logger.warning(
+                "Code skew detected and gateway idle — auto-restarting "
+                "(exit 75) to load disk code: boot=%s disk=%s",
+                boot_rev,
+                disk_rev,
+            )
+            self.request_restart(detached=False, via_service=True)
+        except Exception:
+            logger.debug("code-skew auto-restart decision failed", exc_info=True)
+
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
@@ -16347,6 +16404,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
+            # Code-skew idle auto-restart: only when NO session slot is busy
+            # (the property that guarantees a turn is never cut). The in-band
+            # restart machinery drains all remaining work before stop().
+            # Best-effort: a broken decision must not break the turn unwind.
+            try:
+                self._maybe_code_skew_auto_restart()
+            except Exception:
+                logger.debug("code-skew auto-restart check failed", exc_info=True)
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -16945,6 +17010,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _send_code_skew_notice(self, source, notice: str) -> None:
+        """Deliver the code-skew notice as a standalone message.
+
+        Mirrors the draining-case send path (``_send_with_retry``). Delivery
+        failure is swallowed — the warning is best-effort by design and must
+        never interfere with the turn that follows it.
+        """
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter is None:
+                return
+            await adapter._send_with_retry(
+                chat_id=source.chat_id,
+                content=notice,
+                metadata=self._thread_metadata_for_source(source),
+            )
+        except Exception:
+            logger.debug("code-skew notice delivery failed", exc_info=True)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -16957,6 +17041,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        # Code-skew watch: warn loudly ONCE per session per boot while the
+        # checkout differs from the revision captured at gateway boot. This
+        # is a notice, NOT a gate — the turn always proceeds, and a delivery
+        # failure is swallowed for the same reason (#77184 spirit: the
+        # warning must never amputate the turn it is warning about).
+        try:
+            from gateway.code_skew import per_turn_warning
+
+            _skew_notice = per_turn_warning(_quick_key)
+            if _skew_notice:
+                await self._send_code_skew_notice(source, _skew_notice)
+        except Exception:
+            logger.debug("code-skew per-turn notice failed", exc_info=True)
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's

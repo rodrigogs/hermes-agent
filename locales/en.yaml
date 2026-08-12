@@ -341,6 +341,7 @@ gateway:
     state_no:              "No"
     queued:                "**Queued follow-ups:** {count}"
     platforms:             "**Connected Platforms:** {platforms}"
+    code_skew:             "⚠️ Code skew: boot `{boot}` ≠ disk `{disk}` — the gateway still runs boot code. Restart to load the new code (`/restart`)."
 
   stop:
     stopped_pending:       "⚡ Stopped. The agent hadn't started yet — you can continue this session."

@@ -330,6 +330,7 @@ gateway:
     state_no:              "لا"
     queued:                "**المتابعات في الطابور:** {count}"
     platforms:             "**المنصّات المتصلة:** {platforms}"
+    code_skew:             "⚠️ Code skew: boot `{boot}` ≠ disk `{disk}` — the gateway still runs boot code. Restart to load the new code (`/restart`)."
 
   stop:
     stopped_pending:       "⚡ تم الإيقاف. لم يكن الوكيل قد بدأ بعد — يمكنك متابعة هذه الجلسة."

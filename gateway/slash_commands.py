@@ -710,6 +710,23 @@ class GatewaySlashCommandsMixin:
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
 
+        # Code-skew watch: while the checkout differs from the boot revision,
+        # /status always shows it — the persistent surface for an operator
+        # who checks in later than the one-shot per-session warning.
+        try:
+            from gateway.code_skew import detect_code_skew
+
+            _skew = detect_code_skew()
+            if _skew:
+                lines.extend(
+                    [
+                        "",
+                        t("gateway.status.code_skew", boot=_skew[0], disk=_skew[1]),
+                    ]
+                )
+        except Exception:
+            pass
+
         return "\n".join(lines)
 
     @staticmethod

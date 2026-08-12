@@ -85,6 +85,20 @@ DEFAULT_CONFIG = {
         # 0 = legacy behaviour (enter stop()/drain immediately). Default
         # 6h is a safety valve for wedged agents, not a target latency.
         "restart_after_turn_timeout": 21600,
+        # Code-skew watch (gateway/code_skew.py): when the checkout drifts
+        # from the revision captured at gateway boot (a hot `git pull`, or
+        # the window before `hermes update`'s graceful restart fires), warn
+        # each session once per boot and surface the drift in /status.
+        # Never refuses the turn — this is a notice channel, not a gate.
+        "code_skew_warning": True,
+        # Idle auto-restart on code skew: when skew is present AND no
+        # messaging turn is in flight, drain and exit 75 so the supervisor
+        # restarts the gateway onto the new code. Only fires under a
+        # supervisor (systemd/s6/launchd — exit 75 is meaningless to a bare
+        # process) and never mid-turn: the in-band restart machinery waits
+        # for in-flight work before stop(). Disable to keep running stale
+        # code until a manual restart.
+        "code_skew_auto_restart": True,
         # Upper bound (seconds) a submitted prompt waits for the deferred
         # agent build (MCP discovery, model metadata, skills scan) before
         # failing with a visible error (#63078). The gateway's wait is
