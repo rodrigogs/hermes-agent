@@ -33,6 +33,8 @@ const CODE_TO_KEY: Record<string, string> = {
   Escape: 'escape',
   Backspace: 'backspace',
   Tab: 'tab',
+  PageUp: 'pageup',
+  PageDown: 'pagedown',
   ArrowUp: 'up',
   ArrowDown: 'down',
   ArrowLeft: 'left',
@@ -169,6 +171,8 @@ const TOKEN_LABELS: Record<string, string> = {
   escape: 'Esc',
   backspace: '⌫',
   tab: '⇥',
+  pageup: 'PgUp',
+  pagedown: 'PgDn',
   space: 'Space',
   up: '↑',
   down: '↓',
@@ -188,7 +192,7 @@ function labelForBase(base: string): string {
   return base.length === 1 ? base.toUpperCase() : base
 }
 
-function labelForMod(mod: string): string {
+export function formatModifierToken(mod: string): string {
   if (mod === 'mod') {
     return IS_MAC ? '⌘' : 'Ctrl'
   }
@@ -214,7 +218,7 @@ export function comboTokens(combo: string): string[] {
   const parts = combo.split('+')
   const base = parts.pop() ?? ''
 
-  return [...parts.map(labelForMod), labelForBase(base)]
+  return [...parts.map(formatModifierToken), labelForBase(base)]
 }
 
 // Human-readable label, e.g. "⌘⇧K" on macOS, "Ctrl+Shift+K" elsewhere.
