@@ -184,6 +184,30 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # API-error classification override. Fired once per failed API call at
+    # the top of ``agent/error_classifier.classify_api_error()``, BEFORE the
+    # built-in pipeline, so provider plugins can own their provider's error
+    # quirks without core patches. Callbacks receive the parsed error context
+    # (provider, model, status_code, error_type, error_code, error_message,
+    # error_body, error, approx_tokens, context_length, num_messages) and
+    # should self-scope on ``provider``. Return None to pass, or a dict::
+    #   {"reason": "<FailoverReason name>",          # required
+    #    "retryable": bool, "should_compress": bool,
+    #    "should_rotate_credential": bool, "should_fallback": bool,
+    #    "message": str, "error_context": dict}      # all optional
+    # Dispatch is run-all-then-pick-first: every registered callback runs
+    # with its failures isolated (an early answer never stops later
+    # callbacks), then the first valid result in registration order wins —
+    # on conflict the first-registered plugin is the tie-break, and every
+    # additional valid-but-losing result is reported with a runtime warning
+    # (the #64714 skipped-transform rule). Invalid dicts and unknown
+    # reasons are skipped; a broken plugin can never break error
+    # classification. Cold path: fires only on API failure.
+    # Privacy: error_message/error_body may carry an unredacted provider
+    # error dump.
+    # Contract: the transform-family first-valid-wins shape in
+    # docs/plugins/hook-taxonomy.md.
+    "transform_api_error_classification",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -253,6 +277,73 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # Kanban worker-lifecycle, task-mutation, and dispatcher-tick observers
+    # (RFC #58548, accepted as the design basis in the #64231 batch
+    # disposition; on_kanban_dispatch_tick is the re-port of PR #56066).
+    # All five are observers only: return values are ignored, and every fire
+    # site is fully best-effort, so a broken callback can never break
+    # dispatch or a task mutation. Cost rule: every call site short-circuits
+    # on has_hook(), so when nothing subscribes no payload is built and the
+    # hot paths (each dispatcher tick, each task write) pay one dict probe.
+    #
+    # WHICH PROCESS: worker spawn/exit/stale-claim and the dispatch tick
+    # fire in the DISPATCHER process (gateway-embedded dispatcher or
+    # ``hermes kanban dispatch``); on_kanban_task_updated fires in whichever
+    # process committed the mutation (CLI, worker, or the gateway-embedded
+    # dashboard API).
+    #
+    # Common kwargs (task-scoped hooks): task_id: str, profile_name: str,
+    #   board: str | None, assignee: str | None, run_id: int | None.
+    #
+    # on_kanban_worker_spawned fires after ``spawn_fn`` returns AND the
+    # worker PID (when one was reported) is durably persisted, per the RFC
+    # timing contract; like kanban_task_claimed it runs inside the board's
+    # dispatch lock, so callbacks must stay fast. Adds:
+    #   worker_pid: int | None, workspace_path: str.
+    #   Privacy: workspace_path is a filesystem path and may reveal project
+    #   layout or usernames.
+    "on_kanban_worker_spawned",
+    # on_kanban_worker_exited is tick-derived from detect_crashed_workers —
+    # it fires when a dead-PID running task is reclaimed, AFTER every
+    # reclaim/accounting txn has committed. Exit visibility latency is
+    # bounded by the dispatcher tick interval. Adds:
+    #   worker_pid: int,
+    #   exit_kind: "clean_exit" | "rate_limited" | "nonzero_exit"
+    #              | "signaled" | "unknown",
+    #   exit_code: int | None,
+    #   outcome: "crashed" | "rate_limited",
+    #   retry_status: str  (the phase the task was released back to).
+    "on_kanban_worker_exited",
+    # on_kanban_worker_stale_claim fires when release_stale_claims reclaims
+    # a TTL-expired claim, after the reclaim txn commits. Live-PID claim
+    # extensions and deferred reclaims do NOT fire. Adds:
+    #   worker_pid: int | None, heartbeat_stale: bool, retry_status: str.
+    "on_kanban_worker_stale_claim",
+    # on_kanban_task_updated is the task-mutation boundary observer: it
+    # fires after a committed task-row field write outside the
+    # claim/complete/block lifecycle — kanban_db.assign_task,
+    # set_model_override, and set_reasoning_effort, plus the dashboard
+    # plugin API's direct-SQL priority/title/body editors (single and
+    # bulk) via kanban_db.notify_task_updated. Adds:
+    #   changed_fields: list[str] — field NAMES only; new values are never
+    #   carried (fetch the task if you need them).
+    #   Privacy: names only here, but title/body values in the board DB may
+    #   contain user/project content.
+    "on_kanban_task_updated",
+    # on_kanban_dispatch_tick fires once per dispatcher tick in
+    # dispatch_once, strictly AFTER the board's single-writer dispatch lock
+    # has been released (the #56066 original fired inside the lock — the
+    # #64231 disposition mandates the post-lock re-port), so a slow
+    # subscriber can never extend the writer critical section.
+    # Kwargs: board: str | None, profile_name: str, dry_run: bool,
+    #   outcome: "ok" | "skipped_locked" | "idle",
+    #   result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed,
+    #     promoted, reconciled_orphans, crashed, stale, timed_out,
+    #     auto_blocked, rate_limited, auto_assigned_default,
+    #     respawn_guarded, skipped_per_profile_capped, skipped_unassigned,
+    #     skipped_nonspawnable, skipped_locked).
+    #   Privacy: result carries task ids, assignees, and workspace paths.
+    "on_kanban_dispatch_tick",
     # Gateway platform-boundary observer hooks (#64176). Observer-only; each
     # callback isolated by invoke_hook. Payloads are normalized envelopes only,
     # never raw platform SDK objects (per #64176 / #64182 ground rule). This
@@ -287,6 +378,16 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+}
+
+# Hooks whose return value carries a directive that the shell-hook response
+# parser (``agent/shell_hooks._parse_response``) has no channel for.
+# ``VALID_HOOKS`` doubles as the shell-hook config allow-list, so without
+# this exclusion a shell hook could register for one of these events and
+# have its output silently ignored — registration is refused loudly instead.
+# Support for a shell response shape can lift an event out of this set.
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -5699,6 +5800,114 @@ def get_pre_verify_continue_message(
             return message.strip()
 
     return None
+
+
+def get_plugin_error_classification(
+    *,
+    provider: str = "",
+    model: str = "",
+    status_code: Optional[int] = None,
+    error_type: str = "",
+    error_code: str = "",
+    error_message: str = "",
+    error_body: Optional[Dict[str, Any]] = None,
+    error: Optional[BaseException] = None,
+    approx_tokens: int = 0,
+    context_length: int = 0,
+    num_messages: int = 0,
+) -> Optional[Dict[str, Any]]:
+    """Check ``transform_api_error_classification`` hooks for a directive.
+
+    Consulted by :func:`agent.error_classifier.classify_api_error` BEFORE
+    its built-in pipeline, so a provider plugin can both add classifications
+    the core patterns miss and correct ones they get wrong for its provider.
+
+    A callback returns ``None`` to decline, or a dict with a required
+    ``"reason"`` (a :class:`agent.error_classifier.FailoverReason` member or
+    its string name) plus optional recovery-hint overrides. Dispatch is
+    run-all-then-pick-first: ``invoke_hook`` runs every registered callback
+    with failures isolated, then the first result carrying a valid reason
+    wins in registration order — mirroring
+    :func:`get_pre_tool_call_block_message`, invalid or irrelevant returns
+    are silently ignored so a misbehaving plugin degrades to a no-op.
+    When more than one callback returns a valid classification, the losing
+    results are skipped with a runtime warning (the #64714
+    skipped-transform rule) so conflicting provider plugins are visible in
+    logs instead of silently shadowed.
+
+    Privacy: ``error_message`` and ``error_body`` may carry an unredacted
+    provider error dump; callbacks must not log or forward them without
+    redaction.
+
+    Cold path: fires only on API failure, never on the request hot path.
+    Contract: the transform-family first-valid-wins shape in
+    ``docs/plugins/hook-taxonomy.md``.
+
+    Returns a sanitized dict (``reason`` coerced to ``FailoverReason``, hint
+    fields coerced to ``bool``) or ``None`` when no plugin claimed the error.
+    """
+    from agent.error_classifier import FailoverReason
+
+    hook_results = invoke_hook(
+        "transform_api_error_classification",
+        provider=provider,
+        model=model,
+        status_code=status_code,
+        error_type=error_type,
+        error_code=error_code,
+        error_message=error_message,
+        error_body=error_body if isinstance(error_body, dict) else {},
+        error=error,
+        approx_tokens=approx_tokens,
+        context_length=context_length,
+        num_messages=num_messages,
+    )
+
+    winner: Optional[Dict[str, Any]] = None
+    skipped_valid = 0
+    for result in hook_results:
+        if not isinstance(result, dict):
+            continue
+        reason_raw = result.get("reason")
+        if isinstance(reason_raw, FailoverReason):
+            reason = reason_raw
+        elif isinstance(reason_raw, str):
+            try:
+                reason = FailoverReason(reason_raw.strip().lower())
+            except ValueError:
+                continue
+        else:
+            continue
+
+        if winner is not None:
+            skipped_valid += 1
+            continue
+
+        out: Dict[str, Any] = {"reason": reason}
+        for key in (
+            "retryable",
+            "should_compress",
+            "should_rotate_credential",
+            "should_fallback",
+        ):
+            if key in result:
+                out[key] = bool(result[key])
+        message = result.get("message")
+        if isinstance(message, str) and message.strip():
+            out["message"] = message.strip()[:500]
+        error_context = result.get("error_context")
+        if isinstance(error_context, dict):
+            out["error_context"] = error_context
+        winner = out
+
+    if winner is not None and skipped_valid:
+        logger.warning(
+            "transform_api_error_classification: skipped %d valid "
+            "classification(s) after the first result in registration order "
+            "won (run-all-then-pick-first)",
+            skipped_valid,
+        )
+    return winner
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:
