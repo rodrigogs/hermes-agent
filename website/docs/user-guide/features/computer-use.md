@@ -63,17 +63,21 @@ on macOS/Linux, `install.ps1` on Windows. Use `hermes computer-use
 status` to verify the install.
 
 Already have cua-driver? Hermes reuses it when it supports the 0.20 runtime
-contract. During setup and toolset enablement, Hermes checks the local version
-and manifest. It repairs an old or incomplete standard installation through
-the upstream installer. A binary selected with `HERMES_CUA_DRIVER_CMD` stays
+contract. During setup, toolset enablement, `hermes update`, and the first
+`computer_use` call of a session, Hermes checks the local version and
+manifest. It repairs an old or incomplete standard installation through
+the upstream installer (at most once per session at runtime). A binary
+selected with `HERMES_CUA_DRIVER_CMD` stays
 under your control, so Hermes reports the incompatibility and leaves it
 unchanged.
 
-If you install Cua Driver first, `cua-driver skills install` detects Hermes
-and links Cua's skill pack into the Hermes skills directory automatically.
-You can also register raw Cua MCP tools as a custom MCP server, but that is an
-alternative for users who need the low-level interface. The built-in toolset
-provides Hermes actions, configuration, approvals, and diagnostics.
+If you install Cua Driver first, `cua-driver skills install` installs Cua's
+skill pack under `~/.cua-driver/skills/cua-driver`. Hermes autodetection is a
+planned cua-driver follow-up, so currently point Hermes at that directory or
+symlink it into your skill space. You can also register raw Cua MCP tools as a
+custom MCP server, but that is an alternative for users who need the low-level
+interface. The built-in toolset provides Hermes actions, configuration,
+approvals, and diagnostics.
 
 After installing, regardless of which path you took, grant the
 platform-appropriate prereqs:
@@ -102,7 +106,7 @@ grant are launch settings. They cannot change after the runtime starts:
 |---|---|---|---|
 | Manual or smart approvals (default) | `standard` | Normal Hermes approvals; Cua stops at its protected boundary | Refuses unless `computer_use.grant_existing_profile: true` (one-time config opt-in) |
 | `computer_use.permission_mode: bounded` + reviewed manifest | private `bounded` daemon | You review and approve the capability manifest once, at launch | Allowed only within the manifest's declared profiles/origins/tools; everything else fails closed |
-| `--yolo`, `/yolo`, or `approvals.mode: off` | private `unrestricted` daemon | One explicit Hermes risk acceptance; no runtime Cua prompts | Allowed within Cua's built-in, managed, and user policy ceilings |
+| `--yolo`, `/yolo`, or `approvals.mode: off` | private `unrestricted` daemon | One explicit Hermes risk acceptance; no runtime Cua prompts | Refuses unless `computer_use.grant_existing_profile: true`; YOLO does not substitute for this grant |
 
 ### Attaching to your signed-in browser
 
@@ -232,9 +236,11 @@ maintains directly:
 cua-driver skills install
 ```
 
-This command detects Hermes and links the pack into its skill directory
-automatically. The wrapper remains the workflow layer and points to Cua's
-installed skill for driver behavior. After running it, an agent gets access to:
+The command installs the pack under `~/.cua-driver/skills/cua-driver`. Hermes
+autodetection is a planned cua-driver follow-up, so currently point Hermes at
+that directory or symlink it into your skill space. The wrapper remains the
+workflow layer and points to Cua's installed skill for driver behavior. The
+pack contains:
 
 | File | Topic |
 |---|---|
@@ -388,7 +394,7 @@ Permission mode and manifest (see
 computer_use:
   permission_mode: standard        # standard (default) | bounded
   capability_manifest: ""          # capability manifest path, required for bounded
-  grant_existing_profile: false    # opt-in: attach to signed-in browser in standard mode
+  grant_existing_profile: false    # opt-in: attach in standard or unrestricted mode
 ```
 
 Override the driver binary path (tests / CI / local builds):
@@ -555,9 +561,9 @@ autostart pattern — see
   (macOS no-foreground contract, Windows UIA + Session 0, Linux AT-SPI
   + X11/Wayland, recording, browser pages), run
   `cua-driver skills install` and read `MACOS.md` / `WINDOWS.md` /
-  `LINUX.md` / `RECORDING.md` / `WEB_APPS.md`. Once `cua-driver skills
-  install` autodetects Hermes (planned follow-up), this happens
-  automatically on install.
+  `LINUX.md` / `RECORDING.md` / `WEB_APPS.md`. Hermes autodetection is a
+  planned follow-up; currently point Hermes at the installed pack directory
+  or symlink it into your skill space.
 - **cua.ai/docs** — the cua-driver project's documentation:
   - [What is computer use?](https://cua.ai/docs/explanation/what-is-computer-use) — concept intro
   - [The no-foreground contract](https://cua.ai/docs/explanation/the-no-foreground-contract) — *why* background mode matters

@@ -1039,6 +1039,20 @@ def install_cua_driver(
     driver_cmd = _cua_driver_cmd()
     binary = _resolved_cua_driver_cmd()
 
+    # An explicit override is authoritative even when it is currently broken.
+    # Do not install or replace the standard system driver: that cannot repair
+    # the configured path and would mutate an unrelated installation.
+    override = os.environ.get("HERMES_CUA_DRIVER_CMD", "").strip()
+    if override and not binary:
+        _print_warning(
+            "    HERMES_CUA_DRIVER_CMD does not resolve to an executable: "
+            f"{override}"
+        )
+        _print_info(
+            "    Fix or unset the override before running computer-use install."
+        )
+        return False
+
     # Not installed → fresh install path (only when caller asked for it).
     if not binary and not upgrade:
         if not _cua_install_target_writable():
@@ -1058,10 +1072,16 @@ def install_cua_driver(
         # baked in by CD and errors cleanly on missing-arch assets.
         return _run_cua_driver_installer(label="Installing")
 
+    # An installed driver that fails Hermes' runtime contract (version floor,
+    # missing manifest verbs) is repaired regardless of the caller's mode.
+    # Hermes' own minimum requirement IS the confirmation that an upgrade is
+    # needed, so the ``upgrade=True`` path must not defer to the driver's
+    # ``check-update`` verb here — a cached/indeterminate "no update" answer
+    # would otherwise pin users on an unusable driver forever (observed:
+    # 0.19.3 installs hard-failing every computer_use call after the 0.20
+    # contract landed, with `hermes update` declining to refresh).
     contract = _cua_driver_contract_status(binary) if binary else None
-    repair_existing = bool(
-        binary and not upgrade and contract and not contract.get("ready")
-    )
+    repair_existing = bool(binary and contract and not contract.get("ready"))
 
     # A compatible existing installation needs no download. Finish the small
     # host-specific setup that the upstream installer normally owns.
