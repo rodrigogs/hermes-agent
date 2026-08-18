@@ -3766,9 +3766,16 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     return model, None
 
 
-# Bare billing buckets are not routable provider identities (kept in parity with the
-# provider gate in agent_init). Restoring one as a session provider override breaks resume.
-_BARE_BILLING_PROVIDERS = {"auto", "openrouter", "custom"}
+# Bare billing buckets are not routable provider identities; restoring one as a
+# session provider override breaks resume. (agent_init's fail-fast gate is a
+# DIFFERENT set that also skips "openrouter" — there it means "default route,
+# don't fail fast", not "unroutable".)
+# ``openrouter`` is deliberately excluded here — it is a fully routable provider
+# with its own API key and base_url. Sessions that used OpenRouter store
+# ``billing_provider="openrouter"``; dropping it forces resume to the current
+# global model (e.g. a custom endpoint), which is the wrong provider for the
+# stored model. See #57588.
+_BARE_BILLING_PROVIDERS = {"auto", "custom"}
 
 
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
