@@ -1516,6 +1516,13 @@ function McpSetupButton({ profile, entry, onDone, ensureProfile }) {
   }
 
   const beginOAuth = async () => {
+    // A second click (retry, impatient double-click) must not orphan the
+    // previous poll interval — an overwritten pollRef leaks a 2s poller that
+    // runs until unmount and can flip phase from a stale OAuth session.
+    if (pollRef.current) {
+      clearInterval(pollRef.current)
+      pollRef.current = null
+    }
     setPhase('busy')
     setMessage('')
     const profile = await resolveProfile()
@@ -3068,7 +3075,7 @@ function parseGroupChatMentions(text, members) {
     // Cross-connection members are also addressable by their @name-device
     // handle (the roster's disambiguated form) — same-named agents on two
     // machines resolve to the right one.
-    const handle = String(member.handle || '').trim()
+    const handle = String(member.handle || botHandle(member.name, member) || '').trim()
     const forms = new Set([
       member.name.toLowerCase(),
       member.name.toLowerCase().replace(/[\s_-]+/g, ''),
@@ -3154,6 +3161,13 @@ function rotateGroupSpeakers(members, round) {
   return [...members.slice(shift), ...members.slice(0, shift)]
 }
 
+/** Transcript form of a room speaker's profile name. The primary profile is
+ *  literally named "default" — render it as Hermes (matching displayName and
+ *  the @hermes handle) so the main agent never loses its name in rooms. */
+function groupSpeakerLabel(name) {
+  return (name || '').trim().toLowerCase() === 'default' ? 'Hermes' : name
+}
+
 /** Room-log line as a member sees it: `Name (user): …` / `Name: …` /
  *  `Name (you): …`. */
 function formatGroupChatLine(entry, viewerName) {
@@ -3166,7 +3180,7 @@ function formatGroupChatLine(entry, viewerName) {
   // two machines stay tellable apart in every member's transcript.
   const source = entry.from.source ? ` [${entry.from.source}]` : ''
 
-  return `${entry.from.name}${suffix}${source}: ${entry.text}`
+  return `${groupSpeakerLabel(entry.from.name)}${suffix}${source}: ${entry.text}`
 }
 
 /** The full per-turn payload for one member: participation rules + the room
@@ -3177,13 +3191,13 @@ function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLines }) {
   const peers = members.filter(m => groupMemberKey(m) !== viewerKey)
   const peerNames = peers
     .map(m => {
-      const handle = m.title ? `${m.title} (@${m.name})` : `@${m.name}`
+      const handle = m.title ? `${m.title} (@${botHandle(m.name, m)})` : `@${botHandle(m.name, m)}`
       return m.remoteSource ? `${handle} [on ${m.connectionLabel || m.connectionId}]` : handle
     })
     .join(', ')
 
   return [
-    `[Group chat: "${groupName}"] You are @${viewer.name}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
+    `[Group chat: "${groupName}"] You are @${botHandle(viewer.name, viewer)}, one participant in a group chat with ${peerNames || 'no one else yet'} and the user.`,
     '',
     'New messages in the room since your last turn (oldest first):',
     ...deltaLines.map(line => `  ${line}`),
@@ -6640,14 +6654,15 @@ function RoutinesPane() {
               })
             }),
       jsx(CreateRoutineDialog, {
-        key: createTarget,
         bot: createTarget,
         open: createOpen,
         onClose: () => {
           setCreateOpen(false)
           setCreateOwner(null)
         }
-      })
+        // key is the jsx() THIRD argument — as a prop it is silently ignored
+        // and the dialog kept stale per-bot form state when the target changed.
+      }, createTarget)
     ]
   })
 }
@@ -7143,6 +7158,10 @@ function GroupChatWorkspace({ group, members }) {
   const room = rooms[group] || { log: [], running: false }
   const [draft, setDraft] = useState('')
   const [confirmDisband, setConfirmDisband] = useState(false)
+  // Click-to-disambiguate: which log entry is showing its speaker's full
+  // @handle (the roster's name-device form when names collide across
+  // connections). Naturally every speaker just shows its display name.
+  const [revealedSpeaker, setRevealedSpeaker] = useState(null)
 
   const header = jsxs('div', {
     className: 'flex items-center gap-2 px-2.5 pt-2.5 pb-2',
@@ -7156,6 +7175,22 @@ function GroupChatWorkspace({ group, members }) {
       jsx('div', {
         className: 'min-w-0 flex-1 truncate text-sm font-semibold',
         children: `${group} — group chat`
+      }),
+      // Member faces: the room's roster at a glance, matching each bot's
+      // avatar in the sidebar. Falls back to the count for the title tooltip.
+      jsx('div', {
+        className: 'flex shrink-0 items-center -space-x-1.5',
+        title: members.map(b => displayName(b, botRosterMeta(b, allMeta))).join(', '),
+        children: members.slice(0, 6).map(b => {
+          const bMeta = botRosterMeta(b, allMeta)
+          const { shape, color, image } = botAppearance(b.name, bMeta)
+          const photo = Boolean(image && !isBackfilledFacePng(image))
+
+          return jsx('div', {
+            className: 'rounded-full ring-2 ring-(--ui-bg-primary,#111)',
+            children: jsx(BotFace, { shape, color, image: photo ? image : null, size: 20, name: b.name })
+          }, botRosterKey(b))
+        })
       }),
       jsx('span', {
         className: 'shrink-0 text-[0.65rem] text-(--ui-text-quaternary)',
@@ -7205,37 +7240,88 @@ function GroupChatWorkspace({ group, members }) {
               ? room.log.map((entry, index) => {
                   const isUser = entry.from.kind === 'user'
                   const meta = isUser || entry.from.source ? null : allMeta[entry.from.name]
-                  const sourceBadge = !isUser && entry.from.source ? ` · ${entry.from.source}` : ''
+                  // Match this speaker back to its member descriptor so display
+                  // names and disambiguating handles come from the roster (the
+                  // primary "default" profile renders as Hermes, remote dupes
+                  // carry their @name-device handle) instead of raw profile ids.
+                  const member = isUser
+                    ? null
+                    : members.find(b =>
+                        b.name === entry.from.name &&
+                        (entry.from.source
+                          ? (b.connectionLabel || b.connectionId) === entry.from.source
+                          : !b.remoteSource)
+                      ) || null
+                  const display = isUser ? 'You' : displayName(member || { name: entry.from.name }, meta)
+                  const entryKey = `${entry.at}:${index}`
+                  const revealed = !isUser && revealedSpeaker === entryKey
+                  // Clicked: append the gateway name so same-named agents on
+                  // two connections are tellable apart on demand.
                   const label = isUser
                     ? 'You'
-                    : meta?.title
-                      ? `${meta.title} (@${entry.from.name})${sourceBadge}`
-                      : `@${entry.from.name}${sourceBadge}`
+                    : revealed
+                      ? `${display}${entry.from.source ? `-${entry.from.source}` : ''} (@${botHandle(entry.from.name, member || undefined)})`
+                      : display
+                  // Speaker avatar: same appearance pipeline as the roster
+                  // (custom image/pet, else deterministic shape+color face).
+                  // Remote speakers have no local meta and get the
+                  // deterministic face for their name — stable per bot.
+                  const { shape, color, image } = isUser
+                    ? { shape: null, color: null, image: null }
+                    : botAppearance(entry.from.name, meta)
+                  const photo = Boolean(image && !isBackfilledFacePng(image))
 
                   return jsxs('div', {
-                    className: isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1',
+                    className: cn(
+                      'flex items-start gap-2',
+                      isUser ? 'rounded-md bg-(--chrome-action-hover) px-2 py-1.5' : 'px-2 py-1'
+                    ),
                     children: [
-                      jsxs('div', {
-                        className: 'flex items-baseline gap-2',
-                        children: [
-                          jsx('span', {
-                            className: isUser
-                              ? 'text-[0.7rem] font-semibold text-foreground'
-                              : 'text-[0.7rem] font-semibold text-(--ui-accent,#4f9cf9)',
-                            children: label
+                      isUser
+                        ? null
+                        : jsx('div', {
+                            className: 'mt-0.5 shrink-0',
+                            children: jsx(BotFace, {
+                              shape,
+                              color,
+                              image: photo ? image : null,
+                              size: 24,
+                              name: entry.from.name
+                            })
                           }),
-                          jsx('span', {
-                            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
-                            children: relativeTime(entry.at)
+                      jsxs('div', {
+                        className: 'min-w-0 flex-1',
+                        children: [
+                          jsxs('div', {
+                            className: 'flex items-baseline gap-2',
+                            children: [
+                              isUser
+                                ? jsx('span', {
+                                    className: 'text-[0.7rem] font-semibold text-foreground',
+                                    children: label
+                                  })
+                                : jsx('button', {
+                                    type: 'button',
+                                    className:
+                                      'cursor-pointer border-0 bg-transparent p-0 text-left text-[0.7rem] font-semibold text-(--ui-accent,#4f9cf9)',
+                                    title: revealed ? 'Hide full handle' : 'Show full handle',
+                                    onClick: () => setRevealedSpeaker(revealed ? null : entryKey),
+                                    children: label
+                                  }),
+                              jsx('span', {
+                                className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+                                children: relativeTime(entry.at)
+                              })
+                            ]
+                          }),
+                          jsx('div', {
+                            className: 'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0',
+                            children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                           })
                         ]
-                      }),
-                      jsx('div', {
-                        className: 'text-xs text-(--ui-text-secondary) [&_p]:mb-1 [&_p:last-child]:mb-0',
-                        children: Streamdown ? jsx(Streamdown, { children: entry.text }) : entry.text
                       })
                     ]
-                  }, `${entry.at}:${index}`)
+                  }, entryKey)
                 })
               : [
                   jsx('div', {
@@ -7832,12 +7918,26 @@ export default {
     }
 
     // Routines follow the chat you're in: track the live gateway profile.
-    host.state.profile.listen(profile => {
+    // Capture the unbinds: without them a disable → re-enable cycle stacks a
+    // duplicate listener per cycle (same survives-disable class as the face
+    // clock before its onDispose hook — these kept firing until app restart).
+    const unbindProfileListener = host.state.profile.listen(profile => {
       if (profile && typeof profile === 'string') {
         $selectedBot.set(profile)
       }
     })
-    host.state.gateway.listen(handleSessionsGatewayTransition)
+    const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
+
+    if (typeof ctx.onDispose === 'function') {
+      ctx.onDispose(() => {
+        if (typeof unbindProfileListener === 'function') {
+          unbindProfileListener()
+        }
+        if (typeof unbindGatewayListener === 'function') {
+          unbindGatewayListener()
+        }
+      })
+    }
 
     // Reconciliation sweep: hide every Bot Mode session we know about, on
     // load and again on each reconnect (a swap can land on a gateway whose
