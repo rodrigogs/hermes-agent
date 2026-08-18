@@ -50,7 +50,8 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
+from pathlib import Path
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -262,6 +263,53 @@ def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
     return [block] if block else []
 
 
+def _agent_home(agent: Any) -> Optional[Path]:
+    """The agent's OWN profile home, resolved from its dedicated session_db.
+
+    The agent's ``_session_db.db_path`` is ``<home>/state.db`` — ground truth
+    for which profile this agent belongs to, independent of any HERMES_HOME
+    ContextVar (which a build thread can lose: ContextVars don't propagate
+    into ``threading.Thread``, so an unbound build falls back to the launch
+    home and leaks the default profile's skills/identity into a bot prompt).
+    Returns None when it can't be resolved so callers fall back to ambient.
+    """
+    try:
+        db = getattr(agent, "_session_db", None)
+        db_path = getattr(db, "db_path", None)
+        if db_path:
+            return Path(db_path).parent
+    except Exception:
+        pass
+    return None
+
+
+def _agent_skills_dir(agent: Any) -> Optional[Path]:
+    """The agent's own ``<home>/skills`` dir, or None to use ambient home."""
+    home = _agent_home(agent)
+    return (home / "skills") if home is not None else None
+
+
+def _profile_name_for_home(home: Path) -> str:
+    """Derive the profile name for an explicit agent home.
+
+    ``<root>/profiles/X`` -> ``"X"``; anything else -> ``"default"``.
+
+    Uses :func:`get_default_hermes_root` (NOT ``get_hermes_home()``): on a
+    correctly bound profile session the ambient home IS the profile dir, so
+    ``get_hermes_home()/profiles`` would never contain ``home`` and every
+    profile would misreport as "default".
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root()
+        rel = home.resolve().relative_to((root / "profiles").resolve())
+        return rel.parts[0] if rel.parts else "default"
+    except (ValueError, OSError):
+        # Home IS the root (default profile) or unrelatable -> default.
+        return "default"
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -304,7 +352,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # cwd project instructions disabled.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
-        _soul_content = _r.load_soul_md(_ctx_len)
+        # Scope the SOUL.md read to the agent's OWN home (see _agent_home) —
+        # ambient resolution on a thread that lost the HERMES_HOME ContextVar
+        # reads the launch profile's SOUL.md instead (#50233).
+        _soul_content = _r.load_soul_md(_ctx_len, home_override=_agent_home(agent))
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
@@ -435,6 +486,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            skills_dir_override=_agent_skills_dir(agent),
         )
     else:
         skills_prompt = ""
@@ -514,26 +566,57 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # mid-session, so this doesn't break the prompt cache.
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
+    #
+    # Resolve from the agent's OWN home first (its session_db path), not the
+    # ambient HERMES_HOME: on a build thread that lost the ContextVar this
+    # line would otherwise print "default" for a bot profile — the same
+    # thread-fallback bug that leaked default's skills index.
+    _agent_home_path = _agent_home(agent)
+    active_profile = "default"
     try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
+        if _agent_home_path is not None:
+            active_profile = _profile_name_for_home(_agent_home_path)
+        else:
+            from agent.file_safety import _resolve_active_profile_name
+            active_profile = _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
+    # Home string for the message text: prefer the agent's own home so the
+    # paths named match the profile just resolved. When we have an explicit
+    # agent home, the root (where the default profile's data lives) comes
+    # from get_default_hermes_root(): get_hermes_home() on a bound profile
+    # session is the PROFILE dir, which would misname the default profile's
+    # paths. Without an agent home, keep the ambient resolution byte-identical
+    # to the legacy behavior (and patchable via this module's get_hermes_home).
+    if _agent_home_path is not None:
+        _home_str = str(_agent_home_path)
+        _root_str = str(get_default_hermes_root())
+    else:
+        _home_str = _root_str = str(get_hermes_home())
     if active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + str(get_hermes_home()) + "/profiles/<name>/. Each profile has its own "
+            "under " + _root_str + "/profiles/<name>/. Each profile has its own "
             "skills/, plugins/, cron/, and memories/ that affect a different "
             "session than this one. Do not modify another profile's "
             "skills/plugins/cron/memories unless the user explicitly directs "
             "you to."
         )
     else:
+        # A non-default name is only ever returned when the resolved home is
+        # ALREADY <root>/profiles/<name> — that is exactly how both
+        # _profile_name_for_home() and _resolve_active_profile_name() derive
+        # it. So the profile home is the session home itself; appending
+        # /profiles/<name> again doubled it (#72894). The default profile's
+        # data sits at the ROOT (get_default_hermes_root()), which in ambient
+        # profile mode is NOT get_hermes_home().
+        profile_home = _home_str
+        default_root = get_default_hermes_root()
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"and writes {profile_home}/. The default "
+            f"profile's data lives at {default_root}/skills/, {default_root}/plugins/, "
+            f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "
@@ -612,7 +695,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         context_files_prompt = _r.build_context_files_prompt(
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len,
-            allow_install_tree_fallback=agent.platform in ("cli", "tui"))
+            allow_install_tree_fallback=agent.platform in ("cli", "tui"),
+            home_override=_agent_home(agent))
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
