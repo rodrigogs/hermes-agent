@@ -7919,6 +7919,9 @@ class AIAgent:
             role=function_args.get("role"),
             profile=function_args.get("profile"),
             background=(not _is_subagent),
+            action=function_args.get("action"),
+            subagent_id=function_args.get("subagent_id"),
+            message=function_args.get("message"),
             parent_agent=self,
         )
 
