@@ -83,8 +83,11 @@ DEFAULT_CONFIG = {
         # this cap for in-flight agents/cron/api runs to complete naturally
         # so the requesting turn is not amputated by restart_drain_timeout.
         # 0 = legacy behaviour (enter stop()/drain immediately). Default
-        # 6h is a safety valve for wedged agents, not a target latency.
-        "restart_after_turn_timeout": 21600,
+        # 30 min is a safety valve for wedged agents, not a target latency —
+        # an interactive `hermes gateway restart` must never block for hours
+        # on a turn that wedged (#79133). Long unattended turns can raise
+        # this in config.yaml.
+        "restart_after_turn_timeout": 1800,
         # Code-skew watch (gateway/code_skew.py): when the checkout drifts
         # from the revision captured at gateway boot (a hot `git pull`, or
         # the window before `hermes update`'s graceful restart fires), warn
