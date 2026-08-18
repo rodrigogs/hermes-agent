@@ -579,7 +579,8 @@ export function useMessageStream({
             needsInput: false,
             pendingBranchGroup: null,
             streamId: null,
-            turnStartedAt: null
+            turnStartedAt: null,
+            turnLive: false
           }
         }
 
@@ -734,7 +735,8 @@ export function useMessageStream({
           busy: false,
           needsInput: false,
           interimBoundaryPending: false,
-          turnStartedAt: null
+          turnStartedAt: null,
+          turnLive: false
         }
       })
 
@@ -813,7 +815,8 @@ export function useMessageStream({
           busy: false,
           needsInput: false,
           interimBoundaryPending: false,
-          turnStartedAt: null
+          turnStartedAt: null,
+          turnLive: false
         }
       })
     },
@@ -832,8 +835,10 @@ export function useMessageStream({
     failAssistantMessage,
     flushQueuedDeltas,
     finalizeInterimAssistantMessage,
+    hydrateFromStoredSession,
     queryClient,
     refreshHermesConfig,
+    scheduleSessionsRefresh,
     sessionInterrupted,
     sessionStateByRuntimeIdRef,
     updateSessionState,
