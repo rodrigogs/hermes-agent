@@ -22859,7 +22859,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result = await asyncio.to_thread(
+                    transcribe_audio, path, None, "gateway",
+                )
                 if not result.get("success"):
                     fallback = await asyncio.to_thread(
                         transcribe_audio_local_fallback,
