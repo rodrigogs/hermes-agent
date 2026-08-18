@@ -86,6 +86,7 @@ import {
   backendScopeKey,
   backendScopePrefix,
   buildAgentRoster,
+  connectionDialFieldsChanged,
   mergeConnectionInput,
   migrateV1ToRegistry,
   normalizeConnectionInput,
@@ -207,11 +208,18 @@ import {
 import { runNativeLogin } from './native-oauth-login'
 import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import {
+  createParentStartMarkerResolver,
+  electronProcessStartMarker,
+  parentWatchdogEnv
+} from './parent-process-identity'
+import { selectPoolEvictions } from './pool-eviction'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import {
+  buildSidebarSessionSliceParams,
   fetchPrimaryProfileSessions,
   fetchRemoteProfileSessions,
   mergeProfileSessionWindow
@@ -2957,9 +2965,9 @@ function writeBackendOwnership(contents) {
   }
 }
 
-function execText(command, args) {
+function execText(command, args, { timeout = 3000 } = {}) {
   return new Promise<string>((resolve, reject) => {
-    execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', timeout: 3000 }), (error, stdout) => {
+    execFile(command, args, hiddenWindowsChildOptions({ encoding: 'utf8', timeout }), (error, stdout) => {
       if (error) {
         reject(error)
       } else {
@@ -2986,12 +2994,25 @@ async function processStartMarker(pid) {
   }
 
   if (IS_WINDOWS) {
-    const ticks = await execText('powershell.exe', [
-      '-NoProfile',
-      '-NonInteractive',
-      '-Command',
-      `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks`
-    ])
+    const electronMarker =
+      pid === process.pid ? electronProcessStartMarker(pid, process.pid, process.getCreationTime?.()) : null
+
+    if (electronMarker) {
+      return electronMarker
+    }
+
+    const ticks = await execText(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks`
+      ],
+      // PowerShell 5.1 cold starts routinely exceed the default 3s execText
+      // budget (2.4-8s observed in #87169); give the marker probe headroom.
+      { timeout: 30_000 }
+    )
 
     if (!/^\d+$/.test(ticks)) {
       throw new Error(`Invalid Windows start marker for PID ${pid}`)
@@ -3127,13 +3148,16 @@ const backendOwnership = createBackendOwnership({
   }
 })
 
-let desktopParentStartMarkerPromise = null
+const desktopParentStartMarker = createParentStartMarkerResolver({
+  load: () => processStartMarker(process.pid),
+  onError: error => {
+    const detail = error instanceof Error ? error.message : String(error)
 
-function desktopParentStartMarker() {
-  desktopParentStartMarkerPromise ??= processStartMarker(process.pid)
-
-  return desktopParentStartMarkerPromise
-}
+    rememberLog(
+      `Could not resolve the Desktop process start marker; starting the backend with PID-only parent tracking: ${detail}`
+    )
+  }
+})
 
 async function claimBackendChild(child, command, profile, nonce) {
   try {
@@ -8039,6 +8063,16 @@ function saveRegistryConnection(input: any = {}) {
 
   writeDesktopConnectionsRegistry(upsertConnection(registry, entry))
 
+  // A dial-material edit (endpoint/auth/ssh routing — NOT a label rename)
+  // leaves pooled backends under `conn:<id>::*` and renderer sockets pointing
+  // at the OLD target while the UI shows the new one. Recycle them: stop this
+  // connection's pooled backends/tunnels and tell renderers to dispose+redial
+  // their secondaries for this connection id.
+  if (existing && connectionDialFieldsChanged(existing, entry)) {
+    stopRegistryConnectionBackends(entry.id)
+    broadcastConnectionsChanged({ connectionId: entry.id, reason: 'updated' })
+  }
+
   return sanitizeRegistryConnection(entry)
 }
 
@@ -9121,6 +9155,21 @@ function sendConnectionApplied() {
   webContents.send('hermes:connection:applied')
 }
 
+// Registry lifecycle push: a connection was removed or materially edited, so
+// every window must tear down (and, for edits, re-dial) its secondary sockets
+// scoped to that connection. Without this, a removed remote/cloud source keeps
+// its renderer WebSocket open and streaming as a ghost, and an edited one
+// keeps talking to the OLD endpoint until idle-reap.
+function broadcastConnectionsChanged(payload: { connectionId: string; reason: 'removed' | 'updated' }) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    const { webContents } = win
+
+    if (webContents && !webContents.isDestroyed()) {
+      webContents.send('hermes:connections:changed', payload)
+    }
+  }
+}
+
 async function waitForBackendExit(child, timeoutMs = 5000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) {
     return
@@ -9398,31 +9447,22 @@ function touchPoolBackend(profile) {
   }
 }
 
-// Evict least-recently-used pool backends until at most `keep` remain — but only
-// ever evict backends without a live renderer socket (stale beyond the keepalive
-// window). When every backend is actively kept alive we let the pool exceed the
-// soft cap rather than kill a running session.
+// Evict least-recently-used SPAWNED pool backends until at most `keep` remain —
+// but only ever evict backends without a live renderer socket (stale beyond the
+// keepalive window). When every backend is actively kept alive we let the pool
+// exceed the soft cap rather than kill a running session. Process-less
+// descriptor entries (remote/cloud registry sources, per-profile remote
+// overrides — `entry.process === null`) are excluded from the cap entirely:
+// they hold no local process, so counting them used to let a roster refresh
+// across N registered remote connections LRU-evict a REAL local backend that
+// was merely idle past the keepalive window. Descriptors are still reclaimed
+// by the idle reaper.
 function evictLruPoolBackends(keep) {
-  if (backendPool.size <= keep) {
-    return
-  }
+  const evictions = selectPoolEvictions(backendPool.entries(), Math.max(0, keep), Date.now(), POOL_KEEPALIVE_FRESH_MS)
 
-  const now = Date.now()
-
-  const evictable = [...backendPool.entries()]
-    .filter(([, entry]) => now - (entry.lastActiveAt || 0) > POOL_KEEPALIVE_FRESH_MS)
-    .sort((a, b) => (a[1].lastActiveAt || 0) - (b[1].lastActiveAt || 0))
-
-  let removable = backendPool.size - Math.max(0, keep)
-
-  for (const [profile] of evictable) {
-    if (removable <= 0) {
-      break
-    }
-
+  for (const profile of evictions) {
     rememberLog(`Evicting idle profile backend "${profile}" (LRU cap ${POOL_MAX_BACKENDS})`)
     stopPoolBackend(profile)
-    removable -= 1
   }
 }
 
@@ -9517,6 +9557,7 @@ async function spawnPoolBackend(profile, entry) {
 
   const parentStartMarker = await desktopParentStartMarker()
   const backendNonce = crypto.randomBytes(16).toString('hex')
+  const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
 
   const child = spawn(
     backend.command,
@@ -9536,10 +9577,9 @@ async function spawnPoolBackend(profile, entry) {
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
         // Exact parent identity lets the backend self-exit after an unclean
-        // Desktop death without mistaking a reused PID for its owner.
-        HERMES_PARENT_PID: String(process.pid),
-        HERMES_PARENT_START_MARKER: parentStartMarker,
-        HERMES_PARENT_NONCE: backendNonce,
+        // Desktop death without mistaking a reused PID for its owner. If the
+        // optional marker probe fails, retain legacy PID-only tracking.
+        ...parentIdentityEnv,
         HERMES_WEB_DIST: webDist,
         ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
       },
@@ -9848,6 +9888,7 @@ async function startHermes() {
     const profile = primaryProfileKey()
     const parentStartMarker = await desktopParentStartMarker()
     const backendNonce = crypto.randomBytes(16).toString('hex')
+    const parentIdentityEnv = parentWatchdogEnv(process.pid, parentStartMarker, backendNonce)
 
     const hermesProcess = spawn(
       backend.command,
@@ -9872,10 +9913,9 @@ async function startHermes() {
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',
           // Exact parent identity lets the backend self-exit after an unclean
-          // Desktop death without mistaking a reused PID for its owner.
-          HERMES_PARENT_PID: String(process.pid),
-          HERMES_PARENT_START_MARKER: parentStartMarker,
-          HERMES_PARENT_NONCE: backendNonce,
+          // Desktop death without mistaking a reused PID for its owner. If the
+          // optional marker probe fails, retain legacy PID-only tracking.
+          ...parentIdentityEnv,
           HERMES_WEB_DIST: webDist,
           ...(readyFile ? { HERMES_DESKTOP_READY_FILE: readyFile } : {})
         },
@@ -11893,6 +11933,10 @@ ipcMain.handle('hermes:connections:remove', async (_event, id) => {
   // Tear down anything the removed connection still had running: pooled
   // backends under its composite keys and any ssh tunnel scopes it owned.
   stopRegistryConnectionBackends(key)
+  // And the renderer side: without this push, secondaries scoped to the
+  // removed connection keep their WebSocket open (remote/cloud have no local
+  // process to kill) and stream ghost events until page reload.
+  broadcastConnectionsChanged({ connectionId: key, reason: 'removed' })
 
   return { ok: true, registry: sanitizeConnectionsRegistry(registry) }
 })
@@ -12361,36 +12405,7 @@ async function interceptSessionRequestForRemote(request) {
       return undefined // local fast path → batched endpoint's single DB open
     }
 
-    const recentsProfile = (searchParams.get('recents_profile') || 'all').trim() || 'all'
-
-    const sliceParams = (limitKey, defaultLimit, extra) => {
-      const sp = new URLSearchParams({
-        limit: searchParams.get(limitKey) || defaultLimit,
-        offset: '0',
-        min_messages: '1',
-        archived: 'exclude',
-        order: 'recent',
-        ...extra
-      })
-
-      return sp
-    }
-
-    const recentsSp = sliceParams('recents_limit', '20', { profile: recentsProfile })
-    const recentsExclude = searchParams.get('recents_exclude')
-
-    if (recentsExclude) {
-      recentsSp.set('exclude_sources', recentsExclude)
-    }
-
-    const cronSp = sliceParams('cron_limit', '50', { profile: 'all', source: 'cron' })
-
-    const messagingSp = sliceParams('messaging_limit', '100', { profile: 'all' })
-    const messagingExclude = searchParams.get('messaging_exclude')
-
-    if (messagingExclude) {
-      messagingSp.set('exclude_sources', messagingExclude)
-    }
+    const { recents: recentsSp, cron: cronSp, messaging: messagingSp } = buildSidebarSessionSliceParams(searchParams)
 
     const [recents, cron, messaging] = await Promise.all([
       fetchProfilesSessionSlice(recentsSp, remoteProfiles),
@@ -14057,9 +14072,12 @@ ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketpla
 ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
 // ---------------------------------------------------------------------------
-// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00).
+// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00, or
+// hermes://mcp/install?name=NAME&config=B64 — the vendor "Add to Hermes"
+// button). Parsing is generic ({kind, name, params}); the renderer routes per
+// kind and anything install-shaped requires explicit user confirmation there.
 // A docs/dashboard "Send to App" button opens this URL; we route it into the
-// running app's chat composer. Three delivery paths: macOS 'open-url',
+// running app. Three delivery paths: macOS 'open-url',
 // Win/Linux running-app 'second-instance' (argv), Win/Linux cold-start argv.
 // ---------------------------------------------------------------------------
 const HERMES_PROTOCOL = 'hermes'
