@@ -265,6 +265,25 @@ VALID_HOOKS: Set[str] = {
     #       contracts; no inert VALID_HOOKS surface is registered ahead of
     #       implementation.
     "gateway_platform_event",
+    # Slash-command dispatch observer (#64204, observer-first per #64182
+    # ground rule 3). Fired when a recognized slash command is about to be
+    # dispatched, BEFORE the handler runs, on both the interactive CLI
+    # (cli.py process_command) and the gateway canonical-command dispatch
+    # (gateway/run.py _handle_message). Return values are IGNORED in v1 —
+    # a plugin returning a directive-shaped dict gets a debug log so future
+    # block/rewrite adopters are discoverable once the middleware variant
+    # ships against the #64231 taxonomy.
+    #
+    # Deliberately NOT fired for the gateway's running-agent intercept path
+    # (/stop, /approve, busy_policy dispatch while a turn is live): those are
+    # control-plane operations on an in-flight run — letting plugins observe
+    # (and one day veto) the operator's escape hatches would turn a slow or
+    # hostile plugin into a way to lose control of a running agent.
+    #
+    # Kwargs: surface: "cli" | "gateway", command: canonical name (str),
+    #   alias_used: the exact token the user typed (str), args_raw: str,
+    #   session_key: str | None (gateway), platform: str | None (gateway).
+    "pre_command",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -1270,6 +1289,45 @@ class PluginContext:
         except Exception:
             return "default"
 
+    # -- lifecycle: unload callbacks and supervised tasks --------------------
+
+    def on_unload(self, callback: Callable[[], None]) -> PluginRegistration:
+        """Register a cleanup callback that runs when this plugin unloads.
+
+        Callbacks are recorded in the ownership ledger, so they run in
+        reverse acquisition order interleaved with registration teardown,
+        and each is isolated — an exception is logged, never propagated
+        (see :meth:`PluginManager._dispose_registrations`).
+        """
+        if not callable(callback):
+            raise TypeError("on_unload callback must be callable")
+        handle = self._track("on_unload", getattr(callback, "__name__", "callback"), callback)
+        logger.debug("Plugin %s registered on_unload callback", self.manifest.name)
+        return handle
+
+    def spawn_task(self, coro, *, name: Optional[str] = None) -> "asyncio.Task":
+        """Spawn a supervised background asyncio task owned by this plugin.
+
+        The task is recorded in the ownership ledger; unloading the plugin
+        (or a force reload) cancels it. Requires a running event loop.
+        """
+        if not asyncio.iscoroutine(coro):
+            raise TypeError("spawn_task expects a coroutine")
+        loop = asyncio.get_running_loop()
+        task_name = name or f"plugin:{self.plugin_id}:task"
+        task = loop.create_task(coro, name=task_name)
+
+        def _cancel_task() -> None:
+            if not task.done():
+                task.cancel()
+
+        handle = self._track("background_task", task_name, _cancel_task)
+        task.add_done_callback(lambda _t: handle.dispose())
+        logger.debug(
+            "Plugin %s spawned supervised task: %s", self.manifest.name, task_name
+        )
+        return task
+
     # -- approval transport registration ------------------------------------
 
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
@@ -1286,6 +1344,26 @@ class PluginContext:
             present_fn,
             plugin_id=self.manifest.key or self.manifest.name,
         )
+        # Record ownership so unload/force-reload removes this transport.
+        # Duplicate names are rejected above (raise), so there is never a
+        # displaced previous entry to restore.
+        clean = str(name).strip().lower()
+        entry = self._manager._approval_transports.get(clean)
+        if entry is not None:
+            self._track_replacement(
+                "approval_transport",
+                clean,
+                slot=(
+                    "manager_mapping",
+                    id(self._manager._approval_transports),
+                    clean,
+                ),
+                current=entry,
+                previous=None,
+                restore=lambda replacement: self._manager._restore_mapping(
+                    self._manager._approval_transports, clean, entry, replacement
+                ),
+            )
 
     # -- tool registration --------------------------------------------------
 
@@ -1398,6 +1476,130 @@ class PluginContext:
             return True
         plugin_id = self.manifest.key or self.manifest.name
         return plugin_capability_granted(plugin_id, capability)
+
+    # -- capability-gated MCP access ----------------------------------------
+
+    def call_mcp(
+        self,
+        server: str,
+        tool: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        """Call a tool on a configured MCP server (#64204, capability-gated).
+
+        Synchronous; safe to call from plugin hooks and tools. Routes through
+        the EXISTING native MCP client machinery in :mod:`tools.mcp_tool`
+        (background loop, trust-tier gates, circuit breaker, reconnect and
+        result rendering) — never a parallel client or connection.
+
+        Default-off: a plugin has NO MCP access until the operator lists the
+        servers it may reach under ``plugins.entries.<plugin_id>.mcp_allowlist``
+        in config.yaml::
+
+            plugins:
+              entries:
+                my-plugin:
+                  mcp_allowlist: ["knowledge_rag", "github"]
+
+        Calls to unlisted servers raise :class:`PermissionError`. This is a
+        per-server grant, deliberately not ambient authority over every
+        configured server.
+        # TODO(#64228): swap the per-server allowlist for the declared
+        # capability model once it lands (per-tool grants, expiry, ro/rw).
+
+        Args:
+            server: MCP server name as configured in ``mcp.servers``.
+            tool: Tool name on that server (unprefixed).
+            arguments: JSON-serializable arguments dict for the tool.
+            timeout: Seconds to wait for the call (default 30) so a hung
+                MCP server can never stall the hook/tool pipeline.
+
+        Returns:
+            Envelope dict: ``{"ok": True, "result": <parsed result>}`` on
+            success or ``{"ok": False, "error": <message>}`` when the MCP
+            call itself failed. Results larger than ~64KB are truncated
+            with a marker.
+
+        Raises:
+            PermissionError: server not in this plugin's ``mcp_allowlist``.
+        """
+        plugin_id = self.manifest.key or self.manifest.name
+        allowlist = self._mcp_allowlist(plugin_id)
+        if server not in allowlist:
+            raise PermissionError(
+                f"Plugin {self.manifest.name!r} is not allowed to call MCP "
+                f"server {server!r}. Add it to "
+                f"plugins.entries.{plugin_id}.mcp_allowlist in config.yaml "
+                f"to grant access (default is no MCP access)."
+            )
+
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            timeout = 30.0
+        timeout = max(1.0, min(timeout, 600.0))
+
+        # Reuse the exact handler the tool registry uses for MCP tools —
+        # same trust gate, circuit breaker, reconnect and rendering paths.
+        from tools.mcp_tool import _make_tool_handler
+
+        handler = _make_tool_handler(server, tool, timeout)
+        raw = handler(dict(arguments or {}))
+
+        logger.debug(
+            "Plugin %s called MCP %s/%s (timeout=%ss, %d chars returned)",
+            self.manifest.name, server, tool, timeout, len(raw or ""),
+        )
+        return self._mcp_envelope(raw)
+
+    _MCP_RESULT_CHAR_CAP = 65536
+
+    @classmethod
+    def _mcp_envelope(cls, raw: Any) -> Dict[str, Any]:
+        """Normalize an MCP handler result string into a stable envelope."""
+        if not isinstance(raw, str):
+            raw = "" if raw is None else str(raw)
+        if len(raw) > cls._MCP_RESULT_CHAR_CAP:
+            raw = raw[: cls._MCP_RESULT_CHAR_CAP] + "… [truncated]"
+            truncated = True
+        else:
+            truncated = False
+        parsed: Any = None
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and "error" in parsed:
+            envelope: Dict[str, Any] = {"ok": False, "error": parsed["error"]}
+        elif isinstance(parsed, dict) and "result" in parsed:
+            envelope = {"ok": True, "result": parsed["result"]}
+            if "structuredContent" in parsed:
+                envelope["structuredContent"] = parsed["structuredContent"]
+        else:
+            envelope = {"ok": True, "result": parsed if parsed is not None else raw}
+        if truncated:
+            envelope["truncated"] = True
+        return envelope
+
+    @staticmethod
+    def _mcp_allowlist(plugin_id: str) -> List[str]:
+        """Return the operator-granted MCP server allowlist for a plugin.
+
+        Missing key or unreadable config → empty list (fail closed,
+        default-deny).
+        """
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+        except Exception:
+            return []
+        entries = (cfg.get("plugins") or {}).get("entries") or {}
+        entry = entries.get(plugin_id) or {}
+        allowlist = entry.get("mcp_allowlist")
+        if not isinstance(allowlist, list):
+            return []
+        return [str(item) for item in allowlist]
 
     # -- override trust gate ------------------------------------------------
 
@@ -2575,7 +2777,7 @@ class PluginContext:
         *,
         position: str = "after_memory",
         max_chars: int = DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS,
-    ) -> None:
+    ) -> PluginRegistration:
         """Register bounded context that is frozen into each new session prompt.
 
         Callables receive a read-only session-info mapping. The rendered full
@@ -2610,13 +2812,40 @@ class PluginContext:
                 f"plugin {existing.plugin!r}"
             )
         plugin_id = self.manifest.key or self.manifest.name
-        self._manager._system_prompt_sections[id] = PluginSystemPromptSection(
+        section = PluginSystemPromptSection(
             id=id,
             content=content,
             position=position,
             max_chars=max_chars,
             plugin=plugin_id,
         )
+        self._manager._system_prompt_sections[id] = section
+        # Record ownership so unload/force-reload removes this section.
+        # Duplicate ids are rejected above (raise), so there is never a
+        # displaced previous entry to restore. The parameter ``id`` shadows
+        # the builtin, so capture the mapping identity via ``builtins.id``.
+        import builtins
+
+        handle = self._track_replacement(
+            "system_prompt_section",
+            id,
+            slot=(
+                "manager_mapping",
+                builtins.id(self._manager._system_prompt_sections),
+                id,
+            ),
+            current=section,
+            previous=existing,
+            restore=lambda replacement: self._manager._restore_mapping(
+                self._manager._system_prompt_sections, id, section, replacement
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered system prompt section: %s",
+            self.manifest.name,
+            id,
+        )
+        return handle
 
     # -- inter-plugin event bus --------------------------------------------
 
@@ -2849,6 +3078,19 @@ class PluginManager:
         self._slack_action_handlers: List[tuple] = []
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
+        #
+        # Multi-profile constraint (#65593): several process-global registries
+        # (tools, platforms, providers) are shared across profiles while
+        # multiple PluginManager instances may coexist in one process (keyed
+        # by resolved hermes home). The ledger is therefore keyed per manager
+        # — i.e. per (hermes_home, plugin_id) — and every release/restore
+        # closure is identity-conditional, so one profile's unload can never
+        # clear another profile's registrations. Registry overlays keyed by
+        # scope_key (see tools/registry.py and gateway/platform_registry.py)
+        # carry the profile dimension; anything still process-global is
+        # guarded by the identity checks. TODO(#64178): extend explicit
+        # profile keying to any remaining process-global slots when the
+        # symmetric force-reload lands.
         self._ownership_ledger: Dict[str, List[PluginRegistration]] = {}
         self._registration_order: List[PluginRegistration] = []
 
@@ -2902,10 +3144,10 @@ class PluginManager:
 
     def _restore_mapping(
         self,
-        mapping: Dict[str, dict],
+        mapping: Dict[str, Any],
         key: str,
-        current: dict,
-        previous: Optional[dict],
+        current: Any,
+        previous: Optional[Any],
     ) -> bool:
         """Restore a manager-local mapping only when *current* is still present."""
         if mapping.get(key) is not current:
@@ -3014,8 +3256,9 @@ class PluginManager:
         reverse acquisition order.  Registry inverses are conditional on the
         exact object still being current, so a later registration is never
         removed accidentally.  ``plugin=None`` is the lifecycle operation
-        used by force rediscovery; lifecycle callbacks and supervised tasks
-        are intentionally left for the follow-up slice of #64229.
+        used by force rediscovery.  ``on_unload`` callbacks and supervised
+        background tasks registered through :class:`PluginContext` are
+        disposed through the same reverse-order ledger walk.
 
         Returns ``True`` when at least one plugin or registration was found.
         """
@@ -3055,6 +3298,17 @@ class PluginManager:
             # The handles are authoritative for global registries, while the
             # manager-local containers are also reset to clear legacy/manual
             # state that predates the ledger.
+            #
+            # Platform names may exist in _plugin_platform_names without a
+            # ledger entry (state predating the ledger, or set manually in
+            # long-lived processes). Main's force path always unregistered
+            # them from the global registry — keep that sweep so disabled
+            # plugins can't leak parsers/send handlers into the next
+            # discovery pass.
+            from gateway.platform_registry import platform_registry
+
+            for platform_name in tuple(self._plugin_platform_names):
+                platform_registry.unregister(platform_name)
             self._ownership_ledger.clear()
             self._plugins.clear()
             self._hooks.clear()
@@ -4028,7 +4282,7 @@ class PluginManager:
             # register() may have subscribed before raising. Remove those
             # owner-tagged entries so a failed/unloaded plugin cannot leave a
             # callable reachable from later event dispatch.
-            self._remove_plugin_subscriptions(_plugin_id)
+            self._remove_plugin_subscriptions(plugin_key)
             logger.warning(
                 "Failed to load plugin '%s': %s",
                 manifest.name, exc, exc_info=_PLUGINS_DEBUG,
@@ -5017,6 +5271,49 @@ def has_hook(hook_name: str) -> bool:
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
     """Return a stable snapshot of callbacks registered for a hook."""
     return get_plugin_manager().iter_hook_callbacks(hook_name)
+
+
+def fire_pre_command_hook(
+    *,
+    surface: str,
+    command: str,
+    alias_used: str,
+    args_raw: str,
+    session_key: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> None:
+    """Fire the ``pre_command`` observer hook (#64204). Never raises.
+
+    Observer-only in v1: return values are ignored. If a plugin returns a
+    directive-shaped dict (``action``/``decision`` keys), a debug line is
+    logged so future block/rewrite adopters are discoverable when the
+    middleware variant ships against the #64231 command-event taxonomy.
+    """
+    try:
+        manager = get_plugin_manager()
+        if not manager.has_hook("pre_command"):
+            return
+        results = manager.invoke_hook(
+            "pre_command",
+            surface=surface,
+            command=command,
+            alias_used=alias_used,
+            args_raw=args_raw,
+            session_key=session_key,
+            platform=platform,
+        )
+        for result in results:
+            if isinstance(result, dict) and (
+                "action" in result or "decision" in result
+            ):
+                logger.debug(
+                    "pre_command is observer-only in v1: ignoring directive "
+                    "%r for /%s (surface=%s). Block/rewrite will arrive with "
+                    "the command middleware variant (#64204/#64231).",
+                    result, command, surface,
+                )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("pre_command hook dispatch failed (non-fatal): %s", exc)
 
 
 _thread_tool_whitelist = threading.local()
