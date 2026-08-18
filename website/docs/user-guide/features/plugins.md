@@ -337,7 +337,7 @@ hermes plugins install <name>                # install by index name (resolved t
 hermes plugins install user/repo             # install from Git, then prompt Enable? [y/N]
 hermes plugins install user/repo --enable    # install AND enable (no prompt)
 hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
-hermes plugins update my-plugin              # pull latest
+hermes plugins update my-plugin              # pull latest (local edits are autostashed and re-applied)
 hermes plugins remove my-plugin              # uninstall
 hermes plugins enable my-plugin              # add to allow-list
 hermes plugins disable my-plugin             # remove from allow-list + add to disabled
@@ -391,6 +391,7 @@ working but are **deprecated** in favor of the consent flow:
 | `llm.agent_id_override` | `llm.allow_agent_id_override` |
 | `llm.profile_override` | `llm.allow_profile_override` |
 | `llm.task_override` | `llm.allow_task_override` |
+| `gateway.platform_actions` | `allow_platform_actions` |
 
 A gate is open when *either* the capability is granted *or* the legacy key is
 set — existing configs keep working unchanged.
@@ -401,6 +402,53 @@ regular in-process Python: a malicious plugin can ignore every gate here.
 Granting a capability is a statement of trust in the plugin author — it is
 not a code audit, and Hermes has not reviewed the plugin's code. Only install
 plugins from sources you trust.
+:::
+
+### Platform actions
+
+`ctx.platform_actions` gives a plugin a minimal, capability-gated verb set for
+acting on connected chat platforms through the live gateway adapter registry —
+the sanctioned alternative to monkeypatching an adapter. **It is off by
+default**: every call re-checks the `gateway.platform_actions` capability
+(legacy key `plugins.entries.<id>.allow_platform_actions`), and an ungranted
+call returns a structured error instead of acting.
+
+v1 verbs (both `async`, both return a plain dict, and neither ever raises into
+hook dispatch):
+
+```python
+result = await ctx.platform_actions.add_reaction(
+    platform="telegram", chat_id="-100123", message_id="456", emoji="👍",
+)
+result = await ctx.platform_actions.set_thread_title(
+    platform="discord", chat_id="123", thread_id="456", title="New title",
+)
+if not result["ok"]:
+    print(result["error"], result.get("detail"))
+```
+
+Success is `{"ok": True, "action": <verb>}`. Failures are
+`{"ok": False, "error": <code>, "detail": <str>}` with stable error codes:
+`capability_not_granted`, `invalid_argument`, `gateway_unavailable`,
+`unknown_platform`, `adapter_not_registered`, `adapter_disconnected`,
+`unsupported_platform_action`, `action_failed`. Actions validate that the
+target adapter exists and is connected before acting; a disconnected or
+missing adapter degrades to a structured error, never an exception.
+
+Platforms supported in v1: Telegram and Discord. Telegram's `add_reaction`
+*sets* the bot's reaction (the Bot API replaces a previous bot reaction rather
+than stacking). Every action — allowed or denied — is written to the log with
+the plugin id, verb, platform, and outcome.
+
+:::warning Security note
+Platform actions are a **messaging-as-the-bot power**: a granted plugin can
+react and rename threads in any chat the gateway bot can reach, not just the
+chat that triggered the hook. Grant `gateway.platform_actions` only to plugins
+you trust, and prefer plugins that document exactly which actions they take.
+Raw platform SDK payload/handle access is deliberately **not** part of this
+surface — per the #64176 round-2 design correction it requires its own
+capability (`gateway.raw_events`) with a "no stability guarantee" label and a
+separate design, and has not shipped.
 :::
 
 ### Discovering community plugins
@@ -471,6 +519,73 @@ consent/review flow (plugins install disabled by default, enabling is an
 explicit step, and tool-override rights require a separate grant). Review a
 plugin's source before enabling it.
 :::
+
+### Plugin packs
+
+A **plugin pack** is a declarative, shareable YAML file (`hermes-pack.yaml`)
+that pins a set of plugins — like sharing a modpack. Installing a pack fans
+out to ordinary pinned installs; nothing new exists at runtime.
+
+```yaml
+name: voice-assistant-pack
+description: STT + streaming TTS + approval relay
+author: hyper
+version: 1.0.0
+plugins:
+  - name: hermes-media-studio            # bare community-index name…
+    ref: e8d59971d2b7901405b39dac7b03bdd616272d0d
+  - repo: owner/approval-relay           # …or explicit owner/repo (or git URL)
+    ref: 8f3c2d1a9b4e5f6071829304a5b6c7d8e9f00112
+    subdir: plugins/relay                # optional monorepo path
+config:                                  # optional, non-secret seeds only
+  hermes-media-studio:
+    default_model: flux-3
+skills: []                               # declared list only (not auto-installed yet)
+```
+
+```bash
+hermes plugins pack show ./hermes-pack.yaml     # dry-run review
+hermes plugins pack install ./hermes-pack.yaml  # review → confirm → install
+hermes plugins pack export > hermes-pack.yaml   # snapshot the current install
+hermes plugins pack export --enabled-only       # only plugins.enabled
+```
+
+**Supply-chain posture.** Every entry's `ref` must be an exact 40-character
+commit SHA — tags and branch names are rejected with an error naming the
+entry, the same rule as the community index. Pack installs ride the exact
+same pinned install path as `hermes plugins install --ref <sha>` and record
+the same provenance in `plugins/.install-metadata.json`, so two installs of
+the same pack resolve identically. Packs build on the
+[manifest v2 fields](/developer-guide/plugins) (`manifest_version`,
+`api_version`, `requires_plugins`) — each plugin's own manifest still
+validates through the normal install path.
+
+**Consent is never bulk-granted.** `pack install` shows a mandatory review
+screen (every plugin, source, pinned ref, and the capabilities it declares),
+then asks **one** confirmation for the pack contents. After that, each
+plugin's declared capabilities go through the standard per-plugin
+capability-consent prompt — identical to a single `hermes plugins install`.
+There is no `--yes`, and non-interactive sessions cannot install packs.
+
+**Secrets never travel in packs.** `config:` seeds are limited to
+non-secret `plugins.entries.<id>` keys — secret-shaped key names
+(`*token*`, `*key*`, `*password*`, …), capability grants, and the deprecated
+`allow_*` trust gates are rejected on install and stripped on export.
+Plugins that need secrets declare them in their own `requires_env`, which
+prompts during install as usual. Existing user values in
+`plugins.entries.<id>` always win over pack seeds.
+
+**Partial failure.** Each plugin installs independently; failures are
+reported per plugin, the rest continue, and the command exits non-zero if
+any plugin failed.
+
+**Export caveats.** `pack export` only includes plugins with known Git
+provenance (installed via `hermes plugins install`). Local-only plugins are
+listed as warning comments in the emitted YAML, not as installable entries.
+
+The `skills:` list is parsed and displayed at install time but not yet
+auto-installed — install those manually for now (`hermes skills`). Wiring
+skill-hub ids into pack install is a documented follow-up seam.
 
 ### Interactive UI
 
