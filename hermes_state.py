@@ -4022,6 +4022,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
 
+    def __del__(self) -> None:
+        """Safety net: close the connection if the caller forgot.
+
+        ``atexit.register`` in ``__init__`` pins this instance alive until
+        interpreter exit, which prevents GC from collecting orphaned
+        ``SessionDB`` instances on exception paths.  When callers forget
+        ``.close()``, the sqlite FDs leak until the process exits (EMFILE).
+
+        A ``__del__`` finalizer is the last-resort guard: it fires when the
+        GC collects the object, which *can* happen once ``atexit`` is
+        unregistered (via ``close()``) **or** when the atexit-held
+        reference is the only remaining root and the interpreter is
+        shutting down.  During normal interpreter teardown the order of
+        module cleanup is undefined, so we guard every attribute access.
+
+        Delegates to ``close()`` so the read pool, token writer, and atexit
+        hook are all cleaned up — not just the writer connection.
+        """
+        if self.__dict__.get("_conn") is None:
+            return
+        try:
+            self.close()
+        except Exception:
+            pass
+
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #
     # `optimize_fts_storage()` (the `hermes sessions optimize-storage`
