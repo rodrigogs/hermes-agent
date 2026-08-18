@@ -493,6 +493,9 @@ def test_relaunchable_fixup_falls_back_to_legacy_adhoc_on_failure(tmp_path, monk
 # --- desktop.* launch options (config.yaml) -------------------------------
 
 
+
+
+
 # --- Linux launcher entry registration ------------------------------------
 
 
