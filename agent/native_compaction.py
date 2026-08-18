@@ -266,16 +266,57 @@ def prune_pre_checkpoint_items(
     return checkpoint_run + list(reversed(retained_reversed)) + post
 
 
-def is_native_compaction_rejection(error: Any) -> bool:
-    """True when a provider error names the context_management field.
+def is_native_compaction_rejection(error: Any, status_code: Any = None) -> bool:
+    """True when a provider error is a STRUCTURED rejection of the
+    context_management field.
 
     Used by the conversation loop's one-shot recovery: strip the field,
     disable native compaction for the rest of the session, retry. Matching
-    is deliberately narrow — generic 4xx/5xx/timeouts must NOT permanently
-    downgrade native compaction, they take the normal retry path.
+    is deliberately narrow — a transient 5xx/timeout whose body merely
+    ECHOES the request (and therefore contains the field name) must NOT
+    permanently downgrade native compaction for the session (#82777).
+
+    Two conditions, both required when a status is known:
+
+    * ``status_code`` is 400 (or unknown/None — some transports surface
+      only a message string; field-name matching alone is then the best
+      available signal, preserving pre-#82777 behavior for them), and
+    * the error text names ``context_management`` / ``compact_threshold``
+      alongside rejection language ("unknown", "unsupported", "invalid",
+      "unexpected", "not permitted"...). A bare field-name echo without
+      rejection language does not match.
     """
     text = str(error or "").lower()
-    return "context_management" in text or "compact_threshold" in text
+    if "context_management" not in text and "compact_threshold" not in text:
+        return False
+    if status_code is not None:
+        try:
+            if int(status_code) != 400:
+                return False
+        except (TypeError, ValueError):
+            pass
+    rejection_markers = (
+        "unknown", "unsupported", "invalid", "unexpected", "not permitted",
+        "not allowed", "unrecognized", "extra field", "no such", "bad request",
+        "not supported",
+    )
+    return any(marker in text for marker in rejection_markers)
+
+
+def has_compaction_checkpoint(items: Any) -> bool:
+    """Does this ``codex_reasoning_items`` sidecar carry a compaction checkpoint?
+
+    A ``type: "compaction"`` item is the server-side stand-in for history that
+    has already been pruned — cumulative context, not per-turn reasoning. It
+    rides the same sidecar as ordinary reasoning items, so anything that
+    rewrites or discards that sidecar (or the message carrying it) has to ask
+    this question first: the checkpoint exists in exactly one place, and the
+    request that loses it loses the compacted history with it.
+    """
+    return any(
+        isinstance(item, dict) and item.get("type") == "compaction"
+        for item in (items if isinstance(items, list) else ())
+    )
 
 
 def merge_interim_reasoning_items(
@@ -299,10 +340,6 @@ def merge_interim_reasoning_items(
         if isinstance(item, dict) and item.get("type") == "compaction"
     ]
     new_list = list(new_items) if isinstance(new_items, list) else []
-    new_has_checkpoint = any(
-        isinstance(item, dict) and item.get("type") == "compaction"
-        for item in new_list
-    )
-    if new_has_checkpoint or not kept_checkpoints:
+    if has_compaction_checkpoint(new_list) or not kept_checkpoints:
         return new_list
     return kept_checkpoints + new_list
