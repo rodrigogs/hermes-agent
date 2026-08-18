@@ -6898,7 +6898,7 @@ async function cloudAgentSilentSignIn(dashboardUrl) {
   return { baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
 }
 
-function encryptDesktopSecret(value, options) {
+function encryptDesktopSecret(value, options = {}) {
   return encryptDesktopSecretStrict(value, safeStorage, options)
 }
 
@@ -7155,17 +7155,17 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
     remoteTokenPreview: tokenPreview(remoteToken),
     remoteTokenSet: Boolean(remoteToken),
+    // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
+    // affordance in Settings → Gateway on keyring-less Linux.
+    secureTokenStorage,
+    // Whether the saved token is currently persisted in plain text.
+    remoteTokenPlainText,
     sshHost: (ssh || savedSsh)?.host || '',
     sshUser: (ssh || savedSsh)?.user || '',
     sshPort: (ssh || savedSsh)?.port || null,
     sshKeyPath: (ssh || savedSsh)?.keyPath || '',
     sshRemoteHermesPath: (ssh || savedSsh)?.remoteHermesPath || '',
     sshRemoteProfile: (ssh || savedSsh)?.remoteProfile || '',
-    // Whether the OS keyring can encrypt a token; drives the plain-text opt-in
-    // affordance in Settings → Gateway on keyring-less Linux.
-    secureTokenStorage,
-    // Whether the saved token is currently persisted in plain text.
-    remoteTokenPlainText,
     // The env override only forces the global/primary connection; a per-profile
     // scope is never overridden by HERMES_DESKTOP_REMOTE_URL.
     envOverride
