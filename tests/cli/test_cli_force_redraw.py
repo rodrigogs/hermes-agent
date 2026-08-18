@@ -53,6 +53,11 @@ class TestForceFullRedraw:
         monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 90)
         monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
         monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        monkeypatch.setattr(
+            cli_mod,
+            "CLI_CONFIG",
+            {"display": {"cli_rebuild_scrollback_on_redraw": False}},
+        )
 
         bare_cli._recover_after_resize(app, original_on_resize)
 
@@ -66,6 +71,57 @@ class TestForceFullRedraw:
         assert bare_cli._last_resize_width == 90
         assert bare_cli._status_bar_suppressed_after_resize is True
 
+    def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        bare_cli._app = app
+        monkeypatch.setattr(
+            cli_mod,
+            "CLI_CONFIG",
+            {"display": {"cli_rebuild_scrollback_on_redraw": False}},
+        )
+
+        bare_cli._force_full_redraw()
+
+        app.renderer.output.erase_screen.assert_called_once()
+        app.renderer.output.cursor_goto.assert_called_once_with(0, 0)
+        app.renderer.output.write_raw.assert_not_called()
+
+    def test_force_redraw_can_clear_scrollback_when_configured(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        bare_cli._app = app
+        monkeypatch.setattr(
+            cli_mod,
+            "CLI_CONFIG",
+            {"display": {"cli_rebuild_scrollback_on_redraw": True}},
+        )
+
+        bare_cli._force_full_redraw()
+
+        app.renderer.output.erase_screen.assert_called_once()
+        app.renderer.output.write_raw.assert_called_once_with("\x1b[3J")
+
+    def test_resize_recovery_can_clear_scrollback_when_configured(self, bare_cli, monkeypatch):
+        app = MagicMock()
+        events = []
+        app.renderer.output.erase_screen.side_effect = lambda: events.append("erase")
+        app.renderer.output.write_raw.side_effect = lambda *_: events.append("scrollback_wipe")
+        original_on_resize = lambda: events.append("original_resize")
+
+        bare_cli._status_bar_suppressed_after_resize = False
+        bare_cli._last_resize_width = 200
+        monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 90)
+        monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        monkeypatch.setattr(
+            cli_mod,
+            "CLI_CONFIG",
+            {"display": {"cli_rebuild_scrollback_on_redraw": "true"}},
+        )
+
+        bare_cli._recover_after_resize(app, original_on_resize)
+
+        assert events[:3] == ["erase", "scrollback_wipe", "replay"]
+        assert events.index("scrollback_wipe") < events.index("original_resize")
 
     def test_resize_recovery_is_debounced(self, bare_cli, monkeypatch):
         timers = []
@@ -142,3 +198,119 @@ class TestForceFullRedraw:
         bare_cli._app = app
 
         bare_cli._force_full_redraw()  # must not raise
+
+
+class TestFirstSigwinchBaseline:
+    """Bug #65293: the session's FIRST SIGWINCH used to be force-treated as a
+    width change (no prior width to compare against), so a benign resize
+    signal — GNOME Terminal tab bar appearing, monitor-scale change, focus
+    events — cleared the viewport and replayed ``_OUTPUT_HISTORY``.  After a
+    resume that deque holds the whole "Previous Conversation" recap plus the
+    first live exchange, so everything reprinted as a duplicate.  A replay
+    must require an OBSERVED width change against a recorded baseline.
+    """
+
+    def test_first_sigwinch_with_unchanged_width_does_not_replay(
+        self, bare_cli, monkeypatch
+    ):
+        app = MagicMock()
+        events = []
+        app.renderer.output.erase_screen.side_effect = lambda: events.append("erase")
+        original_on_resize = lambda: events.append("original_resize")
+
+        bare_cli._status_bar_suppressed_after_resize = False
+        # No baseline recorded yet — the pre-fix code forced width_changed=True.
+        assert getattr(bare_cli, "_last_resize_width", None) is None
+        monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 120)
+        monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
+        monkeypatch.setattr(
+            cli_mod, "_replay_output_history", lambda: events.append("replay")
+        )
+
+        bare_cli._recover_after_resize(app, original_on_resize)
+
+        # Width did not change — no clear, no replay, straight to prompt_toolkit.
+        assert events == ["original_resize"]
+        app.renderer.output.erase_screen.assert_not_called()
+        # The signal still records the baseline for the next comparison.
+        assert bare_cli._last_resize_width == 120
+
+    def test_real_width_change_after_baseline_still_replays(
+        self, bare_cli, monkeypatch
+    ):
+        """The #49120 recovery (2J + replay) must still fire on a real change."""
+        app = MagicMock()
+        events = []
+        app.renderer.output.erase_screen.side_effect = lambda: events.append("erase")
+        original_on_resize = lambda: events.append("original_resize")
+
+        bare_cli._status_bar_suppressed_after_resize = False
+        bare_cli._last_resize_width = 120
+        monkeypatch.setattr(bare_cli, "_get_tui_terminal_width", lambda: 90)
+        monkeypatch.setattr(bare_cli, "_schedule_status_bar_unsuppress", lambda *_: None)
+        monkeypatch.setattr(
+            cli_mod, "_replay_output_history", lambda: events.append("replay")
+        )
+
+        bare_cli._recover_after_resize(app, original_on_resize)
+
+        assert "erase" in events and "replay" in events
+        assert bare_cli._last_resize_width == 90
+
+    def test_install_resize_recovery_seeds_width_baseline(self, bare_cli):
+        """Hook installation records the CURRENT width as the baseline, so an
+        initial maximize/restore (a real change vs that baseline) is still
+        recovered while a same-size first signal is not.
+
+        The baseline must come from ``app.output`` — the same object the
+        running app measures on SIGWINCH — not from ``get_app()``, which
+        before ``app.run()`` is a DummyApplication reporting a fake 80 cols.
+        """
+        app = MagicMock()
+        app.output.get_size.return_value.columns = 132
+        scheduled = []
+        bare_cli._schedule_resize_recovery = lambda *a, **k: scheduled.append(a)
+
+        original = app._on_resize
+        bare_cli._install_resize_recovery(app)
+
+        assert bare_cli._last_resize_width == 132
+        assert app._on_resize is not original  # hook installed
+        app._on_resize()  # simulated SIGWINCH → routes to the debouncer
+        assert len(scheduled) == 1
+        assert scheduled[0][0] is app
+        assert scheduled[0][1] is original
+
+    def test_install_resize_recovery_falls_back_to_shutil(
+        self, bare_cli, monkeypatch
+    ):
+        """A dead app.output probe falls back to shutil, never to the
+        DummyApplication's fake width."""
+        import os as os_mod
+
+        app = MagicMock()
+        app.output.get_size.side_effect = RuntimeError("not attached")
+        monkeypatch.setattr(
+            cli_mod.shutil,
+            "get_terminal_size",
+            lambda _default: os_mod.terminal_size((97, 40)),
+        )
+
+        bare_cli._install_resize_recovery(app)
+
+        assert bare_cli._last_resize_width == 97
+
+    def test_install_resize_recovery_survives_width_probe_failure(
+        self, bare_cli, monkeypatch
+    ):
+        app = MagicMock()
+        app.output.get_size.side_effect = RuntimeError("not attached")
+
+        def _boom(_default):
+            raise RuntimeError("no tty")
+
+        monkeypatch.setattr(cli_mod.shutil, "get_terminal_size", _boom)
+
+        bare_cli._install_resize_recovery(app)  # must not raise
+
+        assert getattr(bare_cli, "_last_resize_width", None) is None
