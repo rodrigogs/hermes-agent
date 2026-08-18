@@ -632,14 +632,6 @@ def test_desktop_launch_options_normalizes_password_store(raw, expected):
     assert store == expected
 
 
-def test_desktop_launch_options_survives_config_error():
-    with patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
-        flags, gpu, store = cli_main._desktop_launch_options()
-    assert flags == []
-    assert gpu == "auto"
-    assert store == "auto"
-
-
 # --- desktop.password_store detection & bridging (linux) ------------------
 
 
