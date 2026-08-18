@@ -773,7 +773,7 @@ def _print_update_completion(message: str) -> None:
         print(f"=== hermes-update completed {action_id} ===")
 
 
-def _update_via_zip(args):
+def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -1011,6 +1011,10 @@ def _update_via_zip(args):
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    _rebuild_desktop_after_update(
+        _m().PROJECT_ROOT / "apps" / "desktop",
+        had_desktop_app_before_update=had_desktop_app_before_update,
+    )
 
     # Sync skills
     try:
@@ -1786,10 +1790,23 @@ def _upgrade_pip_before_lazy_refresh(
     except subprocess.CalledProcessError as exc:
         logger.debug("pip upgrade before lazy refresh failed: %s", exc)
 
+
+def _capture_active_lazy_features() -> list[str]:
+    """Snapshot active lazy backends before a managed runtime is replaced."""
+    try:
+        from tools import lazy_deps
+
+        return lazy_deps.active_features()
+    except Exception as exc:
+        logger.debug("Could not snapshot active lazy features: %s", exc)
+        return []
+
+
 def _refresh_active_lazy_features(
     install_cmd_prefix: list[str] | None = None,
     *,
     env: dict[str, str] | None = None,
+    features: list[str] | None = None,
 ) -> bool:
     """Refresh lazy-installed backends after a code update.
 
@@ -1817,11 +1834,14 @@ def _refresh_active_lazy_features(
         logger.debug("Lazy refresh skipped (import failed): %s", exc)
         return True
 
-    try:
-        active = lazy_deps.active_features()
-    except Exception as exc:
-        logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
-        return True
+    if features is None:
+        try:
+            active = lazy_deps.active_features()
+        except Exception as exc:
+            logger.debug("Lazy refresh skipped (active_features failed): %s", exc)
+            return True
+    else:
+        active = features
 
     if not active:
         return True
@@ -1831,7 +1851,10 @@ def _refresh_active_lazy_features(
 
     unexpected_failure = False
     try:
-        results = lazy_deps.refresh_active_features(prompt=False)
+        if features is None:
+            results = lazy_deps.refresh_active_features(prompt=False)
+        else:
+            results = lazy_deps.restore_features(active)
     except Exception as exc:
         # refresh_active_features is documented as never-raise, but defend
         # the update flow against future regressions.
@@ -1839,7 +1862,7 @@ def _refresh_active_lazy_features(
         results = {}
         unexpected_failure = True
 
-    refreshed = [f for f, s in results.items() if s == "refreshed"]
+    refreshed = [f for f, s in results.items() if s in {"refreshed", "restored"}]
     current = [f for f, s in results.items() if s == "current"]
     failed = [(f, s) for f, s in results.items() if s.startswith("failed:")]
     skipped = [(f, s) for f, s in results.items() if s.startswith("skipped:")]
@@ -3981,9 +4004,91 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
+
+def _desktop_app_present(desktop_dir: Path) -> bool:
+    """Return whether a packaged or source Desktop build exists."""
+    return (
+        _m()._desktop_packaged_executable(desktop_dir) is not None
+        or _m()._desktop_dist_exists(desktop_dir)
+    )
+
+
+def _rebuild_desktop_after_update(
+    desktop_dir: Path, *, had_desktop_app_before_update: bool
+) -> None:
+    """Rebuild an installed Desktop app when its source or artifact changed."""
+    # The release tree is ignored by git and can disappear during an update.
+    # Its pre-update presence is enough to restore it; do not make people who
+    # have never used Desktop pay for an Electron build.
+    has_desktop_app = had_desktop_app_before_update or _desktop_app_present(desktop_dir)
+    if not (
+        (desktop_dir / "package.json").exists()
+        and _m()._resolve_node_runtime_npm()
+        and has_desktop_app
+    ):
+        return
+
+    print("→ Checking if desktop app needs rebuilding...")
+    # Consult the content-hash stamp IN-PROCESS first. The spawned
+    # `hermes desktop --build-only` subprocess re-imports the whole CLI stack
+    # (~1-3 s) just to reach the same _m()._desktop_build_needed check; when
+    # the stamp already says "up to date" we can skip the spawn entirely. The
+    # update path never passes --source, so the subprocess would run with
+    # source_mode=False — mirror that here. Any error in the pre-check falls
+    # through to the subprocess.
+    skip_desktop_build = False
+    try:
+        skip_desktop_build = not _m()._desktop_build_needed(
+            desktop_dir, _m().PROJECT_ROOT, source_mode=False
+        )
+    except Exception:
+        skip_desktop_build = False
+    if skip_desktop_build:
+        print("  ✓ Desktop app up to date")
+        return
+
+    desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
+    # Capture the (very loud) Electron/vite build output into update.log
+    # instead of streaming it to the terminal. On the rare nonzero exit,
+    # retry once after waiting again for the venv — this covers a
+    # still-settling rebuild window the first wait didn't fully catch — then
+    # surface the captured tail so the failure is debuggable.
+    #
+    # Start the build subprocess with the Hermes-managed Node on PATH: when
+    # `hermes update` runs inside the desktop updater chain (Desktop →
+    # hermes-setup → hermes update), the shell PATH customizations are lost,
+    # so a bare-PATH child would fail with `node: not found` before cmd_gui can
+    # self-heal.
+    from hermes_constants import with_hermes_node_path
+
+    build_env = with_hermes_node_path()
+    build_result = _m()._run_logged_subprocess(
+        desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+    )
+    if build_result.returncode != 0:
+        build_result = _m()._run_logged_subprocess(
+            desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
+        )
+    if build_result.returncode != 0:
+        print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
+        tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
+        if tail:
+            print(tail)
+        from hermes_constants import display_hermes_home as _dhh
+
+        print(f"  Full build log: {_dhh()}/logs/update.log")
+    else:
+        print("  ✓ Desktop app up to date")
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    # A managed-runtime refresh can replace site-packages before the normal
+    # ``.[all]`` install runs. Snapshot while the old environment can still
+    # prove which optional backends the user had activated.
+    active_lazy_features = _m()._capture_active_lazy_features()
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -4121,6 +4226,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         sys.exit(2)
 
+    # Capture this after every fail-closed venv guard, but before either
+    # update path can remove the ignored release tree.
+    desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
+    had_desktop_app_before_update = _desktop_app_present(desktop_dir)
+
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)
     use_zip_update = False
@@ -4183,7 +4293,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
         try:
-            _update_via_zip(args)
+            _update_via_zip(
+                args,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+            )
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         return
@@ -4404,9 +4517,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     _m()._install_python_dependencies_with_optional_fallback(
                         [repair_uv, "pip"], env=repair_env, group="all"
                     )
+                    _m()._refresh_active_lazy_features(
+                        [repair_uv, "pip"],
+                        env=repair_env,
+                        features=active_lazy_features,
+                    )
                 else:
                     _m()._install_python_dependencies_with_optional_fallback(
                         [sys.executable, "-m", "pip"], group="all"
+                    )
+                    _m()._refresh_active_lazy_features(
+                        [sys.executable, "-m", "pip"],
+                        features=active_lazy_features,
                     )
                 _m()._clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
@@ -4686,7 +4808,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Lazy refresh can corrupt the venv when a backend install fails.
         # Clear the lazy marker only when refresh/repair is confirmed healthy.
-        lazy_ok = _m()._refresh_active_lazy_features(install_prefix, env=lazy_env)
+        lazy_ok = _m()._refresh_active_lazy_features(
+            install_prefix,
+            env=lazy_env,
+            features=active_lazy_features,
+        )
         if lazy_ok:
             _m()._clear_lazy_refresh_incomplete_marker()
         else:
@@ -4721,62 +4847,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
-        # Rebuild the desktop app if the source tree changed since the last
-        # build.  ``hermes desktop --build-only`` uses the content-hash stamp
-        # internally, so this is effectively a no-op when nothing changed.
-        # Only bother if the user has a desktop app installed (indicated by
-        # an existing packaged executable or desktop dist); people who have
-        # never run ``hermes desktop`` shouldn't be forced into a full
-        # Electron build by ``hermes update``.
-        desktop_dir = _m().PROJECT_ROOT / "apps" / "desktop"
-        has_desktop_app = _m()._desktop_packaged_executable(desktop_dir) is not None or _m()._desktop_dist_exists(desktop_dir)
-        if (desktop_dir / "package.json").exists() and _m()._resolve_node_runtime_npm() and has_desktop_app:
-            print("→ Checking if desktop app needs rebuilding...")
-            # Consult the content-hash stamp IN-PROCESS first. The spawned
-            # `hermes desktop --build-only` subprocess re-imports the whole
-            # CLI stack (~1-3 s) just to reach the same _m()._desktop_build_needed
-            # check; when the stamp already says "up to date" we can skip the
-            # spawn entirely. The update path never passes --source, so the
-            # subprocess would run with source_mode=False — mirror that here.
-            # Any error in the pre-check falls through to the subprocess.
-            _skip_desktop_build = False
-            try:
-                _skip_desktop_build = not _m()._desktop_build_needed(
-                    desktop_dir, _m().PROJECT_ROOT, source_mode=False
-                )
-            except Exception:
-                _skip_desktop_build = False
-            if _skip_desktop_build:
-                print("  ✓ Desktop app up to date")
-            else:
-                _desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
-                # Capture the (very loud) Electron/vite build output into
-                # update.log instead of streaming it to the terminal. On the rare
-                # nonzero exit, retry once after waiting again for the venv — this
-                # covers a still-settling rebuild window the first wait didn't fully
-                # catch — then surface the captured tail so the failure is
-                # debuggable.
-                #
-                # Start the build subprocess with the Hermes-managed Node on PATH:
-                # when `hermes update` runs inside the desktop updater chain
-                # (Desktop → hermes-setup → hermes update), the shell PATH
-                # customizations are lost, so a bare-PATH child would fail with
-                # `node: not found` before cmd_gui can self-heal.
-                from hermes_constants import with_hermes_node_path
-
-                _build_env = with_hermes_node_path()
-                build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
-                if build_result.returncode != 0:
-                    build_result = _m()._run_logged_subprocess(_desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=_build_env)
-                if build_result.returncode != 0:
-                    print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
-                    tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
-                    if tail:
-                        print(tail)
-                    from hermes_constants import display_hermes_home as _dhh
-                    print(f"  Full build log: {_dhh()}/logs/update.log")
-                else:
-                    print("  ✓ Desktop app up to date")
+        _rebuild_desktop_after_update(
+            desktop_dir,
+            had_desktop_app_before_update=had_desktop_app_before_update,
+        )
 
         print()
         print("✓ Code updated!")
@@ -6011,11 +6085,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
-        if sys.platform == "win32":
+        if _m()._is_windows():
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(args)
+            _update_via_zip(
+                args,
+                had_desktop_app_before_update=had_desktop_app_before_update,
+            )
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
