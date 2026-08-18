@@ -273,7 +273,8 @@ async function saveBotMeta(name, patch) {
  *  and Bot Chats created before this policy (or while the old pref was off)
  *  left visible rows behind. On every plugin load, sweep every session id we
  *  own — canonical chats from bot meta plus each group room's member
- *  sessions — through the core session.set_hidden RPC. Idempotent (the DB
+ *  sessions — through the core session.set_hidden RPC, then run the
+ *  ownership-based sweep for the rows we DON'T know by id. Idempotent (the DB
  *  setter is a no-op on already-hidden rows) and feature-detected: older
  *  gateways lack session.set_hidden and simply keep the rows visible. */
 function hideOwnedBotSessions() {
@@ -285,10 +286,82 @@ function hideOwnedBotSessions() {
     .filter(sid => Boolean(sid) && sid !== true)
   const ids = [...new Set([...canonical, ...rooms])]
 
-  return Promise.all(
+  const known = Promise.all(
     ids.map(sid =>
       Promise.resolve(host.request('session.set_hidden', { session_id: sid, hidden: true })).catch(() => undefined)
     )
+  )
+
+  return Promise.all([known, sweepBotProfileSessions().catch(() => undefined)])
+}
+
+// Titles Bot Mode itself mints for its plumbing sessions. Bot-to-bot CLI
+// handoffs (`hermes -p <bot> chat --in ~ -c "Bot Chat" --create-if-missing`)
+// and mention handoffs create sessions with EXACTLY these titles; the
+// "Group: " prefix is the member-session title ensureGroupChatSession has
+// used since group chats shipped. Exact/prefix matching is deliberate — a
+// user's real conversation inside a bot profile keeps whatever title the
+// user gave it and is never touched.
+const BOT_MODE_SWEEP_TITLES = new Set(['Bot Chat', 'Agent Inbox'])
+
+function isBotModeSweepTitle(title) {
+  const t = String(title || '').trim()
+  return BOT_MODE_SWEEP_TITLES.has(t) || t.startsWith('Group: ')
+}
+
+/** Ownership-based sweep: the id-based sweep above only covers sessions the
+ *  plugin recorded ($botMeta canonical chats, $groupChats member sids), but
+ *  Bot Mode sessions are ALSO minted outside the plugin — bot-to-bot CLI
+ *  handoffs ("Agent Inbox" / extra "Bot Chat" rows born visible in a bot's
+ *  profile) — and those ids the plugin never learns. So: enumerate each
+ *  roster bot's OWN profile sessions (only bot profiles — a non-bot profile
+ *  is never listed, so its sessions are never touched) and hide any VISIBLE
+ *  row whose title is Bot Mode plumbing. session.list without include_hidden
+ *  returns only visible rows, which keeps the sweep naturally idempotent.
+ *  Remote-source bots route to their own connection via requestForBot.
+ *  Feature-detected + fire-and-forget: older gateways without per-profile
+ *  session.list / session.set_hidden simply reject and the sweep no-ops. */
+async function sweepBotProfileSessions() {
+  const cached = $lastRoster.get()
+  let roster = Array.isArray(cached) && cached.length ? cached : null
+
+  if (!roster) {
+    // Plugin load can run before the Bots pane hydrates $lastRoster — fall
+    // back to the active gateway's own profile list (local bots; remote
+    // sources get covered by the next sweep once the roster cache exists).
+    try {
+      const res = await host.request('profiles.list', {})
+      roster = Array.isArray(res?.profiles) ? res.profiles : []
+    } catch {
+      return
+    }
+  }
+
+  await Promise.all(
+    roster.map(async bot => {
+      const name = String(bot?.name || '').trim()
+
+      if (!name) {
+        return
+      }
+
+      try {
+        const res = await requestForBot(bot, 'session.list', { profile: name, limit: PROFILE_SESSION_LIST_LIMIT })
+        const rows = Array.isArray(res?.sessions) ? res.sessions : []
+
+        await Promise.all(
+          rows
+            .filter(row => row && row.id && isBotModeSweepTitle(row.title))
+            .map(row =>
+              Promise.resolve(
+                requestForBot(bot, 'session.set_hidden', { session_id: row.id, hidden: true, profile: name })
+              ).catch(() => undefined)
+            )
+        )
+      } catch {
+        /* older gateway / unreachable source — leave this profile alone */
+      }
+    })
   )
 }
 
@@ -8165,30 +8238,70 @@ export default {
       id: 'pane',
       area: 'panes',
       title: 'Bots',
-      // dock: explicit adoption gesture. Without it the tree adopts a
-      // same-placement pane by CENTER-STACKING it into the sessions zone —
-      // and when that zone's header is hidden (lone-pane auto-hide is the
-      // default the user never changed), the sessions pane vanishes behind
-      // the Bots tab with no visible strip to switch back. Splitting below
-      // the sessions pane keeps both surfaces visible instead.
-      data: { placement: 'left', width: '260px', dock: { pane: 'sessions', pos: 'bottom' } },
+      // dock: explicit adoption gesture — CENTER-STACK into the sessions zone
+      // so the sidebar grows a SESSIONS | BOTS tab strip instead of splitting
+      // two cramped panes down the column. Center is safe now: insertAtGroup
+      // pins the zone's header explicitly shown on a center gain (and it
+      // stays shown once the zone has stacked), so the sessions pane can
+      // never vanish behind a stripless Bots tab — the lone-pane auto-hide
+      // trap this dock used to work around with a 'bottom' split.
+      // heal: one-shot re-home for installs that adopted under the old
+      // 'bottom' split — moves the pane into the sessions strip ONCE, never
+      // touching a user-placed layout (see healDockedPanes in the tree store).
+      data: { placement: 'left', width: '260px', dock: { pane: 'sessions', pos: 'center', heal: 'sessions-tab-v1' } },
       render: () => jsx(BotsPane, {})
     })
 
     // Routines — its OWN tiling pane splitting the workspace's right edge
     // (NOT the collapsible right sidebar; placement 'right' is that sidebar's
     // role and hides the pane until "Show Right Sidebar").
-    ctx.register({
-      id: 'routines',
-      area: 'panes',
-      title: 'Cronjobs',
-      data: {
-        placement: 'main',
-        dock: { pane: 'workspace', pos: 'right' },
-        width: '250px'
-      },
-      render: () => jsx(RoutinesPane, {})
-    })
+    //
+    // Registered ONLY while Bot Mode is on screen: the pane exists while the
+    // Bots pane is visible (its zone's active tab, or a lone pane in a
+    // stacked pre-heal layout) and unregisters when the user tabs back to
+    // Sessions — no Cronjobs tile squatting beside the chat outside Bot Mode.
+    // `ctx.register` returns the disposer that makes this cheap; the tree
+    // keeps the pane's spot, so re-registering re-adopts it where it was.
+    // host.paneVisibility is feature-detected: older desktops without the SDK
+    // export keep the always-registered behavior.
+    const registerRoutinesPane = () =>
+      ctx.register({
+        id: 'routines',
+        area: 'panes',
+        title: 'Cronjobs',
+        data: {
+          placement: 'main',
+          dock: { pane: 'workspace', pos: 'right' },
+          width: '250px'
+        },
+        render: () => jsx(RoutinesPane, {})
+      })
+
+    if (typeof host.paneVisibility === 'function') {
+      // The contribution-scoped pane id (`register` prefixes `${ID}:`).
+      const $botsPaneVisible = host.paneVisibility(`${ID}:pane`)
+      let unregisterRoutines = null
+
+      const syncRoutinesPane = visible => {
+        if (visible) {
+          unregisterRoutines ??= registerRoutinesPane()
+        } else if (unregisterRoutines) {
+          unregisterRoutines()
+          unregisterRoutines = null
+        }
+      }
+
+      const stopRoutinesSync = $botsPaneVisible.listen(syncRoutinesPane)
+      syncRoutinesPane($botsPaneVisible.get())
+
+      if (typeof ctx.onDispose === 'function') {
+        // The registration disposer is already tracked by ctx.register; only
+        // the listener needs explicit teardown or it survives plugin disable.
+        ctx.onDispose(stopRoutinesSync)
+      }
+    } else {
+      registerRoutinesPane()
+    }
 
     ctx.register({
       id: 'new-agent',
