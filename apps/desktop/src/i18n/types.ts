@@ -934,7 +934,6 @@ export interface Translations {
     tabToolsets: string
     configuringProfile: string
     tabMcp: string
-    tabHub: string
     all: string
     searchSkills: string
     searchToolsets: string
@@ -1019,6 +1018,11 @@ export interface Translations {
       updateStarted: string
       actionFailed: string
       actionLog: string
+      alreadyInstalled: (name: string) => string
+      pickerTitle: string
+      pickerBrowse: string
+      pickerHide: string
+      pickerHint: string
       loadFailed: string
       previewFailed: string
       scanFailed: string
