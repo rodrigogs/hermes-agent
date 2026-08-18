@@ -503,11 +503,21 @@ export function preserveLocalPendingTurnMessages(
     for (let index = previousMessages.indexOf(newestOptimisticUser); index >= 0; index -= 1) {
       const candidate = previousMessages[index]
 
-      if (candidate.role !== 'user' || !candidate.id.startsWith('user-')) {
-        break
+      if (candidate.role === 'user' && candidate.id.startsWith('user-')) {
+        liveOptimisticUsers.add(candidate)
+
+        continue
       }
 
-      liveOptimisticUsers.add(candidate)
+      // Arrival-ordered mid-turn corrections sit BELOW the sealed live output
+      // (#73793): a live-tail assistant row between the prompt and its
+      // correction is still the same turn's run. Only a committed reply ends
+      // it — that is the post-compression staleness the rule exists to catch.
+      if (candidate.role === 'assistant' && isLiveTailRow(candidate)) {
+        continue
+      }
+
+      break
     }
   }
 
@@ -603,6 +613,58 @@ export function preserveLocalPendingTurnMessages(
       }
     }
 
+    // Ordinal pairing missed (the committed row shifted ordinal when history
+    // was compacted / the authoritative list is shorter), yet the
+    // authoritative transcript already carries this same reply under its
+    // committed id. The #70209 guard above only covers SETTLED local rows
+    // (`pending !== true`); a still-pending stream row that slips past
+    // pairing falls through to `preserved.push` and renders the answer
+    // twice — the reported A B C D E C D tail duplication.
+    //
+    // Three-way same-turn check against SETTLED authoritative rows only
+    // (a live projection shell must not swallow the richer local row, see
+    // the traces-only replacement test):
+    //  1. identical answer text            -> authoritative already has it
+    //  2. authoritative extends local text -> authoritative is the settled
+    //     final version of the still-streaming local copy
+    //  3. local extends authoritative text -> local is further along; replace
+    //     the committed row with the richer body instead of appending
+    if (isPendingAssistant) {
+      const nextText = textWithoutReferenceLines(chatMessageText(message))
+
+      const committedMatch = nextMessages.find(
+        candidate =>
+          candidate.role === 'assistant' &&
+          !isLiveTailRow(candidate) &&
+          (textWithoutReferenceLines(chatMessageText(candidate)) === nextText ||
+            isStrictAnswerTextExtension(textWithoutReferenceLines(chatMessageText(candidate)), nextText))
+      )
+
+      if (committedMatch) {
+        continue
+      }
+
+      const committedPrefix = nextMessages.find(
+        candidate =>
+          candidate.role === 'assistant' &&
+          !isLiveTailRow(candidate) &&
+          isStrictAnswerTextExtension(nextText, textWithoutReferenceLines(chatMessageText(candidate)))
+      )
+
+      if (committedPrefix) {
+        // Keep the COMMITTED id (not the local stream id): the turn is
+        // already in the authoritative transcript, so the merged row must
+        // stay addressable as that durable row — a stream id would read as a
+        // live row again next reconcile and re-enter this same path.
+        replacements.set(committedPrefix.id, {
+          ...withAuthoritativeTurnState(message, committedPrefix),
+          id: committedPrefix.id
+        })
+
+        continue
+      }
+    }
+
     preserved.push(message)
   }
 
@@ -630,10 +692,22 @@ export function appendLiveSessionProjection(
   const inflightStreaming = Boolean(projection.inflight?.streaming)
 
   // Mid-turn redirect corrections. They are additional user bubbles belonging
-  // to this same turn, ordered after the prompt that started it.
-  const inflightCorrections = (projection.inflight?.corrections ?? [])
-    .map(correction => correction?.trim() ?? '')
-    .filter(Boolean)
+  // to this same turn, ordered by arrival: after the output that had already
+  // streamed when they were typed, before the output they redirected.
+  // `correction_offsets` (assistant-text length at each accepted correction)
+  // carries that boundary; older gateways omit it.
+  const rawCorrections = projection.inflight?.corrections ?? []
+  const rawOffsets = projection.inflight?.correction_offsets
+
+  const inflightCorrectionEntries = rawCorrections
+    .map((correction, index) => ({ text: correction?.trim() ?? '', offset: rawOffsets?.[index] }))
+    .filter(entry => entry.text)
+
+  const inflightCorrections = inflightCorrectionEntries.map(entry => entry.text)
+
+  const correctionOffsetsUsable =
+    inflightCorrectionEntries.length > 0 &&
+    inflightCorrectionEntries.every(entry => typeof entry.offset === 'number' && entry.offset >= 0)
 
   // A retained failed turn (the gateway keeps error snapshots replayable when
   // the terminal frame may have been lost to a disconnect) — surface the
@@ -660,13 +734,27 @@ export function appendLiveSessionProjection(
   // Only suppress the projection when the latest authoritative user row is the
   // same turn — older identical prompts must not hide a newly accepted repeat.
   // A mid-turn redirect gives that turn a RUN of user rows (prompt +
-  // corrections), so match the contiguous run ending at the latest user row
-  // rather than the single last one.
+  // corrections). Arrival order seals already-streamed output BETWEEN those
+  // rows (#73793), so collect the run by walking back over the live tail:
+  // user rows count, live-tail assistant rows are skipped, and a committed
+  // assistant reply ends the turn.
   const latestUserIndex = messages.map(message => message.role).lastIndexOf('user')
   const latestUserRun: ChatMessage[] = []
 
-  for (let index = latestUserIndex; index >= 0 && messages[index].role === 'user'; index -= 1) {
-    latestUserRun.unshift(messages[index])
+  for (let index = latestUserIndex; index >= 0; index -= 1) {
+    const candidate = messages[index]
+
+    if (candidate.role === 'user') {
+      latestUserRun.unshift(candidate)
+
+      continue
+    }
+
+    if (candidate.role === 'assistant' && isLiveTailRow(candidate)) {
+      continue
+    }
+
+    break
   }
 
   const persistedInLatestRun = (text: string): boolean =>
@@ -681,22 +769,6 @@ export function appendLiveSessionProjection(
       id: `user-inflight-${sessionId}`,
       role: 'user',
       parts: [textPart(inflightUser)]
-    })
-  }
-
-  // Corrections typed while the turn ran. Each is its own bubble, placed after
-  // the original prompt and before the reply they redirected — the same order
-  // the live transcript showed. Skip any the transcript already holds so a
-  // resume doesn't double them.
-  for (const [index, correction] of inflightCorrections.entries()) {
-    if (persistedInLatestRun(correction)) {
-      continue
-    }
-
-    projected.push({
-      id: `user-inflight-correction-${index}-${sessionId}`,
-      role: 'user',
-      parts: [textPart(correction)]
     })
   }
 
@@ -738,10 +810,65 @@ export function appendLiveSessionProjection(
     isLiveTailRow(liveAssistantOfCurrentTurn)
   )
 
-  if (inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedUser)) {
-    if (turnAlreadyStructured && !inflightError) {
-      // Structure is authoritative; skip the text-only dump row.
-    } else {
+  const wantsAssistantRow = Boolean(
+    inflightAssistant || inflightStreaming || inflightError || (inflightUser && queuedUser)
+  )
+
+  const projectAssistantDump = wantsAssistantRow && !(turnAlreadyStructured && !inflightError)
+
+  const pushCorrection = (correction: string, index: number): void => {
+    if (persistedInLatestRun(correction)) {
+      return
+    }
+
+    projected.push({
+      id: `user-inflight-correction-${index}-${sessionId}`,
+      role: 'user',
+      parts: [textPart(correction)]
+    })
+  }
+
+  // Corrections typed while the turn ran are ordered by ARRIVAL: each lands
+  // after the assistant output that had already streamed when it was typed and
+  // before the output it redirected (#73793 — the old prompt → corrections →
+  // reply order spliced them above screens of output the user had already
+  // read). With usable offsets the flat dump is split at each boundary; without
+  // them (older gateway, or a structured/error tail that must stay whole) the
+  // corrections follow the projected reply, matching the live transcript's
+  // append-at-tail contract.
+  if (projectAssistantDump && correctionOffsetsUsable && !inflightError && inflightAssistant) {
+    let cursor = 0
+
+    for (const [index, entry] of inflightCorrectionEntries.entries()) {
+      const boundary = Math.min(Math.max(entry.offset as number, cursor), inflightAssistant.length)
+      const segment = inflightAssistant.slice(cursor, boundary)
+
+      if (segment.trim()) {
+        // Sealed pre-correction output. The `inflight-assistant-` prefix marks
+        // it a live-tail row so repeated resumes keep the user run intact.
+        projected.push({
+          id: `inflight-assistant-segment-${index}-${sessionId}`,
+          role: 'assistant',
+          parts: [assistantTextPart(segment)],
+          pending: false,
+          interim: true
+        })
+      }
+
+      cursor = boundary
+      pushCorrection(entry.text, index)
+    }
+
+    const tail = inflightAssistant.slice(cursor)
+
+    projected.push({
+      id: liveStreamId,
+      role: 'assistant',
+      parts: tail.trim() ? [assistantTextPart(tail)] : [],
+      pending: inflightStreaming
+    })
+  } else {
+    if (projectAssistantDump) {
       projected.push({
         id: liveStreamId,
         role: 'assistant',
@@ -749,6 +876,10 @@ export function appendLiveSessionProjection(
         pending: inflightStreaming,
         ...(inflightError ? { error: inflightError } : {})
       })
+    }
+
+    for (const [index, correction] of inflightCorrections.entries()) {
+      pushCorrection(correction, index)
     }
   }
 
@@ -1123,4 +1254,24 @@ export function isSessionGoneError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err ?? '')
 
   return message.includes('404') || /session not found/i.test(message)
+}
+
+/**
+ * The busy value a resume/activate response should land with (#70449).
+ *
+ * `running` in a `session.activate` / `session.resume` payload is a snapshot
+ * taken when the RPC was issued. A turn that started — or streamed — after
+ * that snapshot has already marked the runtime busy in the live cache, so a
+ * stale `running: false` must never rewind it: that is exactly how opening an
+ * in-progress chat cleared its working indicator while the agent was still
+ * going. Preserving the newer live busy is safe, because the turn's own
+ * terminal signal (running:false via session.info / the settle path) remains
+ * the only authority that ends it, and the background-sync reaper clears
+ * truly lost turns.
+ *
+ * A snapshot that says `running: true` always wins — adopting a live turn is
+ * never stale.
+ */
+export function resolveResumedBusy(snapshotRunning: boolean | null | undefined, liveBusy: boolean): boolean {
+  return Boolean(snapshotRunning) || liveBusy
 }

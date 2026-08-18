@@ -25,6 +25,7 @@ import {
   isSessionGoneError,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
+  resolveResumedBusy,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
   toBranchMessages
@@ -714,6 +715,25 @@ describe('preserveLocalPendingTurnMessages', () => {
     ])
   })
 
+  // Arrival-ordered mid-turn corrections (#73793) seal the live output BETWEEN
+  // the prompt and the correction. The sealed live-tail row must not end the
+  // optimistic run, or a refresh drops the prompt that started the turn.
+  it('keeps the whole live run when sealed live output sits between prompt and correction', () => {
+    const previous = [
+      msg('user-1000', 'user', 'remove the session counts'),
+      msg('assistant-stream-1', 'assistant', 'two screens of output', { interim: true }),
+      msg('user-2000', 'user', 'hurry up'),
+      msg('assistant-stream-2', 'assistant', 'post-redirect output', { pending: true })
+    ]
+
+    expect(preserveLocalPendingTurnMessages([], previous).map(message => message.id)).toEqual([
+      'user-1000',
+      'assistant-stream-1',
+      'user-2000',
+      'assistant-stream-2'
+    ])
+  })
+
   it('still drops optimistic rows separated from the live run by an assistant reply', () => {
     const previous = [
       msg('user-stale', 'user', 'compressed-away prompt'),
@@ -1086,12 +1106,72 @@ describe('preserveLocalPendingTurnMessages', () => {
     expect(chatMessageText(preserved[1])).toBe('first answer')
     expect(preserved.filter(message => message.role === 'assistant')).toHaveLength(2)
   })
+
+  // A still-PENDING stream row whose committed twin the authoritative history
+  // already carries (ordinal shifted under compaction) used to fall through to
+  // `preserved.push` and render the same answer twice — the reported tail
+  // duplication (A B C D E C D). The #70209 guard only covers settled local
+  // rows (`pending !== true`); these cover the pending ones.
+  it('does not re-append a pending stream row the authoritative history already carries', () => {
+    const previous = [
+      msg('1-user', 'user', '查金价'),
+      msg('2-a', 'assistant', 'X'),
+      streamingMsg('assistant-stream-live', '面板内容')
+    ]
+
+    const next = [msg('1-user', 'user', '查金价'), msg('9-assistant', 'assistant', '面板内容')]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
+  it('drops a pending stream row whose text the committed authoritative reply extends', () => {
+    const previous = [
+      msg('1-user', 'user', '查金价'),
+      msg('2-a', 'assistant', 'X'),
+      streamingMsg('assistant-stream-live', '面板')
+    ]
+
+    const next = [msg('1-user', 'user', '查金价'), msg('9-assistant', 'assistant', '面板内容完整版')]
+
+    expect(preserveLocalPendingTurnMessages(next, previous)).toBe(next)
+  })
+
+  it('replaces the committed row with a further-along pending copy instead of appending', () => {
+    const previous = [
+      msg('1-user', 'user', '查金价'),
+      msg('2-a', 'assistant', 'X'),
+      streamingMsg('assistant-stream-live', '面板内容完整版')
+    ]
+
+    const next = [msg('1-user', 'user', '查金价'), msg('9-assistant', 'assistant', '面板')]
+
+    const preserved = preserveLocalPendingTurnMessages(next, previous)
+
+    expect(preserved.map(message => message.id)).toEqual(['1-user', '9-assistant'])
+    expect(chatMessageText(preserved[1])).toBe('面板内容完整版')
+  })
+
+  // The authoritative history genuinely does not have this reply yet — the
+  // pending row is the only copy and must survive (same contract as the
+  // settled-row variant above).
+  it('still keeps a pending stream row when the authoritative history has no reply', () => {
+    const previous = [msg('1-user', 'user', '查金价'), streamingMsg('assistant-stream-live', '面板内容')]
+
+    const next = [msg('1-user', 'user', '查金价')]
+
+    expect(preserveLocalPendingTurnMessages(next, previous).map(message => message.id)).toEqual([
+      '1-user',
+      'assistant-stream-live'
+    ])
+  })
 })
 
 describe('appendLiveSessionProjection', () => {
   // Corrections typed while a turn ran are their own user bubbles on the same
-  // turn. Resume must rebuild the prompt AND every correction, in order.
-  it('projects mid-turn redirect corrections after the prompt that started the turn', () => {
+  // turn, ordered by ARRIVAL. Without boundary offsets (older gateway) the
+  // whole dump precedes them — never the old prompt → corrections → reply
+  // order that spliced them above output the user had already read (#73793).
+  it('projects mid-turn redirect corrections after the assistant output that predates them', () => {
     const restored = appendLiveSessionProjection([], {
       session_id: 'runtime-1',
       inflight: {
@@ -1104,10 +1184,72 @@ describe('appendLiveSessionProjection', () => {
 
     expect(restored.map(message => message.parts.map(part => ('text' in part ? part.text : '')).join(''))).toEqual([
       'remove the session counts',
+      'Moving.',
       'hurry up',
-      'and the worktree ones',
-      'Moving.'
+      'and the worktree ones'
     ])
+  })
+
+  // With correction_offsets the flat dump is split at each accepted-correction
+  // boundary, so every correction lands after exactly the output it followed
+  // and before the output it redirected — arrival order end to end (#73793).
+  it('interleaves corrections into the assistant dump at their arrival offsets', () => {
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      inflight: {
+        user: 'remove the session counts',
+        corrections: ['hurry up', 'and the worktree ones'],
+        correction_offsets: [7, 13],
+        assistant: 'Moving.Still.Done soon.',
+        streaming: true
+      }
+    })
+
+    expect(restored.map(message => message.parts.map(part => ('text' in part ? part.text : '')).join(''))).toEqual([
+      'remove the session counts',
+      'Moving.',
+      'hurry up',
+      'Still.',
+      'and the worktree ones',
+      'Done soon.'
+    ])
+    expect(restored.map(message => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+      'assistant'
+    ])
+    // Only the live tail streams; sealed pre-correction segments are settled.
+    expect(restored.at(-1)).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
+    expect(restored[1]).toMatchObject({ pending: false, interim: true })
+    expect(restored[3]).toMatchObject({ pending: false, interim: true })
+  })
+
+  it('keeps the live stream row even when every offset points at the dump tail', () => {
+    const restored = appendLiveSessionProjection([], {
+      session_id: 'runtime-1',
+      inflight: {
+        user: 'prompt',
+        corrections: ['nudge'],
+        correction_offsets: [4],
+        assistant: 'text',
+        streaming: true
+      }
+    })
+
+    // The whole dump precedes the correction, and the still-streaming turn
+    // keeps its (empty for now) live row at the tail so future deltas land
+    // BELOW the correction, not above it.
+    expect(restored.map(message => message.parts.map(part => ('text' in part ? part.text : '')).join(''))).toEqual([
+      'prompt',
+      'text',
+      'nudge',
+      ''
+    ])
+    expect(restored.at(-1)).toMatchObject({ id: 'assistant-stream-runtime-1', pending: true })
+    expect(restored.at(-1)?.role).toBe('assistant')
   })
 
   it('does not re-project a correction the transcript already persisted', () => {
@@ -1285,5 +1427,23 @@ describe('appendLiveSessionProjection', () => {
       id: 'assistant-stream-runtime-1',
       pending: true
     })
+  })
+})
+
+describe('resolveResumedBusy', () => {
+  it('keeps a live busy turn when the resume snapshot stalely reports idle (#70449)', () => {
+    expect(resolveResumedBusy(false, true)).toBe(true)
+    expect(resolveResumedBusy(undefined, true)).toBe(true)
+    expect(resolveResumedBusy(null, true)).toBe(true)
+  })
+
+  it('clears busy when both the snapshot and the live cache agree the turn ended', () => {
+    expect(resolveResumedBusy(false, false)).toBe(false)
+    expect(resolveResumedBusy(undefined, false)).toBe(false)
+  })
+
+  it('adopts a running turn reported by the snapshot even without live state', () => {
+    expect(resolveResumedBusy(true, false)).toBe(true)
+    expect(resolveResumedBusy(true, true)).toBe(true)
   })
 })
