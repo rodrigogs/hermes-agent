@@ -38,14 +38,18 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import os
+import re
 import sys
 import threading
 import types
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
+
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -365,6 +369,187 @@ class LoadedPlugin:
 # PluginContext  – handed to each plugin's ``register()`` function
 # ---------------------------------------------------------------------------
 
+_PLUGIN_SETTING_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_PLUGIN_SETTING_RESERVED_ROOTS = frozenset({"model", "plugins", "security", "settings"})
+_PLUGIN_STATE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_PLUGIN_STATE_QUOTA_BYTES = 10 * 1024 * 1024
+_PLUGIN_STATE_LOCKS: Dict[str, threading.RLock] = {}
+_PLUGIN_STATE_LOCKS_GUARD = threading.Lock()
+
+
+def _plugin_relative_segments(key: str) -> tuple[str, ...]:
+    """Validate and split a plugin-relative settings key.
+
+    The public API accepts only relative keys (``endpoint`` or
+    ``retry.policy``).  Full Hermes paths, traversal syntax, and the security-
+    sensitive core roots called out in #64227 are rejected before any config
+    read occurs.
+    """
+    if not isinstance(key, str):
+        raise ValueError("Expected a plugin-relative config key string")
+    segments = tuple(key.split("."))
+    if (
+        not key
+        or "/" in key
+        or "\\" in key
+        or any(
+            not _PLUGIN_SETTING_SEGMENT_RE.fullmatch(segment) for segment in segments
+        )
+        or segments[0].lower() in _PLUGIN_SETTING_RESERVED_ROOTS
+    ):
+        raise ValueError(
+            "Expected a plugin-relative config key such as 'endpoint' or "
+            "'retry.policy'; global, cross-plugin, and traversal paths are forbidden"
+        )
+    return segments
+
+
+def _nested_plugin_value(root: object, segments: tuple[str, ...], default: Any) -> Any:
+    current = root
+    for segment in segments:
+        if not isinstance(current, Mapping) or segment not in current:
+            return default
+        current = current[segment]
+    return current
+
+
+def _nested_plugin_mapping(segments: tuple[str, ...], value: Any) -> dict[str, Any]:
+    nested: Any = value
+    for segment in reversed(segments):
+        nested = {segment: nested}
+    return nested
+
+
+def _plugin_data_namespace(plugin_id: str, skill_namespace: str) -> str:
+    """Return one Windows-safe directory component for plugin-owned data."""
+    candidate = skill_namespace or plugin_id
+    if (
+        skill_namespace
+        and candidate.startswith("agent-plugin-")
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,191}", candidate)
+    ):
+        # Portable Agent Plugins already receive this exact PLUGIN_DATA path.
+        return candidate
+    # Reuse the portable namespace algorithm for native/nested ids too. Its
+    # fixed prefix avoids Windows reserved device names (CON, NUL, COM1...),
+    # while the digest prevents collisions after unsafe characters are folded.
+    return _portable_skill_namespace(candidate)
+
+
+def _state_thread_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve(strict=False))
+    with _PLUGIN_STATE_LOCKS_GUARD:
+        return _PLUGIN_STATE_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def _locked_plugin_state(path: Path):
+    """Serialize state read-modify-write across threads and processes.
+
+    ``fcntl`` is used on POSIX and ``msvcrt`` on native Windows.  The lock is
+    kept in a sibling file because atomic replacement changes the inode/file
+    handle of the target itself.
+    """
+    lock_path = path.with_name(f".{path.name}.lock")
+    thread_lock = _state_thread_lock(lock_path)
+    with thread_lock:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as handle:
+            if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                import msvcrt
+
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class PluginState:
+    """Atomic, quota-bounded JSON key/value state owned by one plugin."""
+
+    def __init__(self, plugin_id: str, skill_namespace: str = "") -> None:
+        self._data_namespace = _plugin_data_namespace(plugin_id, skill_namespace)
+
+    @property
+    def data_dir(self) -> Path:
+        """Profile-scoped directory matching portable plugins' PLUGIN_DATA."""
+        return get_hermes_home() / "plugin-data" / self._data_namespace
+
+    @property
+    def path(self) -> Path:
+        return self.data_dir / "state.json"
+
+    @property
+    def quota_bytes(self) -> int:
+        return _PLUGIN_STATE_QUOTA_BYTES
+
+    @staticmethod
+    def _validate_key(key: str) -> None:
+        if (
+            not isinstance(key, str)
+            or not _PLUGIN_STATE_KEY_RE.fullmatch(key)
+            or ".." in key
+        ):
+            raise ValueError(
+                "Plugin state keys must be 1-128 characters using letters, "
+                "numbers, '_', '-', '.', or ':' (without '..')"
+            )
+
+    def _read_unlocked(self) -> dict[str, Any]:
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"Cannot parse plugin state {self.path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"Cannot parse plugin state {self.path}: root must be an object"
+            )
+        return data
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Read a JSON value, returning *default* when the key is absent."""
+        self._validate_key(key)
+        with _locked_plugin_state(self.path):
+            return self._read_unlocked().get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        """Atomically set one JSON value without dropping concurrent updates."""
+        self._validate_key(key)
+        with _locked_plugin_state(self.path):
+            data = self._read_unlocked()
+            data[key] = value
+            try:
+                encoded = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Plugin state value for {key!r} is not JSON-serializable"
+                ) from exc
+            if len(encoded) > self.quota_bytes:
+                raise ValueError(
+                    f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
+                    f"than the {self.quota_bytes}-byte per-plugin quota"
+                )
+            from utils import atomic_json_write
+
+            atomic_json_write(self.path, data, mode=0o600)
+
+
 class PluginContext:
     """Facade given to plugins so they can register tools and hooks."""
 
@@ -374,6 +559,105 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._state: PluginState | None = None
+
+    @property
+    def plugin_id(self) -> str:
+        """Return the effective registry id used for this plugin's namespaces."""
+        return self.manifest.key or self.manifest.name
+
+    # -- namespaced config and durable state --------------------------------
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """Read ``plugins.entries.<plugin_id>.settings.<key>``.
+
+        ``key`` is always plugin-relative.  For migration compatibility, a
+        missing canonical value falls back to the former ``config`` subtree;
+        no global config paths are exposed.
+        """
+        try:
+            segments = _plugin_relative_segments(key)
+        except ValueError:
+            logger.warning(
+                "Rejected config path %r from plugin %s", key, self.plugin_id
+            )
+            raise
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        plugins = config.get("plugins") if isinstance(config, Mapping) else None
+        entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+        entry = entries.get(self.plugin_id) if isinstance(entries, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return default
+        missing = object()
+        value = _nested_plugin_value(entry.get("settings"), segments, missing)
+        if value is not missing:
+            return value
+        return _nested_plugin_value(entry.get("config"), segments, default)
+
+    def set_config(self, key: str, value: Any) -> None:
+        """Atomically write one value in this plugin's ``settings`` subtree."""
+        try:
+            segments = _plugin_relative_segments(key)
+        except ValueError:
+            logger.warning(
+                "Rejected config path %r from plugin %s", key, self.plugin_id
+            )
+            raise
+        from hermes_cli import config as config_mod
+
+        if config_mod.is_managed():
+            raise PermissionError(
+                "Plugin settings cannot be changed in a managed install"
+            )
+        from hermes_cli import managed_scope
+
+        dotted_path = ".".join((
+            "plugins",
+            "entries",
+            self.plugin_id,
+            "settings",
+            *segments,
+        ))
+        if managed_scope.is_key_managed(dotted_path):
+            raise PermissionError(
+                f"Plugin setting {dotted_path!r} is administrator-managed"
+            )
+        partial = {
+            "plugins": {
+                "entries": {
+                    self.plugin_id: {
+                        "settings": _nested_plugin_mapping(segments, value),
+                    }
+                }
+            }
+        }
+        full_path = ("plugins", "entries", self.plugin_id, "settings", *segments)
+        # The lock covers the merge read plus atomic save, preventing sibling
+        # plugin writes from racing between those two steps.
+        # Serialize bridge-to-bridge writes across processes as well as
+        # threads. Other Hermes config writers still retain their existing
+        # atomic-replace semantics; this lock specifically prevents two
+        # plugin read/merge/write transactions from dropping siblings.
+        with _locked_plugin_state(config_mod.get_config_path()):
+            with config_mod._CONFIG_LOCK:
+                # Fail closed on malformed YAML. save_config's raw-cache reader
+                # intentionally degrades parse failures to {}, which is safe for
+                # reads but destructive for read-modify-write.
+                config_mod.read_user_config_raw()
+                config_mod.save_config(
+                    partial,
+                    preserve_keys={full_path},
+                    merge_existing=True,
+                )
+
+    @property
+    def state(self) -> PluginState:
+        """Return this plugin's profile-scoped durable JSON state facade."""
+        if self._state is None:
+            self._state = PluginState(self.plugin_id, self.manifest.skill_namespace)
+        return self._state
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -433,6 +717,23 @@ class PluginContext:
             return get_active_profile_name()
         except Exception:
             return "default"
+
+    # -- approval transport registration ------------------------------------
+
+    def register_approval_transport(self, name: str, present_fn: Callable) -> None:
+        """Register a human approval presentation transport.
+
+        The transport is inactive until the operator explicitly selects
+        ``security.approval.transport: <name>``. It receives a host-created,
+        redacted ``ApprovalRequest`` and may only return a correlated human
+        decision; command policy and approval persistence remain host-owned.
+        ``present_fn`` may be synchronous or async.
+        """
+        self._manager.register_approval_transport(
+            name,
+            present_fn,
+            plugin_id=self.manifest.key or self.manifest.name,
+        )
 
     # -- tool registration --------------------------------------------------
 
@@ -859,15 +1160,12 @@ class PluginContext:
         ordering, mapped-vs-bulk precedence, conflict warnings, and
         provenance; the source only fetches.
 
-        NOTE ON TIMING: plugin discovery happens later in startup than
-        the first ``load_hermes_dotenv()`` call, so a plugin-registered
-        source is not consulted by the initial env load of the process
-        that discovers it.  It IS consulted by every subsequently
-        spawned Hermes process (gateway children, cron sessions,
-        subagents), and immediately after a
-        ``reset_secret_source_cache()`` re-pull.  Plugin sources are
-        therefore best for supplying credentials to the running fleet;
-        the bundled sources cover first-process bootstrap.
+        NOTE ON TIMING: ``load_hermes_dotenv()`` usually runs at import
+        *before* plugin discovery.  After discovery completes, the plugin
+        manager re-pulls enabled plugin secret sources (``reset_secret_source_cache``
+        + ``load_hermes_dotenv``) so the first process sees them (#64177).
+        Child processes that load env after plugins still work without that
+        re-pull.  Failed re-pulls never block startup.
 
         Contract requirements (rejected with a warning otherwise):
         inherit from ``SecretSource``, ``api_version`` matching
@@ -1174,9 +1472,15 @@ class PluginContext:
                 f"Pick a plugin-namespaced key (e.g. '{self.manifest.name}_{key}')."
             )
 
+        # Owner is the plugin's canonical id (``key or name``) — the same id
+        # ``ctx.llm`` is bound to (PluginLlm._plugin_id) — so the task trust
+        # gate in agent/plugin_llm.py can match ownership. For the common
+        # case where a manifest sets no explicit ``key`` this equals the name.
+        owner_id = self.manifest.key or self.manifest.name
+
         # Reject duplicate registrations across plugins
         existing = self._manager._aux_tasks.get(key)
-        if existing is not None and existing.get("plugin") != self.manifest.name:
+        if existing is not None and existing.get("plugin") != owner_id:
             raise ValueError(
                 f"Plugin '{self.manifest.name}' cannot register auxiliary task "
                 f"{key!r} — already registered by plugin "
@@ -1202,7 +1506,7 @@ class PluginContext:
             "display_name": display_name,
             "description": description,
             "defaults": merged_defaults,
-            "plugin": self.manifest.name,
+            "plugin": owner_id,
         }
         logger.debug(
             "Plugin %s registered auxiliary task: %s (%s)",
@@ -1326,6 +1630,8 @@ class PluginManager:
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
+        # Explicitly-selected, profile-scoped human approval transports.
+        self._approval_transports: Dict[str, Any] = {}
         # Slack Block Kit action handlers registered by plugins. Each entry
         # is (matcher, callback, plugin_name); the Slack adapter wires them
         # into its slack_bolt App at connect() time. ``matcher`` is whatever
@@ -1362,6 +1668,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._portable_mcp_servers.clear()
             self._aux_tasks.clear()
+            self._approval_transports.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
@@ -1373,9 +1680,68 @@ class PluginManager:
         self._discovered = True
         try:
             self._discover_and_load_inner()
+            # Plugin secret sources register during discover; the initial
+            # load_hermes_dotenv() already ran at import time. Re-pull so the
+            # first process sees plugin backends (tracking #64177).
+            self._refresh_secret_sources_after_discovery()
         except BaseException:
             self._discovered = False
             raise
+
+    def _refresh_secret_sources_after_discovery(self) -> None:
+        """If any plugin secret source is enabled, reset cache and re-apply.
+
+        Enablement is delegated to each source's ``is_enabled(cfg)`` — the
+        same contract the orchestrator uses (``registry._ordered_enabled_sources``)
+        — so a source with custom activation logic is honored, not just
+        ``secrets.<name>.enabled``.
+
+        No-op when only bundled sources exist or none are enabled.
+        Fail-open: never raise into discover_and_load.
+        """
+        try:
+            from agent.secret_sources.registry import list_plugin_sources
+            from hermes_cli.env_loader import load_hermes_dotenv, reset_secret_source_cache
+        except Exception:
+            return
+        try:
+            plugin_sources = list_plugin_sources()
+        except Exception:
+            return
+        if not plugin_sources:
+            return
+        # Load the secrets config once; hand each source its own section and
+        # let its is_enabled() decide (honours custom activation extensions).
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            secrets = cfg.get("secrets") or {}
+        except Exception:
+            secrets = {}
+        enabled_names = []
+        for source in plugin_sources:
+            name = getattr(source, "name", "")
+            section = secrets.get(name)
+            section = section if isinstance(section, dict) else {}
+            try:
+                if source.is_enabled(section):
+                    enabled_names.append(name)
+            except Exception:
+                # A source whose is_enabled() raises is skipped, mirroring
+                # the orchestrator's defensive posture.
+                continue
+        if not enabled_names:
+            return
+        try:
+            reset_secret_source_cache()
+            load_hermes_dotenv()
+            logger.debug(
+                "Re-applied secret sources after plugin discovery for: %s",
+                ", ".join(sorted(enabled_names)),
+            )
+        except Exception as exc:
+            logger.debug("secret source re-apply after discovery failed: %s", exc)
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1492,6 +1858,49 @@ class PluginManager:
                 len(self._plugins),
                 sum(1 for p in self._plugins.values() if p.enabled),
             )
+
+    def register_approval_transport(
+        self,
+        name: str,
+        present_fn: Callable,
+        *,
+        plugin_id: str,
+    ) -> None:
+        """Register one plugin-owned approval transport for this profile."""
+        import re
+
+        from hermes_cli.approval_transport import RegisteredApprovalTransport
+
+        clean = str(name).strip().lower()
+        if clean == "builtin":
+            raise ValueError("approval transport name 'builtin' is reserved")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", clean):
+            raise ValueError(
+                "approval transport name must match [a-z0-9][a-z0-9_-]{0,63}"
+            )
+        if not callable(present_fn):
+            raise TypeError("approval transport present_fn must be callable")
+        if clean in self._approval_transports:
+            owner = self._approval_transports[clean].plugin_id
+            raise ValueError(
+                f"approval transport {clean!r} is already registered by {owner!r}"
+            )
+        self._approval_transports[clean] = RegisteredApprovalTransport(
+            name=clean,
+            present=present_fn,
+            plugin_id=plugin_id,
+            profile_home=str(get_hermes_home().resolve()),
+        )
+        logger.info("Plugin %s registered approval transport: %s", plugin_id, clean)
+
+    def get_approval_transport(self, name: str):
+        """Return a transport only inside the profile that registered it."""
+        registered = self._approval_transports.get(str(name).strip().lower())
+        if registered is None:
+            return None
+        if registered.profile_home != str(get_hermes_home().resolve()):
+            return None
+        return registered
 
     def _collect_directory_manifests(self) -> List[PluginManifest]:
         """Collect directory manifests in the same order as full discovery.
@@ -2100,11 +2509,42 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _invoke_hook_callback(callback: Callable, payload: Dict[str, Any]) -> Any:
+        """Invoke a hook while withholding additive fields from old callbacks."""
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            # Some extension/builtin callables do not expose a signature. Keep
+            # the historical behavior for those callables rather than guessing.
+            return callback(**payload)
+
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return callback(**payload)
+
+        accepted_payload = {
+            name: value
+            for name, value in payload.items()
+            if name in parameters
+            and parameters[name].kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        }
+        return callback(**accepted_payload)
+
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
-        Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
+        Hook payloads evolve additively. Callbacks that accept ``**kwargs``
+        receive the complete payload; older callbacks with a narrow signature
+        receive only the keyword arguments they declare. Each callback is
+        wrapped in its own try/except so a misbehaving plugin cannot break the
+        core agent loop.
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -2125,7 +2565,7 @@ class PluginManager:
         results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
+                ret = self._invoke_hook_callback(cb, kwargs)
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
