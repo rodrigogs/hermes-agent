@@ -53,8 +53,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
-from hermes_cli.config import cfg_get
+from hermes_cli.config import cfg_get, load_config_readonly
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
+    CAPABILITY_REGISTRY,
+    plugin_capability_granted,
+)
+from hermes_cli.plugin_capabilities import (
+    parse_declared_capabilities as _parse_declared_capabilities,
+)
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -391,6 +398,13 @@ class PluginManifest:
     key: str = ""
     portable: bool = False
     skill_namespace: str = ""
+    # Declared capability ids from the manifest ``capabilities:`` list
+    # (#64228). Normalized to KNOWN ids only — see
+    # ``hermes_cli.plugin_capabilities.CAPABILITY_REGISTRY``. Declaration is
+    # consent metadata, not a grant: a capability is live only when the user
+    # granted it (``plugins.entries.<id>.granted_capabilities``) or the
+    # deprecated legacy ``allow_*`` key is set.
+    capabilities: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -861,6 +875,24 @@ class PluginContext:
             self.manifest.name, name, " (override)" if override else "",
         )
 
+    # -- capability probing (#64228) -----------------------------------------
+
+    def has_capability(self, capability: str) -> bool:
+        """Return True when *capability* is live for this plugin.
+
+        Plugins should probe with this and degrade gracefully instead of
+        crashing when a gated host surface refuses them. Bundled plugins are
+        trusted for ``tools.override`` (mirrors the registration gate); for
+        everything else the answer comes from the granted-capability set or
+        the deprecated legacy ``allow_*`` config key. Unknown capability ids
+        and unreadable consent state return False (fail closed).
+        """
+        source = getattr(self.manifest, "source", "") or ""
+        if source == "bundled" and capability == "tools.override":
+            return True
+        plugin_id = self.manifest.key or self.manifest.name
+        return plugin_capability_granted(plugin_id, capability)
+
     # -- override trust gate ------------------------------------------------
 
     def _tool_override_allowed(self, tool_name: str) -> bool:
@@ -868,29 +900,31 @@ class PluginContext:
 
         Bundled plugins (shipped with Hermes core) are trusted by default —
         an override there is a deliberate maintainer choice, not a third-party
-        plugin trying to elevate privilege. For every other source, require
-        ``allow_tool_override: true`` under
-        ``plugins.entries.<plugin_id>`` in config.yaml.
+        plugin trying to elevate privilege. For every other source, the
+        canonical check is :func:`plugin_capability_granted` with the
+        ``tools.override`` capability — satisfied by EITHER the consent-flow
+        grant (``plugins.entries.<plugin_id>.granted_capabilities``) OR the
+        deprecated legacy key ``allow_tool_override: true`` (still honored
+        for backward compatibility; #64228 reference migration).
         """
         source = getattr(self.manifest, "source", "") or ""
         if source == "bundled":
             return True
-        try:
-            from hermes_cli.config import load_config
-            cfg = load_config() or {}
-        except Exception:
-            # If we can't load config, fail closed — better to break the
-            # override than silently grant it.
-            return False
         plugin_id = self.manifest.key or self.manifest.name
-        entries = (cfg.get("plugins") or {}).get("entries") or {}
-        entry = entries.get(plugin_id) or {}
-        return bool(entry.get("allow_tool_override", False))
+        # Fail-closed by construction: any failure to read consent state
+        # inside plugin_capability_granted returns False.
+        return plugin_capability_granted(plugin_id, "tools.override")
 
     # -- message injection --------------------------------------------------
 
-    def inject_message(self, content: str, role: str = "user") -> bool:
-        """Inject a message into the active conversation.
+    def inject_message(
+        self,
+        content: str,
+        role: str = "user",
+        *,
+        session_key: str | None = None,
+    ) -> bool:
+        """Inject a message into a CLI or gateway conversation.
 
         If the agent is idle (waiting for user input), this starts a new turn.
         If the agent is running, this interrupts and injects the message.
@@ -898,22 +932,80 @@ class PluginContext:
         This enables plugins (e.g. remote control viewers, messaging bridges)
         to send messages into the conversation from external sources.
 
+        Gateway injection requires an existing ``session_key`` and an explicit
+        ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
+        A ``True`` return means the live gateway accepted the request for
+        asynchronous dispatch, not that platform delivery has completed.
+
         Returns True if the message was queued successfully.
         """
         cli = self._manager._cli_ref
-        if cli is None:
-            logger.warning("inject_message: no CLI reference (not available in gateway mode)")
-            return False
-
         msg = content if role == "user" else f"[{role}] {content}"
 
-        if getattr(cli, "_agent_running", False):
-            # Agent is mid-turn — interrupt with the message
-            cli._interrupt_queue.put(msg)
-        else:
-            # Agent is idle — queue as next input
-            cli._pending_input.put(msg)
-        return True
+        if cli is not None:
+            if getattr(cli, "_agent_running", False):
+                # Agent is mid-turn - interrupt with the message
+                cli._interrupt_queue.put(msg)
+            else:
+                # Agent is idle - queue as next input
+                cli._pending_input.put(msg)
+            return True
+
+        if not session_key:
+            logger.warning(
+                "inject_message: gateway mode requires an existing session_key"
+            )
+            return False
+        if not self._gateway_injection_allowed():
+            plugin_id = self.manifest.key or self.manifest.name
+            logger.warning(
+                "inject_message: gateway injection denied for plugin %s; set "
+                "plugins.entries.%s.allow_gateway_injection: true to allow it",
+                plugin_id,
+                plugin_id,
+            )
+            return False
+
+        if not self._manager.has_gateway_message_injector:
+            logger.warning("inject_message: no live gateway is available")
+            return False
+
+        plugin_id = self.manifest.key or self.manifest.name
+        try:
+            return bool(
+                self._manager.inject_gateway_message(
+                    session_key=session_key,
+                    content=msg,
+                    plugin_id=plugin_id,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "inject_message: gateway scheduling failed for plugin %s",
+                plugin_id,
+                exc_info=True,
+            )
+            return False
+
+    def _gateway_injection_allowed(self) -> bool:
+        """Return whether this plugin may trigger gateway session turns."""
+        try:
+            cfg = load_config_readonly() or {}
+        except Exception:
+            return False
+
+        plugin_id = self.manifest.key or self.manifest.name
+        return (
+            cfg_get(
+                cfg,
+                "plugins",
+                "entries",
+                plugin_id,
+                "allow_gateway_injection",
+                default=False,
+            )
+            is True
+        )
 
     # -- CLI command registration --------------------------------------------
 
@@ -1742,6 +1834,7 @@ class PluginManager:
         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
+        self._gateway_message_injector: tuple[object, Callable] | None = None
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
@@ -1761,6 +1854,32 @@ class PluginManager:
     # -----------------------------------------------------------------------
     # Public
     # -----------------------------------------------------------------------
+
+    @property
+    def has_gateway_message_injector(self) -> bool:
+        """Return whether a live gateway can accept plugin-triggered turns."""
+        return self._gateway_message_injector is not None
+
+    def set_gateway_message_injector(
+        self,
+        owner: object,
+        injector: Callable[..., bool],
+    ) -> None:
+        """Publish a live gateway injector and its lifecycle owner."""
+        self._gateway_message_injector = (owner, injector)
+
+    def clear_gateway_message_injector(self, owner: object) -> None:
+        """Clear the injector only when it still belongs to ``owner``."""
+        registered = self._gateway_message_injector
+        if registered is not None and registered[0] is owner:
+            self._gateway_message_injector = None
+
+    def inject_gateway_message(self, **kwargs: Any) -> bool:
+        """Submit a plugin-triggered turn to the live gateway."""
+        registered = self._gateway_message_injector
+        if registered is None:
+            return False
+        return bool(registered[1](**kwargs))
 
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
@@ -2335,6 +2454,9 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                capabilities=_parse_declared_capabilities(
+                    data.get("capabilities"), name
+                ),
             )
         except Exception as exc:
             logger.warning(
