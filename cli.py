@@ -4381,6 +4381,12 @@ def _normalize_moa_model(model: Optional[str]) -> tuple[Optional[str], Optional[
                 return "moa", preset
     return None, model
 
+def _split_model_config_default(raw_default: Any) -> tuple[str, str]:
+    # Thin wrapper around the shared helper in config.py — kept for
+    # backward compat with existing call sites in this module.
+    from hermes_cli.config import split_model_config_default
+    return split_model_config_default(raw_default)
+
 
 class _VoiceInputMessage:
     """Sentinel wrapper for voice-transcribed messages in ``_pending_input``.
@@ -4566,10 +4572,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # env vars would stomp each other.
         _model_config = CLI_CONFIG.get("model", {})
         _raw_default = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
-        if isinstance(_raw_default, dict):
-            _config_model = str(_raw_default.get("model") or _raw_default.get("default") or _raw_default.get("provider") or "")
-        else:
-            _config_model = str(_raw_default or "")
+        # A dict-valued default (``model.default: {provider: ..., model: ...}``)
+        # carries its own provider; flatten it here so the nested provider is
+        # available when ``requested_provider`` is constructed below instead of
+        # being discarded and replaced by the outer merged ``model.provider``
+        # (typically ``"auto"``, which is authoritative at runtime resolution).
+        _config_model, _nested_provider = _split_model_config_default(_raw_default)
         _DEFAULT_CONFIG_MODEL = ""
         # Track whether the user passed -m / --model so resume knows not to
         # clobber an explicit override with the session's stored model.
@@ -4618,6 +4626,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.requested_provider = (
             _moa_provider_override
             or provider
+            or _nested_provider
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
@@ -6665,8 +6674,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Normalize provider-specific model IDs and routing."""
         current_model = str(self.model or "").strip()
         if isinstance(self.model, dict):
-            _m_dict = self.model
-            current_model = str(_m_dict.get("model") or _m_dict.get("default") or _m_dict.get("provider") or "").strip()
+            _m, _ = _split_model_config_default(self.model)
+            current_model = _m
         changed = False
 
         try:
@@ -8981,10 +8990,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         _model_config = CLI_CONFIG.get("model", {})
         _raw_default2 = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
-        if isinstance(_raw_default2, dict):
-            _config_model = str(_raw_default2.get("model") or _raw_default2.get("default") or _raw_default2.get("provider") or "")
-        else:
-            _config_model = str(_raw_default2 or "")
+        _config_model, _ = _split_model_config_default(_raw_default2)
         if _config_model and _config_model != getattr(self, "model", None):
             _config_provider = (
                 _model_config.get("provider", "")
@@ -14800,9 +14806,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 from hermes_cli.config import load_config
 
+                _img_model, _img_provider = "", ""
+                if isinstance(self.model, dict):
+                    _img_model, _ = _split_model_config_default(self.model)
+                else:
+                    _img_model = str(self.model or "")
+                if isinstance(self.provider, dict):
+                    _, _img_provider = _split_model_config_default(self.provider)
+                else:
+                    _img_provider = str(self.provider or "")
                 _img_mode = decide_image_input_mode(
-                    str(self.provider or "").strip() if not isinstance(self.provider, dict) else str(self.provider.get("provider") or self.provider.get("default") or "").strip(),
-                    str(self.model or "").strip() if not isinstance(self.model, dict) else str(self.model.get("model") or self.model.get("default") or "").strip(),
+                    _img_provider.strip(),
+                    _img_model.strip(),
                     load_config(),
                     requested_provider=(self.requested_provider or "").strip(),
                 )
