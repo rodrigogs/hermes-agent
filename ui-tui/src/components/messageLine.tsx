@@ -34,8 +34,10 @@ export const MessageLine = memo(function MessageLine({
   detailsMode = 'collapsed',
   detailsModeCommandOverride = false,
   isStreaming = false,
+  liveDetails = false,
   msg,
   prev,
+  reasoningActive = false,
   sections,
   t,
   tools = []
@@ -81,7 +83,9 @@ export const MessageLine = memo(function MessageLine({
         <ToolTrail
           commandOverride={detailsModeCommandOverride}
           detailsMode={detailsMode}
+          preferExpandedThinking={liveDetails}
           reasoning={thinking}
+          reasoningActive={reasoningActive}
           reasoningAlwaysVisible={msg.isMoaReference}
           reasoningTokens={msg.thinkingTokens}
           sections={sections}
@@ -245,7 +249,9 @@ export const MessageLine = memo(function MessageLine({
           <ToolTrail
             commandOverride={detailsModeCommandOverride}
             detailsMode={detailsMode}
+            preferExpandedThinking={liveDetails}
             reasoning={thinking}
+            reasoningActive={reasoningActive}
             reasoningTokens={msg.thinkingTokens}
             sections={sections}
             t={t}
@@ -300,11 +306,13 @@ interface MessageLineProps {
   detailsMode?: DetailsMode
   detailsModeCommandOverride?: boolean
   isStreaming?: boolean
+  liveDetails?: boolean
   msg: Msg
   // The block rendered directly above this one. Drives the group-boundary
   // lead gap (see domain/blockLayout.ts::hasLeadGap). Undefined at the top of
   // the transcript or when spacing is irrelevant.
   prev?: Msg
+  reasoningActive?: boolean
   sections?: SectionVisibility
   t: Theme
   tools?: ActiveTool[]

@@ -361,8 +361,15 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      reasoningCollapsedTitle: string
+      reasoningCollapsedDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      sessionDensityTitle: string
+      sessionDensityDesc: string
+      sessionDensityCompact: string
+      sessionDensityComfortable: string
+      sessionDensityDetailed: string
       terminalFontTitle: string
       terminalFontDesc: string
       terminalFontPlaceholder: string
@@ -1695,6 +1702,8 @@ export interface Translations {
     loading: string
     loadMore: string
     loadCount: (step: number) => string
+    messageCount: (count: number) => string
+    toolCallCount: (count: number) => string
     row: {
       pin: string
       unpin: string

@@ -458,9 +458,16 @@ export const en: Translations = {
       colorModeDesc: 'Pick a fixed mode or let Hermes follow your system setting.',
       toolViewTitle: 'Tool Call Display',
       toolViewDesc: 'Product hides raw tool payloads; Technical shows full input/output.',
+      reasoningCollapsedTitle: 'Collapse thinking by default',
+      reasoningCollapsedDesc: 'Keep streamed reasoning available without expanding it until you open it.',
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,
+      sessionDensityTitle: 'Session List Density',
+      sessionDensityDesc: 'Choose how much context appears beneath session titles in the sidebar.',
+      sessionDensityCompact: 'Compact',
+      sessionDensityComfortable: 'Comfortable',
+      sessionDensityDetailed: 'Detailed',
       terminalFontTitle: 'Terminal Font',
       terminalFontDesc:
         'Choose an installed font for Desktop terminals. Nerd Fonts render Powerlevel10k and shell icons; leave blank to use bundled JetBrains Mono.',
@@ -2012,6 +2019,8 @@ export const en: Translations = {
     loading: 'Loading…',
     loadMore: 'Load more',
     loadCount: step => `Load ${step} more`,
+    messageCount: count => `${count} ${count === 1 ? 'message' : 'messages'}`,
+    toolCallCount: count => `${count} ${count === 1 ? 'tool call' : 'tool calls'}`,
     row: {
       pin: 'Pin',
       unpin: 'Unpin',

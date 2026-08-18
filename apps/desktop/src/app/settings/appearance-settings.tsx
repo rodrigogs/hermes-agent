@@ -16,6 +16,8 @@ import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
+import { $reasoningCollapsedByDefault, setReasoningCollapsedByDefault } from '@/store/reasoning-disclosure'
+import { $sessionListDensity, type SessionListDensity, setSessionListDensity } from '@/store/session-list-density'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
 import { $translucency, setTranslucency } from '@/store/translucency'
 import { $zoomPercent, setZoomPercent } from '@/store/zoom'
@@ -248,6 +250,8 @@ export function AppearanceSettings() {
   const { t, isSavingLocale } = useI18n()
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
   const toolViewMode = useStore($toolViewMode)
+  const reasoningCollapsedByDefault = useStore($reasoningCollapsedByDefault)
+  const sessionListDensity = useStore($sessionListDensity)
   const zoomPercent = useStore($zoomPercent)
   const embedMode = useStore($embedMode)
   const embedAllowed = useStore($embedAllowed)
@@ -290,6 +294,12 @@ export function AppearanceSettings() {
     { id: 'product', label: a.product },
     { id: 'technical', label: a.technical }
   ] as const
+
+  const sessionDensityOptions = [
+    { id: 'compact', label: a.sessionDensityCompact },
+    { id: 'comfortable', label: a.sessionDensityComfortable },
+    { id: 'detailed', label: a.sessionDensityDetailed }
+  ] as const satisfies readonly { id: SessionListDensity; label: string }[]
 
   const embedOptions = [
     { id: 'ask', label: a.embedsAsk },
@@ -435,6 +445,21 @@ export function AppearanceSettings() {
 
           <ListRow
             action={
+              <SegmentedControl
+                onChange={id => {
+                  triggerHaptic('selection')
+                  setSessionListDensity(id)
+                }}
+                options={sessionDensityOptions}
+                value={sessionListDensity}
+              />
+            }
+            description={a.sessionDensityDesc}
+            title={a.sessionDensityTitle}
+          />
+
+          <ListRow
+            action={
               <div className="flex items-center gap-3">
                 <input
                   aria-label={a.translucencyTitle}
@@ -508,6 +533,24 @@ export function AppearanceSettings() {
             }
             description={a.toolViewDesc}
             title={a.toolViewTitle}
+          />
+
+          <ListRow
+            action={
+              <SegmentedControl
+                onChange={id => {
+                  triggerHaptic('selection')
+                  setReasoningCollapsedByDefault(id === 'on')
+                }}
+                options={[
+                  { id: 'off', label: t.common.off },
+                  { id: 'on', label: t.common.on }
+                ]}
+                value={reasoningCollapsedByDefault ? 'on' : 'off'}
+              />
+            }
+            description={a.reasoningCollapsedDesc}
+            title={a.reasoningCollapsedTitle}
           />
 
           <ListRow
