@@ -3556,7 +3556,6 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
->>>>>>> 2a26693e22f43f29319be15d12433c95a4eaf6a8
     parent_agent=None,
 ) -> str:
     """

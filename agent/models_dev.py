@@ -18,10 +18,12 @@ Data resolution order:
 
 Network hardening:
 
-- **ETag conditional GET**: every network request sends ``If-None-Match``
-  with the last-known ETag. A 304 Not Modified response is a no-op — the
-  existing cache is re-confirmed fresh without re-downloading the full
-  registry (≈2 MB). The ETag is persisted alongside the cache file.
+- **ETag conditional GET**: network refreshes send ``If-None-Match``
+  with the last-known ETag whenever a servable registry is held (memory,
+  hydrated from disk on cold force-refresh). A 304 Not Modified response
+  is a no-op — the existing cache is re-confirmed fresh without
+  re-downloading the full registry (≈2 MB). The ETag is persisted
+  atomically alongside the cache file.
 - **No-network-on-hot-paths invariant**: resolution, picker, and resume
   paths NEVER perform network I/O. ``allow_network=False`` is threaded
   through every query function, and hot-path callers (vision routing,
@@ -51,8 +53,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json"
-MODELS_DEV_URL = _DEFAULT_MODELS_DEV_URL
+MODELS_DEV_URL = "https://models.dev/api.json"
 _MODELS_DEV_CACHE_TTL = 4 * 3600  # 4 hours — ETag conditional GET makes refresh cheap
 _MODELS_DEV_RETRY_DELAY = 300  # 5 minutes after a failed refresh
 
@@ -256,13 +257,26 @@ def _load_etag() -> str:
 def _save_etag(etag: str) -> None:
     """Persist an ETag to the sidecar file atomically."""
     try:
+        from utils import atomic_write_text
+
         etag_path = _get_etag_path()
         etag_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = etag_path.with_suffix(".tmp")
-        tmp.write_text(etag, encoding="utf-8")
-        tmp.replace(etag_path)
+        atomic_write_text(etag_path, etag)
     except Exception as e:
         logger.debug("Failed to save models.dev ETag: %s", e)
+
+
+def _clear_etag() -> None:
+    """Delete the ETag sidecar so the next fetch is unconditional.
+
+    Called when the cached registry the ETag vouches for is gone or
+    unusable — sending If-None-Match without a servable cache invites a
+    304 that would leave the process with no data at all.
+    """
+    try:
+        _get_etag_path().unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug("Failed to clear models.dev ETag: %s", e)
 
 
 def _get_models_dev_url() -> str:
@@ -280,7 +294,9 @@ def _get_models_dev_url() -> str:
             return url.strip()
     except Exception:
         pass
-    return _DEFAULT_MODELS_DEV_URL
+    # Fall back to the module global (not the constant) so existing
+    # code/tests that patch MODELS_DEV_URL keep working.
+    return MODELS_DEV_URL
 
 
 def _validate_registry(data: Any) -> bool:
@@ -302,16 +318,38 @@ def _load_disk_cache() -> Dict[str, Any]:
                 data = json.load(f)
             if not _validate_registry(data):
                 logger.warning(
-                    "models.dev disk cache is corrupt or empty; ignoring "
-                    "(will refetch from network)"
+                    "models.dev disk cache is corrupt or empty; "
+                    "quarantining (will refetch from network)"
                 )
+                _quarantine_corrupt_cache(cache_path)
                 return {}
             return data
     except Exception as e:
         logger.warning(
-            "Failed to load models.dev disk cache; ignoring: %s", e
+            "Failed to load models.dev disk cache; quarantining: %s", e
         )
+        try:
+            _quarantine_corrupt_cache(_get_cache_path())
+        except Exception:
+            pass
     return {}
+
+
+def _quarantine_corrupt_cache(cache_path: Path) -> None:
+    """Move a rejected cache aside and drop its ETag sidecar.
+
+    Renaming (rather than leaving the file in place) makes the rejection
+    a one-time event: without it, every hot-path call that finds the
+    in-memory cache empty re-reads and re-parses the corrupt file and
+    re-emits the warning until a network fetch succeeds. The sidecar is
+    cleared because it vouches for a registry we no longer hold — a 304
+    against a missing cache would leave the process with no data at all.
+    """
+    try:
+        cache_path.rename(cache_path.with_suffix(".json.corrupt"))
+    except Exception as e:
+        logger.debug("Could not quarantine corrupt models.dev cache: %s", e)
+    _clear_etag()
 
 
 def _disk_cache_age_seconds() -> Optional[float]:
@@ -359,21 +397,32 @@ class _NotModified(Exception):
     """Server returned 304 Not Modified — existing cache is still valid."""
 
 
-def _fetch_models_dev_from_network() -> Dict[str, Any]:
-    """Fetch the live models.dev registry without touching local caches.
+def _fetch_models_dev_from_network(
+    *, conditional: bool = False
+) -> Tuple[Dict[str, Any], str]:
+    """Fetch the live models.dev registry.
 
-    Uses ETag conditional GET: sends ``If-None-Match`` when a cached ETag
-    exists. A 304 Not Modified response means the cached registry is still
-    current; this raises ``_NotModified`` so the caller can re-confirm the
+    ``conditional`` enables ETag conditional GET (``If-None-Match`` with
+    the sidecar's ETag). Callers must pass True ONLY while holding
+    ``_models_dev_fetch_lock`` AND holding a servable registry the 304
+    can re-confirm — a conditional request without one invites a 304
+    that leaves the process with no data at all (previously a permanent
+    empty-registry loop when the sidecar outlived a corrupt cache file).
+    A 304 raises ``_NotModified`` so the caller can re-confirm the
     existing cache's freshness without re-downloading the full payload.
 
-    Raises on network errors and on an empty/invalid registry payload.
+    Returns ``(registry, etag)``; the etag is empty when the server sent
+    none. The caller persists it together with the cache body
+    (``_commit_registry``) so the sidecar can never get ahead of the data
+    it vouches for. Raises on network errors and on an empty/invalid
+    registry payload.
     """
     url = _get_models_dev_url()
     headers: Dict[str, str] = {}
-    etag = _load_etag()
-    if etag:
-        headers["If-None-Match"] = etag
+    if conditional:
+        etag = _load_etag()
+        if etag:
+            headers["If-None-Match"] = etag
 
     # Tuple (connect, read): a flat timeout=15 let a blackholed connect
     # stall the first-turn critical path for the full 15 s. 5 s connect
@@ -387,16 +436,10 @@ def _fetch_models_dev_from_network() -> Dict[str, Any]:
 
     response.raise_for_status()
     data = response.json()
-    if not isinstance(data, dict) or not data:
+    if not _validate_registry(data):
         raise ValueError("models.dev returned an empty or invalid registry")
 
-    # Persist the new ETag alongside the cache so the next conditional
-    # GET can short-circuit.
-    new_etag = response.headers.get("ETag", "")
-    if new_etag:
-        _save_etag(new_etag)
-
-    return data
+    return data, response.headers.get("ETag", "")
 
 
 def _mark_stale_cache_grace() -> None:
@@ -412,7 +455,7 @@ def _mark_stale_cache_grace() -> None:
         _models_dev_cache_time = grace_time
 
 
-def _commit_registry(data: Dict[str, Any], *, where: str) -> None:
+def _commit_registry(data: Dict[str, Any], *, etag: str = "", where: str) -> None:
     """Persist a freshly fetched registry: disk + in-mem + clear backoff.
 
     Callers must hold ``_models_dev_fetch_lock`` so a failing refresh on one
@@ -421,7 +464,7 @@ def _commit_registry(data: Dict[str, Any], *, where: str) -> None:
     immediately after a successful ``force_refresh``).
     """
     global _models_dev_cache, _models_dev_cache_time, _models_dev_retry_after
-    _save_disk_cache(data)
+    _save_disk_cache(data, etag)
     _models_dev_cache = data
     _models_dev_cache_time = time.time()
     _models_dev_retry_after = 0
@@ -442,6 +485,21 @@ def _confirm_cache_not_modified(*, where: str) -> None:
     unchanged, only its freshness marker is advanced.
     """
     global _models_dev_cache_time, _models_dev_retry_after
+    if not _models_dev_cache:
+        # Pathological: a 304 arrived but we hold no registry. Should be
+        # unreachable now that conditional GETs require a servable cache
+        # (see _fetch_models_dev_from_network); kept as defense in depth
+        # because this state previously caused a permanent empty-registry
+        # loop. Drop the sidecar so the next attempt is unconditional and
+        # arm the normal failure backoff instead of marking {} "fresh".
+        _clear_etag()
+        _models_dev_retry_after = time.time() + _MODELS_DEV_RETRY_DELAY
+        logger.warning(
+            "models.dev returned 304 but no cached registry is held (%s); "
+            "cleared ETag sidecar, will refetch unconditionally",
+            where,
+        )
+        return
     _models_dev_cache_time = time.time()
     _models_dev_retry_after = 0
     logger.debug(
@@ -470,9 +528,16 @@ def _background_refresh_models_dev() -> None:
     """Best-effort refresh after serving stale cache data."""
     global _models_dev_refresh_in_flight
     try:
-        data = _fetch_models_dev_from_network()
+        # Fetch INSIDE the lock: symmetric with the foreground path, so
+        # conditional-GET inputs (memory cache + etag sidecar) can't be
+        # mutated mid-fetch by a concurrent force_refresh, and the two
+        # paths can't double-download concurrently. Hot-path callers are
+        # unaffected — they return stale data without touching this lock.
         with _models_dev_fetch_lock:
-            _commit_registry(data, where="background")
+            data, etag = _fetch_models_dev_from_network(
+                conditional=bool(_models_dev_cache)
+            )
+            _commit_registry(data, etag=etag, where="background")
     except _NotModified:
         with _models_dev_fetch_lock:
             _confirm_cache_not_modified(where="background")
@@ -519,10 +584,11 @@ def fetch_models_dev(
 
     Returns the full registry dict keyed by provider ID, or empty dict on failure.
 
-    Network requests use ETag conditional GET: when a cached ETag exists,
-    an ``If-None-Match`` header is sent. A 304 Not Modified response
-    re-confirms the existing cache's freshness without re-downloading the
-    full (~2 MB) registry.
+    Network requests use ETag conditional GET when a cached ETag exists
+    AND a servable registry is held (on a cold ``force_refresh`` the
+    memory cache is hydrated from disk first). A 304 Not Modified
+    response re-confirms the existing cache's freshness without
+    re-downloading the full (~2 MB) registry.
 
     Cache hierarchy (when ``force_refresh=False``):
       1. Fresh in-memory cache → return immediately.
@@ -626,9 +692,22 @@ def fetch_models_dev(
             if now < _models_dev_retry_after:
                 return _models_dev_cache
 
+        # Cold force_refresh (fresh CLI process): stages 1-3 were skipped,
+        # so the memory cache may be empty even though a servable disk
+        # cache + ETag sidecar exist. Hydrate first so the conditional GET
+        # fires (a 304 then re-confirms the disk data instead of
+        # re-downloading the full ~2 MB registry).
+        if force_refresh and not _models_dev_cache:
+            disk = _load_disk_cache()
+            if disk:
+                _models_dev_cache = disk
+                _models_dev_cache_time = 0  # servable but not fresh
+
         try:
-            data = _fetch_models_dev_from_network()
-            _commit_registry(data, where="foreground")
+            data, etag = _fetch_models_dev_from_network(
+                conditional=bool(_models_dev_cache)
+            )
+            _commit_registry(data, etag=etag, where="foreground")
             return data
         except _NotModified:
             # Server confirmed our cache is still valid. Re-confirm freshness
@@ -679,7 +758,14 @@ def lookup_models_dev_context(
     if not mdev_provider_id:
         return _default_override_context(provider)
 
-    data = fetch_models_dev(allow_network=allow_network)
+    # NOTE: keep the zero-argument call on the allow_network path. Dozens
+    # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
+    # passing the kwarg unconditionally breaks them all (TypeError).
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
         return _default_override_context(provider)
@@ -1022,7 +1108,14 @@ def _get_provider_models(
     if not mdev_provider_id:
         return None
 
-    data = fetch_models_dev(allow_network=allow_network)
+    # NOTE: keep the zero-argument call on the allow_network path. Dozens
+    # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
+    # passing the kwarg unconditionally breaks them all (TypeError).
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
         return None
@@ -1418,7 +1511,14 @@ def get_model_info(
         shaped = _merge_catalog_entry_with_override(base, override)
         return _parse_model_info(model_id, shaped, mdev_id)
 
-    data = fetch_models_dev(allow_network=allow_network)
+    # NOTE: keep the zero-argument call on the allow_network path. Dozens
+    # of test sites monkeypatch fetch_models_dev with zero-arg lambdas;
+    # passing the kwarg unconditionally breaks them all (TypeError).
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
     pdata = data.get(mdev_id)
     if not isinstance(pdata, dict):
         return _from_override_alone()
