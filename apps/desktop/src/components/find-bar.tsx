@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
+import { appViewForPath, isOverlayView } from '@/app/routes'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { findBarKeyAction, formatMatchLabel } from '@/lib/find-in-page'
@@ -12,6 +13,7 @@ import {
   findNext,
   findPrevious,
   initFindInPageListener,
+  initOpenFindBarListener,
   setFindQuery
 } from '@/store/find-in-page'
 
@@ -37,6 +39,7 @@ export function FindBar() {
   const { active, query, matchOrdinal, matchCount } = useStore($findInPage)
   const inputRef = useRef<HTMLInputElement>(null)
   const [localQuery, setLocalQuery] = useState('')
+  const [filesPaneRight, setFilesPaneRight] = useState<number | null>(null)
   const { pathname } = useLocation()
 
   // Navigating away (opening another session, a settings page, …) closes the
@@ -66,11 +69,92 @@ export function FindBar() {
     return undefined
   }, [active])
 
+  // The files pane (right sidebar, `aside[aria-label="Right sidebar"]`) is a
+  // floating right rail. The find bar is `fixed right-4` by default, which
+  // would cover the files pane's header + first rows when it is open. Measure
+  // the pane's live rect and park the bar just left of it instead.
+  //
+  // The pane can open, close, or be drag-resized *while the bar is open* (its
+  // visibility lives in the contrib workspace registry, not a store we can
+  // subscribe to from here), so a window `resize` listener alone is not
+  // enough: a ResizeObserver tracks width drags of the current aside, and a
+  // body-scoped MutationObserver catches the aside mounting/unmounting and
+  // re-attaches the ResizeObserver to the new node. All paths coalesce into
+  // one rAF-batched measure; everything tears down when the bar closes.
+  useEffect(() => {
+    if (!active) {
+      setFilesPaneRight(null)
+
+      return undefined
+    }
+
+    let rafId: null | number = null
+    let observedAside: Element | null = null
+
+    const resizeObserver =
+      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => scheduleMeasure())
+
+    const measure = () => {
+      rafId = null
+      const aside = document.querySelector('aside[aria-label="Right sidebar"]')
+
+      // The aside can be replaced wholesale (pane closed and reopened, panes
+      // flipped) — retarget the ResizeObserver whenever its identity changes.
+      if (aside !== observedAside) {
+        if (observedAside) {
+          resizeObserver?.unobserve(observedAside)
+        }
+
+        if (aside) {
+          resizeObserver?.observe(aside)
+        }
+
+        observedAside = aside
+      }
+
+      const rect = aside?.getBoundingClientRect()
+
+      if (rect && rect.width > 0 && rect.left < window.innerWidth) {
+        setFilesPaneRight(window.innerWidth - rect.left)
+      } else {
+        setFilesPaneRight(null)
+      }
+    }
+
+    const scheduleMeasure = () => {
+      rafId ??= requestAnimationFrame(measure)
+    }
+
+    // Catches the pane opening/closing while the bar is up. Scoped to
+    // childList mutations only (no attributes/characterData), and the bar is
+    // a transient overlay, so the observer lives only for the find session.
+    const mutationObserver = new MutationObserver(scheduleMeasure)
+    mutationObserver.observe(document.body, { childList: true, subtree: true })
+
+    measure()
+    window.addEventListener('resize', scheduleMeasure)
+
+    return () => {
+      window.removeEventListener('resize', scheduleMeasure)
+      mutationObserver.disconnect()
+      resizeObserver?.disconnect()
+
+      if (rafId != null) {
+        cancelAnimationFrame(rafId)
+      }
+    }
+  }, [active, pathname])
+
   // Subscribe to found-in-page results from the main process. Refcounted in
   // the store, so a remount (connection re-home) can't stack listeners; the
   // subscription is deliberately mount-scoped and NOT tied to `active` —
   // results for an in-flight search must still land if the bar just closed.
   useEffect(() => initFindInPageListener(), [])
+
+  // Mirror the find-results listener for the main-process Ctrl/Cmd+F
+  // forward — on Pop!_OS / GNOME the GTK compositor grabs the chord at
+  // the windowing layer (#81727).
+  useEffect(() => initOpenFindBarListener(), [])
 
   // Debounce search — fire findInPage 200ms after the user stops typing.
   useEffect(() => {
@@ -121,7 +205,7 @@ export function FindBar() {
     return () => window.removeEventListener('keydown', onKeyDown, { capture: true })
   }, [active])
 
-  if (!active) {
+  if (!active || isOverlayView(appViewForPath(pathname))) {
     return null
   }
 
@@ -156,6 +240,11 @@ export function FindBar() {
 
   const matchLabel = formatMatchLabel(query, matchOrdinal, matchCount)
 
+  const barStyle =
+    filesPaneRight != null
+      ? { right: `calc(${filesPaneRight}px + 0.75rem)` }
+      : undefined
+
   return (
     <div
       className={cn(
@@ -169,6 +258,7 @@ export function FindBar() {
         'flex items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1.5 shadow-md'
       )}
       role="search"
+      style={barStyle}
     >
       <input
         aria-label={t.keybinds.actions['view.findInPage'] ?? 'Find in page'}

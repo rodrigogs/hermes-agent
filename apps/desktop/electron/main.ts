@@ -117,7 +117,7 @@ import {
   tuiResumeArgs
 } from './external-terminal'
 import { findGitBash as _findGitBash } from './find-git-bash'
-import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
+import { installFindShortcut, installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
 import {
@@ -10015,6 +10015,15 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+  // Claim Ctrl/Cmd+F in the main process — on Pop!_OS / GNOME-based Linux
+  // distros the Ctrl+F keydown does not reach the renderer's `view.findInPage`
+  // binding (#81727). Routing it through `before-input-event` forwards the
+  // intent at the earliest observable point. macOS / Windows keep the
+  // renderer's own rebindable keybind, so the hook is Linux-only: installing
+  // it elsewhere would make Ctrl/Cmd+F un-rebindable and double-open.
+  if (process.platform === 'linux') {
+    installFindShortcut(win)
+  }
 
   if (zoom) {
     installZoomShortcuts(win)
