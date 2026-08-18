@@ -1,10 +1,15 @@
-"""Bot Mode roster probe — stable-tier system prompt section.
+"""Bot Mode roster probe — canonical Bot Chat system prompt section.
 
 When the desktop's Bot Mode manages this install (any profile carries a
-``ui_meta['hermes-bots']`` block in its profile.yaml), every session of every
-profile gets a short "Messaging other agents" section so bots can hand off
-@mentions and reply to bot-to-bot DMs — including headless CLI sessions
-started by another bot via ``hermes -p <name> chat``.
+``ui_meta['hermes-bots']`` block in its profile.yaml), a bot's canonical
+"Bot Chat" session — and ONLY that session — gets a short "Messaging other
+agents" section so the bot can receive teammate DMs, reply with attribution,
+and hand off @mentions.  Regular sessions never carry the section; the
+desktop's composer middleware owns the @mention send path there.
+
+The caller (agent/system_prompt.py) enforces the session-title gate against
+``BOT_CHAT_TITLE``; this module answers "is this install Bot-Mode-managed,
+and what should the section say for this profile".
 
 This replaces the plugin-side SOUL.md backfill: the protocol is injected by
 the core at prompt-build time instead of appended to user-authored SOUL
@@ -29,6 +34,11 @@ import threading
 from pathlib import Path
 
 _PROTOCOL_HEADING = "## Messaging other agents"
+
+# The canonical per-bot conversation title — the only session shape that
+# receives the protocol section. Must match the desktop plugin's
+# createCanonicalChat title and the `-c "Bot Chat"` resume target.
+BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
@@ -146,6 +156,139 @@ def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, forc
             except Exception:
                 _cached[resolved] = ""
         return _cached[resolved]
+
+
+# ── capability epoch ─────────────────────────────────────────────────────────
+#
+# Bot Chat sessions are effectively eternal — the "new sessions come along
+# often" assumption behind build-once system prompts does not hold. When the
+# user changes a bot's capabilities (skills, toolsets, MCP servers, SOUL) or
+# the teammate roster changes, they expect the change to work on the NEXT
+# message. The fingerprint below hashes exactly that capability surface; the
+# built Bot Chat prompt embeds it, and the restore path in
+# agent/conversation_loop.py rebuilds the prompt when the stored epoch no
+# longer matches the disk state. This is the /model exception applied to
+# capabilities: a LOUD, USER-INITIATED, once-per-change cache break — never
+# a per-turn drift (unchanged state hashes identically and the stored bytes
+# are reused verbatim).
+
+_EPOCH_PREFIX = "Capability epoch: "
+_EPOCH_RE_TEXT = r"Capability epoch: ([0-9a-f]{12})"
+
+
+def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
+    """12-hex digest of the capability surface for ``home``'s profile.
+
+    Sources: the profile's disabled skills + enabled toolsets + MCP server
+    config (config.yaml), SOUL.md bytes, installed skill names, and the
+    Bot-Mode roster (managed profile names). Deliberately NOT cached — the
+    whole point is detecting on-disk drift; callers compare it against the
+    epoch embedded in a stored prompt. Never raises.
+    """
+    import hashlib
+    import json
+
+    resolved = Path(str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")))
+    surface: dict = {}
+    try:
+        # Canonical loader (managed overlay + env expansion + normalization),
+        # scoped to the bot's home via the override the loaders already honor.
+        from hermes_cli.config import load_config_readonly
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        token = set_hermes_home_override(str(resolved))
+        try:
+            cfg = load_config_readonly() or {}
+        finally:
+            reset_hermes_home_override(token)
+        skills_cfg = cfg.get("skills") if isinstance(cfg.get("skills"), dict) else {}
+        tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
+        skills_cfg = skills_cfg or {}
+        tools_cfg = tools_cfg or {}
+        surface["disabled_skills"] = sorted(str(s).lower() for s in (skills_cfg.get("disabled") or []))
+        surface["enabled_toolsets"] = sorted(str(t) for t in (tools_cfg.get("enabled_toolsets") or []))
+        mcp = cfg.get("mcp_servers")
+        surface["mcp"] = json.dumps(mcp, sort_keys=True, default=str) if isinstance(mcp, dict) else ""
+    except Exception:
+        pass
+    try:
+        soul = resolved / "SOUL.md"
+        surface["soul"] = hashlib.sha256(soul.read_bytes()).hexdigest() if soul.is_file() else ""
+    except Exception:
+        surface["soul"] = ""
+    try:
+        names = []
+        skills_root = resolved / "skills"
+        if skills_root.is_dir():
+            for skill_md in skills_root.glob("**/SKILL.md"):
+                names.append(str(skill_md.parent.relative_to(skills_root)))
+        surface["skills"] = sorted(names)
+    except Exception:
+        surface["skills"] = []
+    try:
+        root = _hermes_root(resolved)
+        surface["roster"] = sorted(n for n, d in _roster(root) if _is_bot_managed(d))
+    except Exception:
+        surface["roster"] = []
+    try:
+        blob = json.dumps(surface, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:12]
+    except Exception:
+        return "unavailable"
+
+
+def epoch_line(home: str | os.PathLike | None = None) -> str:
+    """The epoch stamp appended to a Bot Chat prompt."""
+    return f"{_EPOCH_PREFIX}{capability_fingerprint(home)}"
+
+
+def stored_prompt_capability_stale(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
+    """True when ``stored_prompt`` is a Bot Chat prompt whose embedded
+    capability epoch no longer matches the current disk state.
+
+    Non-Bot-Chat prompts (no epoch stamp) are never stale by this check.
+    Fails closed to "not stale" — a broken probe must never turn into a
+    rebuild-every-turn cache burner.
+    """
+    import re
+
+    try:
+        m = re.search(_EPOCH_RE_TEXT, stored_prompt or "")
+        if not m:
+            return False
+        current = capability_fingerprint(home)
+        if current == "unavailable":
+            return False
+        return m.group(1) != current
+    except Exception:
+        return False
+
+
+def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.PathLike | None = None) -> bool:
+    """True when a Bot Chat session's stored prompt PREDATES this feature.
+
+    Legacy Bot Chats (created before bundling / this epoch mechanism)
+    persisted prompts with no protocol section and no epoch stamp; without
+    an explicit upgrade they would be stranded forever — the staleness check
+    above only fires on stamped prompts. This is a one-time migration per
+    legacy session: the caller must only invoke it for sessions titled
+    "Bot Chat", and only rebuilds when the probe would actually emit a
+    section (a profile whose SOUL.md already carries the legacy plugin-side
+    append keeps its protocol-free prompt — rebuilding those would loop,
+    since the probe stays silent and the rebuilt prompt would be unstamped
+    again). Fails closed to "no upgrade".
+    """
+    try:
+        if _EPOCH_PREFIX in (stored_prompt or ""):
+            return False
+        if _PROTOCOL_HEADING in (stored_prompt or ""):
+            return False
+        # Only upgrade when the rebuild would actually add the section —
+        # this is what guarantees the rebuilt prompt carries a stamp and
+        # the upgrade can never re-fire.
+        return bool(get_bot_mode_protocol_section(home))
+    except Exception:
+        return False
 
 
 def _reset_cache_for_tests() -> None:

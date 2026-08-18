@@ -6,7 +6,7 @@ import vm from 'node:vm'
 const source = readFileSync(new URL('../plugin.js', import.meta.url), 'utf8')
 
 function loadSoulHelpers({ serverInjects = false } = {}) {
-  const start = source.indexOf('function botHandle(name) {')
+  const start = source.indexOf('function botHandle(name')
   const end = source.indexOf('// ── human-readable row helpers', start)
   assert.notEqual(start, -1, 'botHandle is missing')
   assert.notEqual(end, -1, 'soul-helper section delimiter is missing')
@@ -138,4 +138,8 @@ test('backend bot_mode_protocol capability suppresses every SOUL protocol write'
   )
   await new Promise(resolve => setTimeout(resolve, 0))
   assert.equal(calls.length, 0)
+
+  // composeSoul's generated-identity path also skips the section.
+  const generated = helpers.composeSoul({ name: 'newbot', title: 'T', description: 'D', roster: [], customSoul: '' })
+  assert.doesNotMatch(generated, /## Messaging other agents/)
 })
