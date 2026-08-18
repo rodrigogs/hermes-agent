@@ -20,7 +20,7 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +245,7 @@ try:
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
+        TypeHandler,
         filters,
     )
     from telegram.constants import ParseMode, ChatType
@@ -261,6 +262,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     CallbackQueryHandler = Any
+    TypeHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
     filters = None
@@ -1052,6 +1054,62 @@ class TelegramAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_id,
+        )
+
+    def _source_from_reaction_for_auth(self, update):
+        """Build the SessionSource for a ``message_reaction`` update's actor.
+
+        Mirrors ``_source_from_message_for_auth`` but for reactions, which
+        carry the reactor (``user``, or ``actor_chat`` for an anonymous admin)
+        and ``chat`` but no ``Message``. The gateway runner uses this internal
+        source for its normal profile-scoped authorization decision. Reactions
+        expose no thread id, so ``thread_id`` is None.
+
+        Raises ``ValueError`` when the reaction, actor, chat, or message identity
+        is absent so the post-auth boundary fails closed rather than authorizing
+        an incomplete source. A future event type must wire its own extraction.
+        """
+        from gateway.session import SessionSource
+
+        mr = getattr(update, "message_reaction", None)
+        if mr is None:
+            raise ValueError(
+                "gateway_platform_event source extraction requires a "
+                "message_reaction update"
+            )
+        user = getattr(mr, "user", None) or getattr(mr, "actor_chat", None)
+        chat = getattr(mr, "chat", None)
+        user_id = str(getattr(user, "id", "")).strip() or None
+        user_name = (
+            str(
+                getattr(user, "username", "")
+                or getattr(user, "full_name", "")
+                or getattr(user, "title", "")
+            ).strip()
+            or None
+        )
+
+        chat_id = str(getattr(chat, "id", "")).strip() or None
+        message_id = getattr(mr, "message_id", None)
+        if not user_id or not chat_id or message_id is None or not str(message_id).strip():
+            raise ValueError(
+                "gateway_platform_event reaction requires actor, chat, and message identities"
+            )
+        chat_type = str(getattr(chat, "type", "dm")).strip().lower() or "dm"
+        if chat_type == "private":
+            chat_type = "dm"
+        elif chat_type == "supergroup":
+            # Reactions carry no message_thread_id; a forum supergroup is the
+            # only forum signal available without the underlying message.
+            chat_type = "forum" if getattr(chat, "is_forum", False) is True else "group"
+
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=None,
         )
 
     def _telegram_auth_env_configured(self) -> bool:
@@ -3679,6 +3737,108 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._post_connect_task is asyncio.current_task():
                 self._post_connect_task = None
 
+    async def _on_platform_update(self, update, context) -> None:
+        """Catch-all PTB handler firing ``gateway_platform_event`` per inbound update.
+
+        Normalizes the update into a stable envelope (no raw SDK objects; see
+        #64176), then forwards it with an internal source to the gateway-owned
+        post-auth boundary. Registered in a dedicated high group so it observes
+        alongside, never displaces, the core handlers. Malformed updates and
+        dispatch errors cannot raise into PTB's update loop.
+        """
+        try:
+            event = self._normalize_platform_event(update)
+        except Exception:
+            logger.debug("[%s] gateway_platform_event normalize error", self.name, exc_info=True)
+            return
+        if event is None:
+            return
+        # The catch-all sees every inbound update. Hand the normalized envelope
+        # and its internal source to the gateway-owned boundary, where the full
+        # profile-scoped authorization chain runs before plugin dispatch. No
+        # callback means no trusted auth boundary, so fail closed.
+        handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]] = getattr(
+            self, "_platform_event_handler", None
+        )
+        if handler is None:
+            return
+        try:
+            source = self._source_from_reaction_for_auth(update)
+            await handler(event, source)
+        except Exception:
+            logger.debug("[%s] gateway_platform_event dispatch error", self.name, exc_info=True)
+            return
+
+    def _normalize_platform_event(self, update) -> Optional[Dict[str, Any]]:
+        """Map an inbound PTB update to a normalized ``gateway_platform_event``
+        envelope ``{platform, event_type, payload}``, or ``None`` if unsupported.
+
+        Reaction (the motivating use case: a plugin that re-renders or reacts to
+        a message when the user reacts to it) is normalized to the fields a
+        plugin consumes: ``emojis`` (standard unicode), ``custom_emoji_ids``
+        (custom reaction emojis — PTB exposes ``custom_emoji_id`` with no
+        ``.emoji``), ``chat_id``, ``message_id``, ``thread_id``. Other update
+        types (forward, edit, chat-member) return ``None`` unless and until
+        they gain a concrete contract and current fire-site consumer.
+        """
+        mr = getattr(update, "message_reaction", None)
+        if mr is None:
+            return None
+        chat = getattr(mr, "chat", None)
+        new_reaction = getattr(mr, "new_reaction", None) or []
+        emojis: List[str] = []
+        custom_emoji_ids: List[str] = []
+        for r in new_reaction:
+            emoji = getattr(r, "emoji", None)
+            if emoji is not None:
+                emojis.append(emoji)
+            custom_id = getattr(r, "custom_emoji_id", None)
+            if custom_id is not None:
+                custom_emoji_ids.append(str(custom_id))
+        return {
+            "platform": "telegram",
+            "event_type": "reaction",
+            "payload": {
+                "emojis": emojis,
+                "custom_emoji_ids": custom_emoji_ids,
+                "chat_id": str(getattr(chat, "id", "")) if chat is not None else None,
+                "message_id": str(getattr(mr, "message_id", "")),
+                # Reactions don't carry thread_id; do not guess it or expose an
+                # adapter object as a routing escape hatch.
+                "thread_id": None,
+            },
+        }
+
+    def _register_handlers(self, app) -> None:
+        """Register every PTB handler on ``app``.
+
+        Single source of truth for handler registration. Both initial connect
+        and the transient-initialization rebuild path call this method, keeping
+        the ``gateway_platform_event`` observer (group 99) in lockstep with the
+        core handlers.
+        """
+        app.add_handler(TelegramMessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text_message
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.COMMAND,
+            self._handle_command
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
+            self._handle_location_message
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+            self._handle_media_message
+        ))
+        # Handle inline keyboard button callbacks (update prompts)
+        app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        # gateway_platform_event observer (see _on_platform_update); group 99 so
+        # it observes alongside, never displaces, the core handlers.
+        app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
 
@@ -3891,25 +4051,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app = builder.build()
             self._bot = self._app.bot
             
-            # Register handlers
-            self._app.add_handler(TelegramMessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._handle_text_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.COMMAND,
-                self._handle_command
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                self._handle_location_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                self._handle_media_message
-            ))
-            # Handle inline keyboard button callbacks (update prompts)
-            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            # Register handlers via the single registration site (#64176).
+            self._register_handlers(self._app)
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -4023,24 +4166,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
-                        # Re-register handlers on the new app
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.TEXT & ~filters.COMMAND,
-                            self._handle_text_message
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.COMMAND,
-                            self._handle_command
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                            self._handle_location_message
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                            self._handle_media_message
-                        ))
-                        self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+                        # Keep core and observer handlers in lockstep after a
+                        # transient-init rebuild (#64176).
+                        self._register_handlers(self._app)
                         # Best-effort discard the old app's resources
                         try:
                             await _shutdown_abandoned_app(old_app)
