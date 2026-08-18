@@ -206,7 +206,7 @@ import {
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
-import { resolveBehindCount, shouldCountCommits } from './update-count'
+import { compareApiUrl, parseCompareBehindCount, resolveBehindCount, resolveCommitLogSelection, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
@@ -2574,11 +2574,22 @@ async function checkUpdates() {
       }
     }
 
+    // Passive SSH-official checks only know tip SHAs (ls-remote) — never
+    // fabricate a "1 commit behind". Recover the exact count via the GitHub
+    // compare API when possible; otherwise behind stays null ("update
+    // available, count unknown") and updateAvailable carries the signal.
+    const upToDate = Boolean(currentSha && currentSha === targetSha)
+
+    const sshBehind = upToDate
+      ? 0
+      : await fetchCompareBehindCount({ currentSha, originUrl: OFFICIAL_REPO_HTTPS_URL, targetSha })
+
     return {
       supported: true,
       branch,
       currentBranch,
-      behind: currentSha && currentSha === targetSha ? 0 : 1,
+      behind: sshBehind,
+      updateAvailable: !upToDate,
       currentSha,
       targetSha,
       commits: [],
@@ -2603,43 +2614,55 @@ async function checkUpdates() {
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
-  const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr, mergeBaseStr] = await Promise.all([
+  const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr] = await Promise.all([
     git(['rev-parse', 'HEAD']),
     git(['rev-parse', `origin/${branch}`]),
     git(['status', '--porcelain']),
     git(['rev-parse', '--abbrev-ref', 'HEAD']),
-    git(['rev-parse', '--is-shallow-repository']),
-    // merge-base exits non-zero with empty stdout when HEAD shares no common
-    // ancestor with the freshly fetched tip — exactly the shallow-clone case.
-    git(['merge-base', 'HEAD', `origin/${branch}`])
+    git(['rev-parse', '--is-shallow-repository'])
   ])
 
   const isShallow = shallowStr === 'true'
-  const hasMergeBase = Boolean(mergeBaseStr)
 
-  // Only enumerate the commit count when it is meaningful. On a shallow checkout
-  // with no merge-base, `rev-list --count` walks the entire remote ancestry
-  // (thousands of commits, see #51922) and resolveBehindCount discards the
-  // result anyway in favour of a SHA compare — so skip the expensive query.
-  const countStr = shouldCountCommits({ isShallow, hasMergeBase })
-    ? await git(['rev-list', `HEAD..origin/${branch}`, '--count'])
-    : ''
+  // A shallow graph cannot provide a trustworthy exact count, even when it has
+  // a visible merge-base. Skip the ancestry walk and use the SHA fallback.
+  const countStr = shouldCountCommits({ isShallow }) ? await git(['rev-list', `HEAD..origin/${branch}`, '--count']) : ''
 
-  const behind = resolveBehindCount({
+  // A positive directional ancestry result remains trustworthy in a shallow
+  // graph and prevents a local commit on top of origin from looking outdated.
+  const targetIsAncestorOfHead =
+    isShallow &&
+    currentSha !== targetSha &&
+    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+
+  let behind = resolveBehindCount({
     countStr,
     currentSha,
     targetSha,
     isShallow,
-    hasMergeBase
+    targetIsAncestorOfHead
   })
 
-  const commits = behind > 0 ? await readCommitLog(updateRoot, branch) : []
+  // Recover the exact count a shallow clone can't compute: the GitHub compare
+  // API knows the full graph regardless of local clone depth. Best-effort —
+  // offline, rate-limited, or non-GitHub origins keep the honest null
+  // ("update available", no fabricated number).
+  if (behind === null) {
+    behind = await fetchCompareBehindCount({ currentSha, originUrl, targetSha })
+  }
+
+  // behind === null means "update available, exact count unknown" (shallow
+  // clone): still list what origin offers — resolveCommitLogSelection keeps
+  // the shallow log to the fetched tip so the range walk can't enumerate the
+  // contaminated ancestry — so "See what's new" stays useful and honest.
+  const commits = behind !== 0 ? await readCommitLog(updateRoot, branch, isShallow) : []
 
   return {
     supported: true,
     branch,
     currentBranch,
     behind,
+    updateAvailable: behind === null || behind > 0,
     currentSha,
     targetSha,
     commits,
@@ -2649,12 +2672,67 @@ async function checkUpdates() {
   }
 }
 
-async function readCommitLog(cwd, branch) {
+// Best-effort exact behind-count for graphs the local clone can't measure.
+// Delegates URL building + response parsing to update-count.ts (pure, unit
+// tested); this wrapper only does the bounded network call. Any failure —
+// offline, 4xx/5xx, rate limit, shape surprise — returns null so callers keep
+// the honest "update available, count unknown" state.
+async function fetchCompareBehindCount({ currentSha, originUrl, targetSha }) {
+  const url = compareApiUrl({ currentSha, originUrl, targetSha })
+
+  if (!url) {
+    return null
+  }
+
+  try {
+    const payload = await new Promise((resolve, reject) => {
+      const req = https.get(
+        url,
+        {
+          headers: {
+            Accept: 'application/vnd.github+json',
+            // GitHub requires a UA on api.github.com; requests without one 403.
+            'User-Agent': 'hermes-desktop-update-check'
+          },
+          timeout: 10_000
+        },
+        res => {
+          const chunks = []
+          res.on('error', reject)
+          res.on('data', chunk => chunks.push(chunk))
+          res.on('end', () => {
+            if ((res.statusCode || 500) >= 400) {
+              reject(new Error(`compare API ${res.statusCode}`))
+
+              return
+            }
+
+            try {
+              resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+            } catch (error) {
+              reject(error)
+            }
+          })
+        }
+      )
+
+      req.on('timeout', () => req.destroy(new Error('compare API timeout')))
+      req.on('error', reject)
+    })
+
+    return parseCompareBehindCount(payload)
+  } catch {
+    return null
+  }
+}
+
+async function readCommitLog(cwd, branch, isShallow) {
   const SEP = '\x1f'
   const REC = '\x1e'
+  const { limit, revision } = resolveCommitLogSelection({ branch, isShallow })
 
   const { stdout } = await runGit(
-    ['log', `HEAD..origin/${branch}`, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', '40'],
+    ['log', revision, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', String(limit)],
     { cwd }
   )
 
