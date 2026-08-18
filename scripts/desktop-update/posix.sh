@@ -79,10 +79,45 @@ json_escape() { # minimal JSON string escape: \ " and control whitespace
   printf '%s' "$s"
 }
 
+notify_fallback() { # status message — renderer-free recovery surface.
+  # Fires only when there is no shim window. BEST-EFFORT immediate channel:
+  # each rung requires EXECUTION acceptance, not existence — notify-send's
+  # exit code is its acceptance (fire-and-forget), zenity/kdialog must
+  # survive their first second (a dialog that dies instantly had no display
+  # and must not eat the message). The GUARANTEED channel is the result
+  # file: a manual/error outcome is durably marked and the next Desktop
+  # boot surfaces it in a dialog (handoff-result.ts + main.ts).
+  case "$1" in manual|error) ;; *) return 0 ;; esac
+  if [ "$(uname)" = "Darwin" ]; then
+    /usr/bin/osascript -e "display notification \"$(printf '%s' "$2" | sed 's/"/\\"/g')\" with title \"Hermes update\"" 2>/dev/null && return 0
+  else
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send -u critical "Hermes update" "$2" 2>/dev/null && return 0
+    fi
+    local p
+    if command -v zenity >/dev/null 2>&1; then
+      zenity --warning --title="Hermes update" --text="$2" 2>/dev/null &
+      p=$!; sleep 1
+      kill -0 "$p" 2>/dev/null && return 0
+      wait "$p" 2>/dev/null
+    fi
+    if command -v kdialog >/dev/null 2>&1; then
+      kdialog --title "Hermes update" --sorry "$2" 2>/dev/null &
+      p=$!; sleep 1
+      kill -0 "$p" 2>/dev/null && return 0
+      wait "$p" 2>/dev/null
+    fi
+  fi
+  # No immediate surface landed. The durable channel takes over: the result
+  # is marked manual/failed and the next boot shows it in a real dialog.
+  log "NOTICE: no notification surface accepted; outcome reaches the user via the result dialog on next launch: $2"
+}
+
 publish() { # status message -- atomic replace; the server reads per poll
   printf '{"status":"%s","message":"%s"}' "$(json_escape "$1")" "$(json_escape "$2")" > "$STATUS.tmp" \
     && mv -f "$STATUS.tmp" "$STATUS" 2>/dev/null || true
   [ -n "$UI_SERVER_PID" ] && sleep 1  # one poll beat to render the state
+  [ -z "$UI_SERVER_PID" ] && notify_fallback "$1" "$2"
 }
 
 find_browser() {
@@ -220,54 +255,92 @@ deliver_outcome() { # the truth-determining half: swap bundles / gate the relaun
   fi
 }
 
-launch_app() { # runs LAST, after the result is durable (the relaunched
-  # Desktop consumes the result file on boot -- launching first races the
-  # write). Returns nonzero when a launch was due but did not happen.
+launch_app() { # attempted BEFORE the terminal event (launch acceptance is
+  # part of the outcome — gille's review). Returns nonzero when a launch
+  # was due but did not verifiably happen; caller downgrades to manual.
   [ -n "$RELAUNCH_TARGET" ] || return 0
   if [ "$(uname)" = "Darwin" ]; then
-    [ -d "$RELAUNCH_TARGET" ] || return 0
+    # A supplied target that no longer exists is a REJECTED launch (the
+    # swap failed badly or the bundle vanished) — not "no launch due".
+    [ -d "$RELAUNCH_TARGET" ] || { log "WARNING: relaunch target missing: $RELAUNCH_TARGET"; return 1; }
     /usr/bin/xattr -dr com.apple.quarantine "$RELAUNCH_TARGET" 2>/dev/null || true
-    /usr/bin/open "$RELAUNCH_TARGET" || { log "WARNING: relaunch failed"; return 1; }
+    # `open` talks to launchd and FAILS LOUDLY on a broken/unlaunchable
+    # bundle — its exit code IS launch acceptance here.
+    /usr/bin/open "$RELAUNCH_TARGET" || { log "WARNING: open rejected the app"; return 1; }
   elif [ "$GATE" = "relaunch" ]; then
-    # Replay the original launch context: filtered args from the Desktop
-    # (after --), its cwd, and its env (inherited through our own spawn).
-    (cd "${RELAUNCH_CWD:-/}" 2>/dev/null || cd /; setsid "$RELAUNCH_TARGET" ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"} >/dev/null 2>&1 &) \
-      || { log "WARNING: relaunch failed"; return 1; }
+    # setsid only proves the wrapper shell started, so verify acceptance:
+    # spawn, then confirm the child is still alive shortly after — an
+    # immediate exec failure (ENOENT, ELF mismatch, dead sandbox) dies
+    # within the window and downgrades to manual instead of lying.
+    (cd "${RELAUNCH_CWD:-/}" 2>/dev/null || cd /
+     setsid "$RELAUNCH_TARGET" ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"} >/dev/null 2>&1 &
+     echo $! > "$STATUS.launchpid") || { log "WARNING: relaunch spawn failed"; return 1; }
+    local lp
+    lp="$(cat "$STATUS.launchpid" 2>/dev/null)"; rm -f "$STATUS.launchpid" 2>/dev/null
+    [ -n "$lp" ] || { log "WARNING: relaunch pid unknown"; return 1; }
+    sleep 1.5
+    kill -0 "$lp" 2>/dev/null || { log "WARNING: relaunched app exited immediately"; return 1; }
   fi
 }
 
+MANUAL=0  # 1 = update landed but the user must act (result protocol field)
+
 write_result() {
-  printf '{"ok":%s,"exit_code":%s,"message":"%s","branch":"%s","finished_at":%s}' \
+  printf '{"ok":%s,"exit_code":%s,"manual":%s,"message":"%s","branch":"%s","finished_at":%s}' \
     "$([ "$FINAL_CODE" -eq 0 ] && echo true || echo false)" "$FINAL_CODE" \
+    "$([ "$MANUAL" -eq 1 ] && echo true || echo false)" \
     "$(json_escape "$FINAL_MSG")" "$(json_escape "$BRANCH")" "$(date +%s)" \
     > "$RESULT.tmp" 2>/dev/null && mv -f "$RESULT.tmp" "$RESULT" 2>/dev/null || true
 }
 
 finish() {
-  # Ordering (helix4u's review): 1. deliver the outcome (swap/gate) so the
-  # truth exists; 2. durable result; 3. marker; 4. shim event; 5. relaunch.
+  # Ordering (gille's reviews, both rounds):
+  #   1. deliver the outcome (swap/gate) so the truth exists;
+  #   2. durable result + marker removal (the relaunched app consumes the
+  #      result on boot and must not park on our marker — this must be on
+  #      disk BEFORE any launch attempt);
+  #   3. attempt the launch and require ACCEPTANCE;
+  #   4. only then the terminal shim event — done means "the app is coming
+  #      back", manual means "it is not, here's what to do", error is error.
+  # A rejected launch rewrites the result (nothing consumed it — the app
+  # never started) so the next boot tells the truth too.
   deliver_outcome
-  [ "$FINAL_CODE" -eq 0 ] && [ -n "$DONE_NOTE" ] && FINAL_MSG="$DONE_NOTE"
+  [ "$FINAL_CODE" -eq 0 ] && [ -n "$DONE_NOTE" ] && { FINAL_MSG="$DONE_NOTE"; MANUAL=1; }
   write_result
 
   if [ "$NO_MARKER_CLEANUP" -eq 0 ] && [ "$(head -1 "$MARKER" 2>/dev/null | tr -d '[:space:]')" = "$$" ]; then
     rm -f "$MARKER" 2>/dev/null || true
   fi
 
-  if [ "$FINAL_CODE" -eq 0 ]; then
-    # A DONE_NOTE means the app will NOT reopen itself -- leave the window
-    # up showing the note instead of closing on a false "Opening Hermes…".
-    publish "done" "$DONE_NOTE"
-    if [ -n "$DONE_NOTE" ]; then stop_ui leave-window; else stop_ui; fi
-  else
+  if [ "$FINAL_CODE" -ne 0 ]; then
     publish "error" "$FINAL_MSG"; stop_ui leave-window
+    launch_app || true   # error path still tries to bring the app back
+    rm -f "$STATUS" "$STATUS.tmp" "$LOG_DIR/desktop-update-ui-port" 2>/dev/null || true
+    return
   fi
 
-  if ! launch_app && [ "$FINAL_CODE" -eq 0 ] && [ -z "$DONE_NOTE" ]; then
-    # Launch failed after "done" went out: nothing consumed the result yet
-    # (the app never started), so make it tell the truth for the next boot.
+  if [ -n "$DONE_NOTE" ]; then
+    if [ "$(uname)" = "Darwin" ]; then
+      # mac DONE_NOTE = swap failed but the PREVIOUS bundle was kept/rolled
+      # back — bring it back up; the note still tells the user to re-run.
+      # A gated linux outcome (skew/manual) skips the launch BY DESIGN.
+      if ! launch_app; then
+        # Even the kept bundle didn't come back: the durable message must
+        # carry BOTH facts (update ok, previous app not reopened).
+        FINAL_MSG="$DONE_NOTE Hermes also could not reopen itself - open it manually."
+        write_result
+      fi
+    fi
+    publish "manual" "$FINAL_MSG"; stop_ui leave-window
+  elif launch_app; then
+    publish "done" ""; stop_ui
+  else
+    # Launch was due and did not land. Downgrade: truthful result for the
+    # next boot, manual state held on screen now.
     FINAL_MSG="Update complete. Reopen Hermes to finish (it could not restart itself)."
+    MANUAL=1
     write_result
+    publish "manual" "$FINAL_MSG"; stop_ui leave-window
   fi
   rm -f "$STATUS" "$STATUS.tmp" "$LOG_DIR/desktop-update-ui-port" 2>/dev/null || true
 }
@@ -314,6 +387,16 @@ fi
 HERMES_BIN="$INSTALL_ROOT/venv/bin/hermes"
 [ -x "$HERMES_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: $HERMES_BIN is missing. The install needs repair (run the Hermes installer or hermes doctor)."; log "$FINAL_MSG"; exit 3; }
 
+# Run FROM the install root: `hermes update` resolves the tree it mutates
+# from the working directory, and we inherit the Desktop's cwd (which can be
+# an unrelated repo — updating THAT instead of the install is the failure
+# the sandbox repro caught). FAIL CLOSED: set -u without set -e means a
+# failed cd would otherwise continue in the wrong tree — the exact class
+# this correction exists to eliminate.
+cd "$INSTALL_ROOT" || {
+  FINAL_CODE=3 FINAL_MSG="Update aborted: cannot enter the install root ($INSTALL_ROOT). Nothing was changed."
+  log "$FINAL_MSG"; exit 3
+}
 export PYTHONUNBUFFERED=1
 log "running: hermes update --yes --gateway --branch $BRANCH"
 OUT="$("$HERMES_BIN" update --yes --gateway --branch "$BRANCH" 2>&1)"; CODE=$?
