@@ -592,6 +592,30 @@ class TestNousPortalContextResolution:
 
 
     @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_empty_model_never_fuzzy_matches_endpoint_catalog(self, mock_fetch):
+        """An empty model name must not substring-match arbitrary catalog
+        entries — '' is a substring of every key, so pre-fix it "matched"
+        whatever the endpoint listed first (e.g. a 32K embedding model on
+        the Nous portal) and poisoned the resolved context length."""
+        import agent.model_metadata as mm
+        mock_fetch.return_value = {
+            "voyageai/voyage-code-4": {"context_length": 32_000},
+            "x-ai/grok-4.6": {"context_length": 500_000},
+        }
+        assert mm._resolve_endpoint_context_length(
+            "", "https://inference-api.nousresearch.com/v1"
+        ) is None
+        # Non-empty names still fuzzy-match.
+        assert mm._resolve_endpoint_context_length(
+            "grok-4.6", "https://inference-api.nousresearch.com/v1"
+        ) == 500_000
+        # Single-model endpoints still resolve even with an empty name.
+        mock_fetch.return_value = {"only-model": {"context_length": 131_072}}
+        assert mm._resolve_endpoint_context_length(
+            "", "http://localhost:8080/v1"
+        ) == 131_072
+
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_openrouter_fallback_is_not_persisted(
         self, mock_or, mock_portal, tmp_path, monkeypatch
@@ -1160,14 +1184,16 @@ class TestGrok43StaleCacheGuard:
     untouched.
     """
 
-    def test_suggests_grok_4_3(self):
-        from agent.model_metadata import _model_name_suggests_grok_4_3
-        assert _model_name_suggests_grok_4_3("grok-4.3")
-        assert _model_name_suggests_grok_4_3("grok-4.3-latest")
-        assert _model_name_suggests_grok_4_3("xai/grok-4.3")
-        assert not _model_name_suggests_grok_4_3("grok-4")
-        assert not _model_name_suggests_grok_4_3("grok-4-fast")
-        assert not _model_name_suggests_grok_4_3("grok-4.20")
+    def test_stale_grok_4_3_detected_by_generic_guard(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        # 256,000 is the old grok-4 catch-all value — stale for grok-4.3 (1M).
+        assert _stale_pre_catalog_cache_entry("grok-4.3", 256_000)
+        assert _stale_pre_catalog_cache_entry("grok-4.3-latest", 256_000)
+        assert _stale_pre_catalog_cache_entry("xai/grok-4.3", 256_000)
+        # Correct/probed values are never dropped.
+        assert not _stale_pre_catalog_cache_entry("grok-4.3", 1_000_000)
+        # Non-listed slugs are untouched even at low cached values.
+        assert not _stale_pre_catalog_cache_entry("grok-4", 256_000)
 
     def test_stale_grok_4_3_dropped_and_reresolves_to_1m(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1195,6 +1221,85 @@ class TestGrok43StaleCacheGuard:
                 slug, base_url=base, api_key="", provider="xai"
             )
             assert ctx == 256_000, f"{slug} should stay 256000, got {ctx}"
+
+
+class TestGrok46StaleCacheGuard:
+    """Pre-catalog builds resolved grok-4.6 via the generic 'grok-4' catch-all
+    (256,000) and persisted it before the 500K catalog entry existed.
+    The step-1 cache guard must drop that stale value and re-resolve to 500K.
+    Official card: 500,000 context (docs.x.ai/developers/models/grok-4.6).
+    """
+
+    def test_stale_grok_4_6_detected_by_generic_guard(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        # 256,000 is the old grok-4 catch-all value — stale for grok-4.6 (500K).
+        assert _stale_pre_catalog_cache_entry("grok-4.6", 256_000)
+        assert _stale_pre_catalog_cache_entry("xai/grok-4.6", 256_000)
+        assert _stale_pre_catalog_cache_entry("x-ai/grok-4.6", 256_000)
+        # Correct/probed values are never dropped.
+        assert not _stale_pre_catalog_cache_entry("grok-4.6", 500_000)
+        # Sibling slugs with correct catalog values are untouched.
+        assert not _stale_pre_catalog_cache_entry("grok-4", 256_000)
+        assert not _stale_pre_catalog_cache_entry("grok-4.5", 500_000)
+
+    def test_stale_grok_4_6_dropped_and_reresolves_to_500k(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+        importlib.reload(mm)
+        base = "https://api.x.ai/v1"
+        mm.save_context_length("grok-4.6", base, 256_000)
+        ctx = mm.get_model_context_length(
+            "grok-4.6", base_url=base, api_key="", provider="xai"
+        )
+        assert ctx == 500_000
+
+
+class TestGenericPreCatalogStaleGuard:
+    """Generic _stale_pre_catalog_cache_entry guard: models whose catalog
+    entry postdates a shorter catch-all (qwen3.6-plus, grok-4-fast,
+    grok-4.20, ...) get their pre-catalog cached values dropped, while
+    correct or probe-derived values survive. Absorbs the per-model
+    predicates and PR #37684's requested guards.
+    """
+
+    def test_absorbed_pr_37684_models(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        # qwen3.6-plus (1M): old "qwen" catch-all persisted 131,072.
+        assert _stale_pre_catalog_cache_entry("qwen3.6-plus", 131_072)
+        assert _stale_pre_catalog_cache_entry("alibaba/qwen3.6-plus", 131_072)
+        assert not _stale_pre_catalog_cache_entry("qwen3.6-plus", 1_048_576)
+        # A 256K value for qwen3.6-plus is above the "qwen" catch-all —
+        # could be a genuine probe result, so it is NOT dropped.
+        assert not _stale_pre_catalog_cache_entry("qwen3.6-plus", 262_144)
+        # grok-4-fast / grok-4.20 (2M each): pre-catalog builds fell to 256K.
+        assert _stale_pre_catalog_cache_entry("grok-4-fast", 256_000)
+        assert _stale_pre_catalog_cache_entry("grok-4-fast-reasoning", 256_000)
+        assert _stale_pre_catalog_cache_entry("grok-4.20", 256_000)
+        assert not _stale_pre_catalog_cache_entry("grok-4-fast", 2_000_000)
+        assert not _stale_pre_catalog_cache_entry("grok-4.20", 2_000_000)
+        # Sibling qwen slugs with legitimately small windows are untouched.
+        assert not _stale_pre_catalog_cache_entry("qwen3-coder", 131_072)
+
+    def test_unknown_models_never_dropped(self):
+        from agent.model_metadata import _stale_pre_catalog_cache_entry
+        assert not _stale_pre_catalog_cache_entry("totally-unknown-model", 4096)
+        assert not _stale_pre_catalog_cache_entry("minimax", 204_800)
+
+    def test_stale_qwen36_plus_dropped_and_reresolves(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        import agent.model_metadata as mm
+        importlib.reload(mm)
+        base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        mm.save_context_length("qwen3.6-plus", base, 131_072)
+        ctx = mm.get_model_context_length(
+            "qwen3.6-plus", base_url=base, api_key="", provider="alibaba"
+        )
+        # Stale 131,072 must be dropped; re-resolution lands on a 1M-class
+        # value (models.dev reports 1,000,000; hardcoded catalog 1,048,576 —
+        # either proves the pre-catalog leftover was invalidated).
+        assert ctx >= 1_000_000
 
 
 class TestMoAContextLength:
