@@ -604,6 +604,14 @@ def grok_supports_reasoning_effort(model: str) -> bool:
     return any(name.startswith(prefix) for prefix in _GROK_EFFORT_CAPABLE_PREFIXES)
 
 
+def is_grok_46_family(model: str) -> bool:
+    """Return whether *model* is a Grok 4.6 family identifier."""
+    name = (model or "").strip().lower().replace("_", "-")
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name == "grok-4.6" or name.startswith("grok-4.6-")
+
+
 _CONTEXT_LENGTH_KEYS = (
     "context_length",
     "context_window",
@@ -1452,6 +1460,15 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     Cache key is ``model@base_url`` so the same model name served from
     different providers can have different limits.
     """
+    # Never persist non-positive values — a 0 or negative context length
+    # is always a bug and would poison the cache, causing downstream
+    # `get_model_context_length()` to return 0 (since `0 is not None`).
+    if length <= 0:
+        logger.warning(
+            "Refusing to cache non-positive context length %s -> %s tokens",
+            f"{model}@{base_url}", length,
+        )
+        return
     key = _context_cache_key(model, base_url)
     cache = _load_context_cache()
     if cache.get(key) == length:
@@ -2624,6 +2641,19 @@ def get_model_context_length(
         except ValueError:
             base_url = ""
 
+    # An empty/blank model id can't be meaningfully resolved: every probe
+    # below would either miss or — worse — fuzzy-match an arbitrary catalog
+    # entry (the endpoint matcher's `model in key` check is vacuously true
+    # for ""), returning whatever context length that random entry has and
+    # persisting it under a junk "@<base_url>" cache key. Fall back to the
+    # default immediately instead.
+    if not str(model or "").strip():
+        logger.info(
+            "No model id provided for context length resolution — defaulting to %s tokens.",
+            f"{DEFAULT_FALLBACK_CONTEXT:,}",
+        )
+        return DEFAULT_FALLBACK_CONTEXT
+
     # Normalise provider-prefixed model names (e.g. "local:model-name" →
     # "model-name") so cache lookups and server queries use the bare ID that
     # local servers actually know about.  Ollama "model:tag" colons are preserved.
@@ -2651,8 +2681,19 @@ def get_model_context_length(
     if base_url and not _skip_persistent_context_cache(base_url, provider):
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
+            # Reject non-positive cached values — a 0 or negative value
+            # is always a bug (corrupted cache, probe failure, or manual
+            # edit).  Without this guard, `0 is not None` short-circuits
+            # the resolution chain and the compressor gets context_length=0,
+            # breaking every status-bar and /usage display downstream.
+            if cached <= 0:
+                logger.warning(
+                    "Dropping non-positive cache entry %s@%s -> %s; re-resolving",
+                    model, base_url, cached,
+                )
+                _invalidate_cached_context_length(model, base_url)
             # Invalidate stale 32k cache entries for Kimi-family models.
-            if cached <= 32768 and _model_name_suggests_kimi(model):
+            elif cached <= 32768 and _model_name_suggests_kimi(model):
                 logger.info(
                     "Dropping stale Kimi cache entry %s@%s -> %s (OpenRouter underreport); "
                     "re-resolving via hardcoded defaults",

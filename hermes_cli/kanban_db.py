@@ -2689,6 +2689,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "delivery_mode",
                 "delivery_mode TEXT NOT NULL DEFAULT 'notify'",
             )
+            # Backfill: before this column existed, the notifier woke the
+            # originating session unconditionally whenever the task carried a
+            # session_id — every pre-existing gateway subscription had de
+            # facto active wake. Defaulting them to plain 'notify' would
+            # silently disable that behavior on upgrade. TUI/CLI rows keep
+            # 'notify' (matching _maybe_auto_subscribe, which only requests
+            # 'notify+wake' for gateway sessions). Runs ONLY on first-add of
+            # the column, so a user's later explicit downgrade is never
+            # overwritten by a re-migration.
+            conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_mode = 'notify+wake' "
+                "WHERE platform != 'tui'"
+            )
         if "chat_type" not in notify_cols:
             _add_column_if_missing(
                 conn,
@@ -3481,47 +3494,10 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
-                if parents:
-                    # ACK-edge inheritance: a child inherits the parent/root
-                    # task's terminal-notification return path (chat_type and
-                    # delivery_mode included), so the originating channel still
-                    # hears about a child that BLOCKs, not just the final fan-in.
-                    # The child task_id is brand-new, so INSERT OR IGNORE copies
-                    # each sub.
-                    placeholders = ",".join("?" * len(parents))
-                    parent_subs = conn.execute(
-                        "SELECT * FROM kanban_notify_subs "
-                        f"WHERE task_id IN ({placeholders}) "
-                        "ORDER BY created_at ASC",
-                        parents,
-                    ).fetchall()
-                    for psub in parent_subs:
-                        # Inherit chat_type and delivery_mode so a woken child
-                        # notification keys to the parent's channel.
-                        psub_mode = psub["delivery_mode"] or "notify"
-                        psub_chat_type = psub["chat_type"] or "dm"
-                        conn.execute(
-                            """
-                            INSERT OR IGNORE INTO kanban_notify_subs
-                                (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
-                                 chat_type, notifier_profile, delivery_mode,
-                                 delivery_metadata, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                task_id,
-                                psub["platform"],
-                                psub["chat_id"],
-                                psub["thread_id"] or "",
-                                psub["user_id"],
-                                psub["user_id_alt"],
-                                psub_chat_type,
-                                psub["notifier_profile"],
-                                psub_mode,
-                                psub["delivery_metadata"],
-                                now,
-                            ),
-                        )
+                # Notify-sub inheritance (ACK-edge: the originating channel
+                # still hears about a child that BLOCKs, not just the final
+                # fan-in) is handled by the single-owner helper below —
+                # _inherit_notify_subs copies every routing/delivery column.
                 _append_event(
                     conn,
                     task_id,
@@ -3577,6 +3553,13 @@ def _inherit_notify_subs(
     cursor. This makes manual `link_tasks(parent, existing_child)` safe: the
     parent chat receives future child terminal events without replaying the
     child's pre-link history.
+
+    Copies EVERY routing/delivery column (chat_type, user_id_alt,
+    delivery_mode, delivery_metadata included) — this helper is the single
+    owner of subscription inheritance for create_task, link_tasks, and triage
+    decomposition. Omitting columns here silently degrades routing: a
+    DM-originated child completion falls back to chat_type='group' and wakes
+    a fresh group-scoped session instead of the originating DM (issue #73030).
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -3590,9 +3573,12 @@ def _inherit_notify_subs(
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+            (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
+             chat_type, notifier_profile, delivery_mode, delivery_metadata,
+             created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
+               COALESCE(chat_type, 'dm'), notifier_profile,
+               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
@@ -11017,7 +11003,15 @@ def add_notify_sub(
     AFTER they subscribe; the gateway/tool auto-subscribe paths run at
     task creation, where the snapshot is 0 anyway.
     """
-    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else "notify"
+    insert_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else (
+        # api_server is stateless: the adapter has no send() — the wake
+        # self-post IS the delivery on that path (see gateway/wake.py and
+        # test_kanban_notifier_apiserver_wake). A plain-'notify' default
+        # would leave those subscriptions with no delivery mechanism at
+        # all, regressing the pre-delivery_mode behavior where a task
+        # carrying a session_id always woke. Explicit modes still win.
+        "notify+wake" if platform == "api_server" else "notify"
+    )
     insert_chat_type = chat_type or "dm"
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)

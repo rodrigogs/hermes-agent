@@ -869,3 +869,145 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# Migration backfill: pre-delivery_mode gateway subscriptions keep active wake.
+#
+# Before the delivery_mode column existed, the notifier woke the originating
+# session unconditionally whenever the task carried a session_id — so every
+# pre-existing gateway subscription had de facto active wake. The column's
+# 'notify' DEFAULT alone would silently disable that on upgrade. The migration
+# backfills first-add rows: gateway platforms -> 'notify+wake', tui -> 'notify'.
+# ---------------------------------------------------------------------------
+
+
+def test_migration_backfills_legacy_gateway_subs_to_notify_wake(kanban_home):
+    from hermes_cli.kanban_db import _migrate_add_optional_columns
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="legacy sub upgrade")
+        # Simulate a pre-delivery_mode database: drop the column entirely,
+        # then insert legacy-shaped rows (one gateway, one tui).
+        conn.execute("ALTER TABLE kanban_notify_subs DROP COLUMN delivery_mode")
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, created_at) "
+            "VALUES (?, 'telegram', 'legacy-chat', '', 1)",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, thread_id, created_at) "
+            "VALUES (?, 'tui', 'tui-session-1', '', 1)",
+            (task_id,),
+        )
+        # Re-run the idempotent migration: first-add of delivery_mode must
+        # backfill gateway rows to notify+wake and leave tui rows on notify.
+        _migrate_add_optional_columns(conn)
+        rows = {
+            r["platform"]: r["delivery_mode"]
+            for r in conn.execute(
+                "SELECT platform, delivery_mode FROM kanban_notify_subs "
+                "WHERE task_id = ?",
+                (task_id,),
+            )
+        }
+    assert rows["telegram"] == "notify+wake", (
+        "Legacy gateway subscription lost active wake across the upgrade"
+    )
+    assert rows["tui"] == "notify"
+
+
+def test_migration_backfill_runs_only_on_first_add(kanban_home):
+    from hermes_cli.kanban_db import _migrate_add_optional_columns
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="explicit downgrade survives")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-x",
+            delivery_mode="notify",
+        )
+        # Column already exists -> re-running the migration must NOT touch
+        # the user's explicit 'notify' choice.
+        _migrate_add_optional_columns(conn)
+        row = conn.execute(
+            "SELECT delivery_mode FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    assert row["delivery_mode"] == "notify"
+
+
+# ---------------------------------------------------------------------------
+# Issue #73030: _inherit_notify_subs (link_tasks / decompose path) must copy
+# EVERY routing column — chat_type, user_id_alt, delivery_mode, and
+# delivery_metadata. Before the fix it copied only platform/chat/thread/user/
+# profile, so a DM-originated child completion fell back to chat_type='group'
+# and woke a fresh group-scoped session instead of the originating DM, and
+# Telegram DM-topic subs lost their persisted reply-fallback metadata.
+# ---------------------------------------------------------------------------
+
+
+def _add_full_parent_sub(kb, conn, parent):
+    kb.add_notify_sub(
+        conn, task_id=parent, platform="telegram", chat_id="chat1",
+        thread_id="topic1", user_id="user1", user_id_alt="alt-1",
+        chat_type="dm", notifier_profile="default",
+        delivery_mode="notify+wake",
+        delivery_metadata={"reply_fallback": "general", "topic_name": "ops"},
+    )
+
+
+def _assert_full_inherited_sub(subs):
+    assert len(subs) == 1
+    s = subs[0]
+    assert s["platform"] == "telegram"
+    assert s["chat_id"] == "chat1"
+    assert s["thread_id"] == "topic1"
+    assert s["user_id"] == "user1"
+    assert s["user_id_alt"] == "alt-1", "user_id_alt dropped during inheritance"
+    assert s["chat_type"] == "dm", (
+        "chat_type dropped during inheritance — wake would key to a "
+        "group-scoped session instead of the originating DM (issue #73030)"
+    )
+    assert s["delivery_mode"] == "notify+wake"
+    md = s["delivery_metadata"]
+    assert md and md.get("reply_fallback") == "general", (
+        "delivery_metadata dropped during inheritance (issue #73030)"
+    )
+
+
+def test_link_tasks_inherits_all_routing_columns(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root", assignee=None)
+        _add_full_parent_sub(kb, conn, parent)
+        # Pre-existing child, linked after the fact — exercises
+        # _inherit_notify_subs directly (not the create_task parents path).
+        child = kb.create_task(conn, title="existing child", assignee="w1")
+        kb.link_tasks(conn, parent, child)
+        subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+    _assert_full_inherited_sub(subs)
+
+
+def test_create_with_parents_inherits_delivery_metadata(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="root", assignee=None)
+        _add_full_parent_sub(kb, conn, parent)
+        child = kb.create_task(
+            conn, title="graph child", assignee="w1", parents=[parent],
+        )
+        subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+    _assert_full_inherited_sub(subs)

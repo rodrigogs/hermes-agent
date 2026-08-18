@@ -285,6 +285,10 @@ class TestDefaultContextLengths:
                         model, provider="kimi-coding", base_url=base_url
                     ) == 1_048_576
 
+    def test_empty_model_uses_fallback_context(self):
+        assert get_model_context_length("") == DEFAULT_FALLBACK_CONTEXT
+        assert get_model_context_length(None) == DEFAULT_FALLBACK_CONTEXT  # type: ignore[arg-type]
+
 
     def test_xai_oauth_grok_build_uses_xai_models_dev_context(self):
         """xAI OAuth should share the xAI provider metadata path.
@@ -1139,6 +1143,33 @@ class TestParseContextLimitFromError:
 # =========================================================================
 
 class TestContextLengthCache:
+
+
+    def test_non_positive_lengths_never_persisted(self, tmp_path):
+        """save_context_length must refuse 0/negative values — a persisted 0
+        short-circuits step 1 (``0 is not None``) and poisons the whole
+        resolution chain downstream (#25812)."""
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            save_context_length("test/model", "http://x", 0)
+            save_context_length("test/model", "http://x", -1)
+            assert get_cached_context_length("test/model", "http://x") is None
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_non_positive_cached_entry_dropped_and_reresolved(self, mock_fetch, tmp_path):
+        """A pre-existing 0 entry (corrupted cache / manual edit) must be
+        invalidated at step 1 and re-resolved instead of returned."""
+        mock_fetch.return_value = {}
+        cache_file = tmp_path / "cache.yaml"
+        with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
+            # Write the poison entry directly — save_context_length now refuses it.
+            cache_file.write_text(
+                "context_lengths:\n  test/model@http://x: 0\n", encoding="utf-8"
+            )
+            assert get_cached_context_length("test/model", "http://x") == 0
+            result = get_model_context_length("test/model", base_url="http://x")
+            assert result > 0
+            assert get_cached_context_length("test/model", "http://x") != 0
 
 
     def test_null_context_lengths_key_returns_empty(self, tmp_path):
