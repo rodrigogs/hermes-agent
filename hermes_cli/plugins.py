@@ -253,6 +253,22 @@ VALID_HOOKS: Set[str] = {
     # read-only — attempts to change it are logged and dropped. The static
     # ``stt.prompt`` config value is the base; hook results mutate on top.
     "pre_transcription",
+    # Pre-dispatch model-selection hook. Fired by the kanban dispatcher
+    # (hermes_cli.kanban_db.dispatch_once) AFTER the task is claimed and
+    # BEFORE the worker subprocess spawns, so the selected model applies to
+    # THIS dispatch (subscribing to kanban_task_claimed would err by one
+    # dispatch: the claim snapshot predates the hook). Callbacks receive
+    # keyword args:
+    #   task_id, profile_name, board, assignee, run_id
+    # and may return None (unchanged) or a dict mutating any of
+    # ``model`` / ``provider``. Results are applied in registration order,
+    # last-writer-wins per field. The hook never writes to the board DB: it
+    # mutates the in-memory Task used for this dispatch only, so a slow or
+    # broken callback can never corrupt durable state. Hard precedence: the
+    # hook is ONLY consulted while the task's ``model_override`` column is
+    # NULL — a human ``hermes kanban set-model`` always wins and is never
+    # overwritten.
+    "pre_kanban_dispatch",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
     # transitions state, AFTER the change is committed to the board DB (so the
     # hook always sees durable state and a slow plugin can never hold the

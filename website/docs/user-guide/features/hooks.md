@@ -474,6 +474,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_kanban_worker_stale_claim` | Observer | After a TTL-expired claim is reclaimed; live-PID extensions don't fire. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `heartbeat_stale`, `retry_status` | Identifiers and claim metadata only. |
 | `on_kanban_task_updated` | Observer | After a committed task-field write outside the claim/complete/block lifecycle (assign, overrides, dashboard editors). Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `changed_fields` | `changed_fields` carries field names only, never values; the named title/body values in the board DB may contain user/project content. |
 | `on_kanban_dispatch_tick` | Observer | Once per dispatcher tick, strictly after the dispatch lock is released; idle and contended ticks fire too. Return ignored. | `board`, `profile_name`, `dry_run`, `outcome`, `result` | `result` is the tick's `DispatchResult` and carries task ids, assignees, and workspace paths. |
+| `pre_kanban_dispatch` | Transform | Fired by the kanban dispatcher after a task is claimed and before the worker spawns (ready and review lanes); dict results are applied in registration order, last-writer-wins per field (`model`, `provider`). Only consulted while the task's `model_override` is NULL — a human `hermes kanban set-model` always wins. Never writes to the board DB: only the in-memory Task for this dispatch is mutated. | `task_id`, `profile_name`, `board`, `assignee`, `run_id` | Board/task/profile/assignee identifiers and the model/provider the hook returns. |
 
 ---
 
@@ -1569,6 +1570,25 @@ Five additional observers (RFC #58548) extend the kanban family. All are observe
 - **`on_kanban_worker_stale_claim`** — when a TTL-expired claim is reclaimed; live-PID extensions don't fire. Adds `worker_pid`, `heartbeat_stale`, `retry_status`.
 - **`on_kanban_task_updated`** — after a committed task-field write outside the claim/complete/block lifecycle (`assign_task`, model/reasoning overrides, dashboard editors). Adds `changed_fields` — field names only, never values.
 - **`on_kanban_dispatch_tick`** — once per dispatcher tick, strictly after the dispatch lock is released, including idle and lock-contended ticks. Payload: `board`, `profile_name`, `dry_run`, `outcome`, `result`.
+
+### `pre_kanban_dispatch`
+
+The one kanban hook that can *select*, not just observe. Fired by `hermes_cli.kanban_db.dispatch_once` after the task is claimed and before the worker subprocess spawns — in both the ready and review dispatch lanes — so the model a hook picks applies to *this* dispatch. (Subscribing to `kanban_task_claimed` instead errs by one dispatch: the claim snapshot is read before that hook fires, and `set_model_override` only takes effect on the next dispatch.)
+
+Callbacks receive the kanban common kwargs — `task_id`, `profile_name`, `board`, `assignee`, `run_id` — and may return `None` (unchanged) or a dict mutating any of `model` / `provider`. Results are applied in registration order, last-writer-wins per field (the `pre_transcription` contract). Unknown fields and non-string values are dropped with a debug log.
+
+Precedence is hard: the hook is **only consulted while the task's `model_override` is NULL**. A human `hermes kanban set-model` override always wins and is never overwritten. The hook never writes to the board DB — it mutates the in-memory `Task` used for this dispatch only, so a slow or broken callback can never corrupt durable state. It short-circuits on `has_hook`, so with no subscriber dispatch behavior is byte-identical. A hook-selected model flows through the exact same `-m`/`--provider` worker-arg path as a human override.
+
+```python
+def route_model(task_id, board, assignee, **kwargs):
+    # Self-scope on the board/card; return None to leave the profile default.
+    if board == "sales" and assignee == "researcher":
+        return {"model": "gpt-4.1", "provider": "openai"}
+    return None
+
+def register(ctx):
+    ctx.register_hook("pre_kanban_dispatch", route_model)
+```
 
 ---
 

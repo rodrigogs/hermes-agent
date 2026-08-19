@@ -358,6 +358,87 @@ def _fire_dispatch_tick_hook(
         _log.debug("kanban dispatch tick hook failed: %s", exc)
 
 
+# Fields a pre_kanban_dispatch hook may mutate on the in-memory Task.
+# Mirrors set_model_override's (model, provider) pair; no other field is
+# ever applied.
+_PRE_DISPATCH_MUTABLE_FIELDS = ("model", "provider")
+
+
+def _resolve_pre_dispatch_model_override(
+    task: "Task",
+    *,
+    board: Optional[str] = None,
+) -> None:
+    """Apply ``pre_kanban_dispatch`` hook results to ``task`` in memory.
+
+    Fired by the dispatch loop AFTER the task is claimed and BEFORE the
+    worker spawns, so the model a hook selects applies to THIS dispatch.
+    Callbacks receive the kanban common kwargs (``task_id``,
+    ``profile_name``, ``board``, ``assignee``, ``run_id``) and may return
+    ``None`` (unchanged) or a dict mutating any of ``model`` /
+    ``provider``. Results are applied in registration order,
+    last-writer-wins per field — the pre_transcription contract.
+
+    Hard precedence: the hook is ONLY consulted while ``task.model_override``
+    is NULL. A human ``hermes kanban set-model`` override always wins and is
+    never overwritten — without this, the override column would be a lie.
+
+    The hook never writes to the board DB: only the in-memory ``Task`` is
+    mutated, so the chosen model is ephemeral to this dispatch and a broken
+    callback can never corrupt durable state. Fully best-effort: every call
+    site short-circuits on ``has_hook`` (no payload built, no invoke when
+    nothing subscribes), and any plumbing failure leaves the task unchanged
+    — dispatch behavior is byte-identical without subscribers.
+    """
+    # Hard precedence: human-set override wins; the hook is not consulted.
+    if task.model_override:
+        return
+    try:
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+        from hermes_cli.profiles import get_active_profile_name
+
+        # No-hook short-circuit: keep the no-plugin dispatch path
+        # byte-identical (no kwargs built, no invoke_hook call).
+        if not has_hook("pre_kanban_dispatch"):
+            return
+        try:
+            profile_name = get_active_profile_name()
+        except Exception:
+            profile_name = "default"
+        hook_results = invoke_hook(
+            "pre_kanban_dispatch",
+            task_id=task.id,
+            profile_name=profile_name,
+            board=board or get_current_board(),
+            assignee=task.assignee,
+            run_id=task.current_run_id,
+        )
+        overrides: dict[str, Any] = {}
+        for hook_result in hook_results:
+            if not isinstance(hook_result, dict):
+                continue
+            for key, value in hook_result.items():
+                if key not in _PRE_DISPATCH_MUTABLE_FIELDS:
+                    _log.debug(
+                        "pre_kanban_dispatch hook returned unsupported field "
+                        "%r — ignoring.", key,
+                    )
+                    continue
+                if not isinstance(value, str):
+                    _log.debug(
+                        "pre_kanban_dispatch hook returned non-string value "
+                        "%r for field %r — ignoring.", value, key,
+                    )
+                    continue
+                overrides[key] = value
+        if "model" in overrides:
+            task.model_override = overrides["model"] or None
+        if "provider" in overrides:
+            task.provider_override = overrides["provider"] or None
+    except Exception as exc:  # noqa: BLE001 — hook plumbing is fail-open
+        _log.debug("pre_kanban_dispatch hook error: %s", exc)
+
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -10249,6 +10330,9 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Pre-dispatch model-selection hook: consulted only while the task
+        # has no human model_override; mutates `claimed` in memory only.
+        _resolve_pre_dispatch_model_override(claimed, board=board)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -10384,6 +10468,9 @@ def _dispatch_once_locked(
         claimed.skills = list(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
+        # Pre-dispatch model-selection hook: same contract as the ready
+        # lane — consulted only while the task has no human model_override.
+        _resolve_pre_dispatch_model_override(claimed, board=board)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
