@@ -15,7 +15,38 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli.plugins import VALID_HOOKS, get_plugin_manager
+
+
+def _plugins():
+    """Resolve ``hermes_cli.plugins`` at CALL time, never at import time.
+
+    Several kanban test modules reload / replace
+    ``sys.modules["hermes_cli.plugins"]``, so a module object captured by a
+    top-level import can become a stale duplicate: its ``PluginManager`` cache
+    is not the one the production path reaches, because
+    ``lifecycle.has_hook`` / ``invoke_hook`` re-resolve ``from hermes_cli
+    import plugins`` on every call. Registering on the stale copy made these
+    tests pass alone and fail after such a module (observed: has_hook() True
+    through the captured module and False through lifecycle, same hook, same
+    process). Resolving late is what keeps the registration and the dispatch
+    looking at ONE registry.
+    """
+    import hermes_cli.plugins as mod
+
+    return mod
+
+
+def _hook_manager():
+    """Return the live manager with plugin discovery already done.
+
+    Discovery must be forced BEFORE a callback is appended: the first
+    production ``has_hook()`` goes through ``plugins._delivery_manager()``,
+    which lazily runs ``discover_and_load()`` and rebuilds the hook registry,
+    silently dropping anything registered beforehand.
+    """
+    plugins = _plugins()
+    plugins.has_hook("pre_kanban_dispatch")  # force the lazy discovery
+    return plugins.get_plugin_manager()
 
 
 @pytest.fixture
@@ -35,28 +66,29 @@ def captured_hooks(monkeypatch):
     Patches the plugin manager's _hooks dict directly (the same registry
     invoke_hook reads) and restores it afterward.
     """
-    mgr = get_plugin_manager()
     events: list[dict] = []
-    saved = {k: list(v) for k, v in mgr._hooks.items()}
-    mgr._hooks.setdefault("pre_kanban_dispatch", []).append(
-        lambda **kw: events.append(kw)
-    )
+    saved = _register_hook(lambda **kw: events.append(kw))
     try:
         yield events
     finally:
-        mgr._hooks = saved
+        _restore_hooks(saved)
 
 
 def _register_hook(callback):
-    """Append *callback* to pre_kanban_dispatch; return the restore token."""
-    mgr = get_plugin_manager()
-    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    """Append *callback* to pre_kanban_dispatch; return the restore token.
+
+    The token carries the manager it was taken from, so the restore cannot
+    land on a different module copy than the registration did.
+    """
+    mgr = _hook_manager()
+    saved = (mgr, {k: list(v) for k, v in mgr._hooks.items()})
     mgr._hooks.setdefault("pre_kanban_dispatch", []).append(callback)
     return saved
 
 
 def _restore_hooks(saved):
-    get_plugin_manager()._hooks = saved
+    mgr, hooks = saved
+    mgr._hooks = hooks
 
 
 def _dispatch_spawn(conn, tid, spawn_fn, **kwargs):
@@ -70,7 +102,7 @@ def _dispatch_spawn(conn, tid, spawn_fn, **kwargs):
 
 
 def test_hook_in_valid_hooks():
-    assert "pre_kanban_dispatch" in VALID_HOOKS
+    assert "pre_kanban_dispatch" in _plugins().VALID_HOOKS
 
 
 # ---------------------------------------------------------------------------
