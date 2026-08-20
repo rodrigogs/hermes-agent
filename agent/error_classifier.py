@@ -1346,19 +1346,6 @@ def _classify_by_status(
                 should_fallback=True,
                 error_context=ctx,
             )
-        # Account/subscription usage exhaustion is a quota wall, not a
-        # request-rate throttle. Anthropic returns this as 429, so the generic
-        # branch below used to retry it and Desktop rendered a provider error
-        # instead of the billing/quota recovery. Preserve periodic quotas when
-        # the response supplies an explicit reset/retry signal.
-        #
-        # The check covers the narrow #93419 core (Anthropic's
-        # ``usage_limit_reached``) plus the broader ``_USAGE_LIMIT_PATTERNS``
-        # ("quota", "limit exceeded", "key limit exceeded") so other providers'
-        # hard quota walls also route to billing — but ONLY when the message is
-        # not itself an explicit rate-limit phrase. Without that guard,
-        # "Rate limit exceeded" ("limit exceeded" substring) would wrongly
-        # promote to non-retryable billing. (broadening + guard credit #39441)
         has_usage_limit = (
             error_code.lower() == "usage_limit_reached"
             or "usage_limit_reached" in error_msg
@@ -1377,10 +1364,24 @@ def _classify_by_status(
             body,
             response_headers,
         )
+        # A 429 whose body is about MONEY, not rate, must not be demoted by an
+        # incidental transient phrase. Providers reuse 429 for a depleted
+        # balance — z.ai answers with "1113 Insufficient balance ... Please
+        # recharge and try again", where "try again" invites the user to
+        # recharge, not to wait out a reset window. Classified as rate_limit,
+        # that earns the 429 cooldown (one hour, or 60s when it is the pool's
+        # only credential via EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS), so the
+        # pool returns to a provider that cannot serve a request until the
+        # balance is topped up. So: an explicit billing phrase outranks the
+        # transient-signal guard (it only needs the message to not itself be
+        # an explicit rate-limit phrase), while a mere usage-limit wording
+        # still requires both guards — a periodic quota with a real reset
+        # signal stays rate_limit. The 402 path below already reads money
+        # phrases as billing; this keeps the two statuses agreeing.
         if (
             (has_billing or has_usage_limit)
             and not has_explicit_rate_limit
-            and not has_transient_signal
+            and (has_billing or not has_transient_signal)
         ):
             return result_fn(
                 FailoverReason.billing,
