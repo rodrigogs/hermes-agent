@@ -3941,6 +3941,50 @@ def _orphaned_desktop_backend_pids(
     return roots
 
 
+def _ledger_reapable_backend_pids(
+    matches: list[tuple[int, str, str]],
+) -> list[int]:
+    """PIDs positively identified by the spawn ledger as orphaned backends.
+
+    The strongest rung: instead of inferring lineage from PPIDs or cmdline
+    shape, look each venv holder up in the machine spawn ledger
+    (``hermes_cli.process_identity``). A holder qualifies when ALL of:
+
+    - its ``(pid, create_time)`` matches a live ledger entry (PID reuse
+      cannot forge this pair);
+    - the entry's purpose is a reapable backend kind (serve/dashboard/
+      gateway — never interactive processes);
+    - the entry's recorded SPAWNER is provably dead (``spawner_is_dead``).
+
+    Unlike the heuristic rungs, this is safe in ANY update context — no
+    hand-off contract needed — because the ownership claim is explicit: the
+    process itself declared who supervises it, and that supervisor is gone.
+    Holders not in the ledger are simply not returned (they fall through to
+    the later rungs); they never disqualify the identified ones. Never raises.
+    """
+    try:
+        from hermes_cli.process_identity import (
+            REAPABLE_PURPOSES,
+            ledger_entries,
+            spawner_is_dead,
+        )
+
+        entries = ledger_entries()
+    except Exception:
+        return []
+    by_pid = {e.get("pid"): e for e in entries if isinstance(e.get("pid"), int)}
+    roots: list[int] = []
+    for pid, _name, _cmdline in matches:
+        entry = by_pid.get(int(pid))
+        if not entry:
+            continue
+        if entry.get("purpose") not in REAPABLE_PURPOSES:
+            continue
+        if spawner_is_dead(entry) is True:
+            roots.append(int(pid))
+    return roots
+
+
 def _handoff_reapable_backend_pids(
     matches: list[tuple[int, str, str]],
 ) -> list[int] | None:
@@ -3974,9 +4018,10 @@ def _handoff_reapable_backend_pids(
       from THIS install's venv qualify; a non-backend holder (operator REPL,
       stray script) disqualifies the whole set → ``None`` (keep refusing), so
       we never widen the blast radius during a hand-off.
-    - Requires ``handoff`` True (caller passes ``args.gateway`` AND a claimed
-      marker) — outside a hand-off this returns ``None`` and the stricter
-      orphan-only path stands.
+    - Only runs when the CALLER has confirmed the hand-off context
+      (``args.gateway`` AND a claimed update-incomplete marker AND no live
+      ``hermes.exe`` shim) — outside that gate this function is never called
+      and the stricter orphan-only path stands.
     - psutil unavailable → ``None`` (can't re-read argv to classify → refuse).
 
     Returns the backend root PIDs to tree-reap, or ``None`` to leave the
@@ -4875,6 +4920,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
+            # Positive-identity rung (runs FIRST, any update context): holders
+            # the spawn ledger proves are orphaned Hermes backends — the
+            # process self-registered (pid, create_time, purpose, spawner) at
+            # startup and its recorded spawner is provably dead. No PPID
+            # archaeology, no hand-off contract required.
+            _ledger_backends = _m()._ledger_reapable_backend_pids(_venv_holders)
+            if _ledger_backends:
+                print(
+                    f"  ⚠ {len(_ledger_backends)} ledger-identified orphaned "
+                    "Hermes backend process(es) hold the venv; stopping their trees"
+                )
+                _m()._stop_process_trees(_ledger_backends)
+                _time.sleep(1.0)
+                _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
             _orphan_backends = _m()._orphaned_desktop_backend_pids(_venv_holders)
             if _orphan_backends:
                 # Every remaining holder is a Desktop `serve` backend whose
@@ -4910,13 +4970,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _handoff = bool(getattr(args, "gateway", False)) and _m()._update_marker_path().exists()
             except Exception:
                 _handoff = False
-            _no_live_shim = True
+            # Fail closed: if we cannot positively verify the shim state
+            # (scripts dir unresolvable, detection raised), assume a live
+            # shim exists and keep refusing rather than reap.
+            _no_live_shim = False
             try:
                 _scripts_dir = _m()._venv_scripts_dir()
                 if _scripts_dir is not None:
                     _no_live_shim = not _m()._detect_concurrent_hermes_instances(_scripts_dir)
             except Exception:
-                _no_live_shim = True
+                _no_live_shim = False
             if _handoff and _no_live_shim:
                 _handoff_backends = _m()._handoff_reapable_backend_pids(_venv_holders)
                 if _handoff_backends:
