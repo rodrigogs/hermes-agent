@@ -23,7 +23,7 @@ redirect there). Three doors lead to it:
 
 - **Settings → Gateways** — the page itself (**Cmd/Ctrl+,**, then
   **Gateways** in the settings nav). The connections registry is a section
-  of that page, below the connection-mode and per-profile override controls.
+  of that page, below the machine-level connection-mode controls.
 - **The sidebar profile rail** — the plug button at the right end of the rail
   (tooltip: **"Connect another Hermes gateway…"**) deep-links straight to
   the Gateways page. It is always visible, even before you have created
@@ -121,9 +121,11 @@ and Tailscale guidance.
 ### Migrating from the single-connection settings
 
 The first launch of a registry-capable build imports your existing settings
-automatically: the global connection mode and any per-profile overrides from
-the old Gateway settings become named registry entries (deduplicated by
-URL/host).
+automatically: the global connection mode and any legacy per-profile
+overrides from Settings → Gateway become named registry entries (deduplicated
+by URL/host). (Newer builds no longer offer per-profile overrides in the
+Gateways settings page — gateway connections are machine-level, and profiles
+are discovered from the gateways you connect.)
 The legacy settings file is left untouched, so older builds on the same
 machine keep working. If a migrated name collided, it was suffixed
 (`Homelab 2`).
@@ -165,6 +167,14 @@ Switching agents is the same gesture as switching profiles:
   list, with per-profile tags.
 - Hovering an agent pre-warms its backend so the switch doesn't pay a cold
   boot.
+- The **Capabilities** page (Skills / Tools / MCP) grows a matching scope: its
+  **Configuring** selector lists every `(profile, device)` agent from the
+  union roster, and picking one reads and writes **that machine's** skills,
+  toolsets, and MCP servers — no gateway switch. Hub installs, env keys, and
+  MCP setup all land on the selected agent's backend. (One caveat: the MCP
+  tab's *hot-reload into a live session* button only appears for agents on
+  the gateway your window is connected to; edits on other machines apply on
+  their next session.)
 
 ## Updating every instance at once
 

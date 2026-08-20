@@ -14,11 +14,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
     # GPT-5.6 series (Sol/Terra/Luna) — GA 2026-07-09 (previewed 2026-06-26).
-    # NOTE (rodrigogs fork): -pro variants and -codex variants are PERMANENT
-    # plan refusals on the ChatGPT Plus account (HTTP 429 usage_limit_reached,
-    # plan_type: plus). Removed from the effective catalog 2026-08-05 after
-    # full live audit; the 6 plain GPT-5.x ids below remain (cooldown only,
-    # self-heal on window reset).
+    # The "-pro" variants are deliberately absent from this curated fallback.
+    # Two independent investigations reached that conclusion from different
+    # failure modes, so both are recorded: upstream measured the ChatGPT Codex
+    # OAuth backend rejecting them with HTTP 400 while the public API still
+    # advertises them, and this fork measured a PERMANENT plan refusal on a
+    # ChatGPT Plus account (HTTP 429 usage_limit_reached, plan_type: plus),
+    # removed after a full live audit on 2026-08-05. Either way the offline
+    # fallback must not surface a dead choice; live discovery picks them up via
+    # _fetch_models_from_api if OpenAI ever enables them on this backend.
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
