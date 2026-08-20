@@ -13608,6 +13608,11 @@ def main():
         help="Also delete archived sessions (excluded by default)",
     )
     sessions_prune.add_argument(
+        "--include-pinned",
+        action="store_true",
+        help="Also delete pinned sessions (excluded by default — pin is a keep flag)",
+    )
+    sessions_prune.add_argument(
         "--never-active",
         action="store_true",
         help=(
