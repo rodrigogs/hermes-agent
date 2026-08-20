@@ -350,6 +350,102 @@ _SUMMARY_END_MARKER = (
 _MERGED_PRIOR_CONTEXT_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
 _MERGED_SUMMARY_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
 
+_SALVAGE_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+_SALVAGE_SUMMARY_MAX_CHARS = 8_000
+_SALVAGE_KEEP_RECENT_TOOLS = 2
+_SALVAGE_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details")
+
+
+def _looks_like_compaction_summary(msg: Dict[str, Any], content: str) -> bool:
+    # Only cap a standalone handoff. Merged carriers preserve a real tail ask
+    # in the same content string; truncating those could delete live user text.
+    if not content.rstrip().endswith(_SUMMARY_END_MARKER):
+        return False
+    if content.startswith(_MERGED_PRIOR_CONTEXT_HEADER):
+        return False
+    # Content heuristics alone must never authorize mutating a live user turn.
+    # Compressor-generated user-role summaries carry this private marker;
+    # ordinary user input does not.
+    if (
+        msg.get("role") == "user"
+        and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+    ):
+        return False
+    head = content[:280]
+    return (
+        bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY))
+        or "CONTEXT COMPACTION" in head
+        or "[CONTEXT COMPACTION]" in head
+        or "Conversation Summary" in head
+    )
+
+
+def salvage_grown_transcript(
+    original: List[Dict[str, Any]],
+    candidate: List[Dict[str, Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Mechanically shrink a compression candidate, or return ``None``.
+
+    Already-compacted middles can be summarized slightly larger while retained
+    tool bodies, stale reasoning, or a synthetic todo snapshot tip the final
+    candidate over the input size. Work on copies and admit the salvage only
+    when the same rough estimator proves it is strictly smaller than the input.
+    """
+    if not candidate or not original:
+        return None
+    budget = estimate_messages_tokens_rough(original)
+    if budget <= 0:
+        return None
+
+    out: List[Dict[str, Any]] = []
+    tool_indices: List[int] = []
+    last_assistant_idx = -1
+    for msg in candidate:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        if msg.get("_todo_snapshot_synthetic") and msg.get("role") == "user":
+            continue
+        copied = dict(msg)
+        out.append(copied)
+        role = copied.get("role")
+        if role == "tool":
+            tool_indices.append(len(out) - 1)
+        elif role == "assistant":
+            last_assistant_idx = len(out) - 1
+
+    keep_tools = set(tool_indices[-_SALVAGE_KEEP_RECENT_TOOLS:])
+    for index, msg in enumerate(out):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant" and index != last_assistant_idx:
+            for key in _SALVAGE_REASONING_KEYS:
+                msg.pop(key, None)
+        if msg.get("role") == "tool" and index not in keep_tools:
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > 200:
+                msg["content"] = _SALVAGE_TOOL_PLACEHOLDER
+        content = msg.get("content")
+        if (
+            isinstance(content, str)
+            and len(content) > _SALVAGE_SUMMARY_MAX_CHARS
+            and _looks_like_compaction_summary(msg, content)
+        ):
+            msg["content"] = (
+                content[:_SALVAGE_SUMMARY_MAX_CHARS].rstrip()
+                + "\n…[summary truncated so compaction can shrink]\n\n"
+                + _SUMMARY_END_MARKER
+            )
+
+    if not any(
+        isinstance(message, dict) and message.get("role") == "user"
+        for message in out
+    ):
+        return None
+    if estimate_messages_tokens_rough(out) < budget:
+        return out
+    return None
+
 # Handoff prefixes that shipped in earlier releases. A summary persisted under
 # one of these can be inherited into a resumed lineage (#35344); when it is
 # re-normalized on re-compaction we must strip the OLD prefix too, otherwise the
@@ -2372,6 +2468,31 @@ class ContextCompressor(ContextEngine):
             return
         self._ineffective_compression_count = count
         self._persist_ineffective_compression_count()
+
+    def record_rejected_compaction(self) -> None:
+        """Record one compaction whose result was REJECTED before committing.
+
+        The anti-growth guard in the commit layer (conversation_compression)
+        discards a candidate that would grow the transcript and keeps the
+        original. Without recording the attempt, the anti-thrash breaker
+        never sees a strike, so automatic compression retries the SAME
+        unchanged transcript on every turn — same summary request, same
+        refusal, same user-facing warning (#88568). This counts one
+        ineffective strike (persisted, so the normal >= 2 latch and its
+        recovery window apply) WITHOUT arming post-compaction real-usage
+        verification — nothing was committed, so there is no new compaction
+        to verify — and without touching the fallback-summary streak (no
+        summary was accepted).
+        """
+        self._record_ineffective_compression_verdict(
+            self._ineffective_compression_count + 1
+        )
+        if not self.quiet_mode:
+            logger.warning(
+                "Compaction rejected before commit (would grow the "
+                "transcript); ineffective_compression_count=%d",
+                self._ineffective_compression_count,
+            )
 
     def record_completed_compaction(
         self, *, used_fallback: bool = False, feasibility_skip: bool = False,
