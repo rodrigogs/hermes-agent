@@ -159,6 +159,18 @@ class TavilyWebSearchProvider(WebSearchProvider):
 
         return bool(get_provider_env("TAVILY_API_KEY"))
 
+    def is_keyless_available(self) -> bool:
+        """Tavily serves anonymous keyless requests (X-Tavily-Access-Mode).
+
+        Default-on ring member of the keyless free tier: fresh installs
+        rotate across Exa/Parallel/Tavily/Firecrawl/Keenable. False when
+        the user pinned ``web.provider_tier.tavily: paid`` — an explicit
+        paid selection opts the free endpoint out.
+        """
+        from plugins.web.keyless_mcp import keyless_enabled, provider_tier
+
+        return keyless_enabled() and provider_tier("tavily") != "paid"
+
     def supports_search(self) -> bool:
         return True
 
@@ -172,6 +184,18 @@ class TavilyWebSearchProvider(WebSearchProvider):
 
             if is_interrupted():
                 return {"success": False, "error": "Interrupted"}
+
+            from agent.web_search_provider import get_provider_env
+
+            from plugins.web.keyless_mcp import search_with_failover, use_keyless
+
+            if use_keyless("tavily", get_provider_env("TAVILY_API_KEY")):
+                # Keyless free tier — ring dispatch with next-in-line
+                # failover on rate limits.
+                logger.info(
+                    "Tavily keyless search: '%s' (limit=%d)", query, limit
+                )
+                return search_with_failover("tavily", query, limit)
 
             logger.info("Tavily search: '%s' (limit=%d)", query, limit)
             raw = _tavily_request(
@@ -203,6 +227,16 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 return [
                     {"url": u, "error": "Interrupted", "title": ""} for u in urls
                 ]
+
+            from agent.web_search_provider import get_provider_env
+
+            from plugins.web.keyless_mcp import extract_with_failover, use_keyless
+
+            if use_keyless("tavily", get_provider_env("TAVILY_API_KEY")):
+                # Keyless free tier — ring dispatch with next-in-line
+                # failover on rate limits.
+                logger.info("Tavily keyless extract: %d URL(s)", len(urls))
+                return extract_with_failover("tavily", list(urls))
 
             logger.info("Tavily extract: %d URL(s)", len(urls))
             raw = _tavily_request(

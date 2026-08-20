@@ -167,6 +167,38 @@ def _is_explicit_firecrawl_selection() -> bool:
     )
 
 
+def _use_keyless_ring() -> bool:
+    """True when Firecrawl calls should route via the keyless ring.
+
+    Ring dispatch applies when there are no direct credentials, the
+    managed Nous gateway isn't the selected path, and the keyless tier
+    isn't disabled or pinned paid. Keyed/self-hosted/gateway setups never
+    reach the ring.
+    """
+    from hermes_cli.config import get_env_value
+
+    if (get_env_value("FIRECRAWL_API_KEY") or "").strip():
+        return False
+    if (get_env_value("FIRECRAWL_API_URL") or "").strip():
+        return False
+    import tools.web_tools as _wt
+    from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER, read_selection
+
+    try:
+        if read_selection("web") == NOUS_MANAGED_PROVIDER:
+            return False
+    except Exception:  # noqa: BLE001 — selection helpers optional
+        pass
+    try:
+        if _wt._is_tool_gateway_ready() and not _is_explicit_firecrawl_selection():
+            return False
+    except Exception:  # noqa: BLE001 — probe optional
+        pass
+    from plugins.web.keyless_mcp import use_keyless
+
+    return use_keyless("firecrawl", "")
+
+
 class _KeylessFirecrawlClient:
     """Minimal REST client for Firecrawl's keyless cloud mode.
 
@@ -504,6 +536,17 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         """Return True when direct Firecrawl OR managed-gateway path is configured."""
         return check_firecrawl_api_key()
 
+    def is_keyless_available(self) -> bool:
+        """Firecrawl serves keyless cloud requests (public API, no auth).
+
+        Default-on ring member of the keyless free tier: fresh installs
+        rotate across Exa/Parallel/Tavily/Firecrawl/Keenable. False when
+        the user pinned ``web.provider_tier.firecrawl: paid``.
+        """
+        from plugins.web.keyless_mcp import keyless_enabled, provider_tier
+
+        return keyless_enabled() and provider_tier("firecrawl") != "paid"
+
     def supports_search(self) -> bool:
         return True
 
@@ -528,6 +571,16 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
 
         if is_interrupted():
             return {"success": False, "error": "Interrupted"}
+
+        if _use_keyless_ring():
+            # No credentials and no managed gateway: ring dispatch with
+            # next-in-line failover on rate limits (default-on free tier).
+            from plugins.web.keyless_mcp import search_with_failover
+
+            logger.info(
+                "Firecrawl keyless search: '%s' (limit=%d)", query, limit
+            )
+            return search_with_failover("firecrawl", query, limit)
 
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
         # _get_firecrawl_client() raises ValueError on unconfigured systems —
@@ -561,6 +614,18 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
 
         if _is_interrupted():
             return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
+
+        if _use_keyless_ring():
+            # No credentials and no managed gateway: ring dispatch with
+            # next-in-line failover on rate limits (default-on free tier).
+            import asyncio as _asyncio
+
+            from plugins.web.keyless_mcp import extract_with_failover
+
+            logger.info("Firecrawl keyless extract: %d URL(s)", len(urls))
+            return await _asyncio.to_thread(
+                extract_with_failover, "firecrawl", list(urls)
+            )
 
         format = kwargs.get("format")
         formats: List[str] = []
