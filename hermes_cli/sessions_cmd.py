@@ -341,7 +341,13 @@ def cmd_sessions(args, sessions_parser=None):
     if action == "import":
         from hermes_cli.foreign_sessions import run_sessions_import
 
-        run_sessions_import(args)
+        result = run_sessions_import(args)
+        # A path was explicitly given but nothing imported → real error (bad
+        # path, unknown source, no turns). Propagate a non-zero exit so
+        # scripts can detect the failure (SES-04/SES-10). An interactive
+        # picker cancel (no path) returning None is a normal no-op → exit 0.
+        if result is None and getattr(args, "path", None):
+            return 1
         return
 
     try:
@@ -350,7 +356,7 @@ def cmd_sessions(args, sessions_parser=None):
         db = SessionDB()
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
-        return
+        return 1
 
     # Hide third-party tool sessions by default, but honour explicit --source
     _source = getattr(args, "source", None)
@@ -903,7 +909,7 @@ def cmd_sessions(args, sessions_parser=None):
         resolved_session_id = db.resolve_session_id(args.session_id)
         if not resolved_session_id:
             print(f"Session '{args.session_id}' not found.")
-            return
+            return 1
         # Note when the explicit target is pinned — the user named this id
         # directly so we honor the delete, but a pin is a "keep" flag and
         # silently destroying it (round-3 QA SES-01) is surprising.
@@ -924,6 +930,7 @@ def cmd_sessions(args, sessions_parser=None):
             print(f"Deleted session '{resolved_session_id}'.")
         else:
             print(f"Session '{args.session_id}' not found.")
+            return 1
 
     elif action == "prune" and getattr(args, "never_active", False):
         # Separate branch on purpose: the shared prune/archive selector is
@@ -968,7 +975,7 @@ def cmd_sessions(args, sessions_parser=None):
             filters = build_prune_filters(args)
         except ValueError as e:
             print(f"Error: {e}")
-            return
+            return 1
 
         if action == "archive" and not any(
             v for k, v in filters.items() if k != "older_than_days"
@@ -1091,15 +1098,27 @@ def cmd_sessions(args, sessions_parser=None):
         resolved_session_id = db.resolve_session_id(args.session_id)
         if not resolved_session_id:
             print(f"Session '{args.session_id}' not found.")
-            return
+            return 1
         title = " ".join(args.title)
+        # Reject blank / whitespace-only / newline-bearing titles (SES-05):
+        # an empty title renders as "—" and embedded newlines corrupt the
+        # `list` table. length is validated in set_session_title; guard
+        # emptiness + control chars here.
+        if not title.strip():
+            print("Error: title cannot be empty or whitespace-only.")
+            return 1
+        if "\n" in title or "\r" in title:
+            print("Error: title cannot contain newlines.")
+            return 1
         try:
             if db.set_session_title(resolved_session_id, title):
                 print(f"Session '{resolved_session_id}' renamed to: {title}")
             else:
                 print(f"Session '{args.session_id}' not found.")
+                return 1
         except ValueError as e:
             print(f"Error: {e}")
+            return 1
 
     elif action in ("pin", "unpin"):
         # CLI surface for the durable "keep" flag (issue #52955). Pinned
