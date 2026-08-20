@@ -44,6 +44,12 @@ DEFAULT_CONFIG = {
     },
     "agent": {
         "max_turns": 500,
+        # Optional wall-clock budget in seconds per conversation run.
+        # null/absent = feature fully off (zero behavior change). When set,
+        # the agent gets a one-time wrap-up notice at 80% elapsed and
+        # implicit provider stale timeouts are capped to the remaining
+        # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
+        "run_budget_seconds": None,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -179,6 +185,15 @@ DEFAULT_CONFIG = {
         # api_modes — fixes the Gemini/Claude "stops after stating intent" case),
         # false (never), or a list of model-name substrings to match.
         "intent_ack_continuation": "auto",
+        # Runtime anti-stall guards. When True (default), two conservative
+        # guards run: (1) an identical-call loop breaker that appends a short
+        # notice to the tool result when the same tool is called 3+ consecutive
+        # times with identical arguments AND identical results (never blocks;
+        # pollers like `process` are exempt), and (2) a continue-intent
+        # extension of the empty-response recovery that re-prompts once when
+        # the model ends its turn saying it will continue but takes no action.
+        # Set False to disable both.
+        "stall_guards": True,
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
         # after a stub instead of finishing the artifact, (2) fabricating
@@ -3610,7 +3625,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 37,
+    "_config_version": 38,
 }
 
 # Optional environment variables that enhance functionality
