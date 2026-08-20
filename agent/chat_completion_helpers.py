@@ -4304,8 +4304,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 agent._fire_reasoning_delta(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
-            if delta and delta.content:
-                content_parts.append(delta.content)
+            delta_content = getattr(delta, "content", None)
+            if delta_content:
+                content_parts.append(delta_content)
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
@@ -4315,7 +4316,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
+                    agent._fire_stream_delta(delta_content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -4330,15 +4331,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
+                        agent.stream_delta_callback(delta_content)
+                        agent._record_streamed_assistant_text(delta_content)
                     except Exception:
                         pass
 
             # Accumulate tool call deltas — notify display on first name
-            if delta and delta.tool_calls:
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if delta_tool_calls:
                 _flush_pending_stream_text()
-                for tc_delta in delta.tool_calls:
+                for tc_delta in delta_tool_calls:
                     raw_idx = tc_delta.index if tc_delta.index is not None else 0
                     delta_id = tc_delta.id or ""
 
