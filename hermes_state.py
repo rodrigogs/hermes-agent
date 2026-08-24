@@ -5111,22 +5111,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             ``requested_model`` and ``requested_provider`` are not two columns,
             they are one route. Every write must leave them describing a route
-            that some caller actually asked for. So a writer may only fill the
-            provider half from a snapshot that names the model half the row
-            already records (or fill both halves at once, when the row records
-            no request at all) — never combine the model of one request with
-            the provider of another.
+            that some caller actually asked for: never the model of one request
+            beside the provider of another. A writer may adopt a snapshot's
+            pair as a whole (when the row records no request, or records only a
+            half this snapshot supersedes), or complete one half from a
+            snapshot that names the same route as far as the row records it —
+            nothing else.
 
-        ``COALESCE``-ing the two halves independently breaks that. This upsert
-        runs on the FIRST TURN OF EVERY PROCESS for an existing session id
-        (that is what the ``ON CONFLICT`` is for) with that process's immutable
-        start-of-run snapshot, while ``requested_model`` may meanwhile have been
-        rewritten by a mid-session ``/model`` switch — whose provider-less form
-        deliberately stores NULL, i.e. "no provider requested", an answer and
-        not a gap to patch. Independent halves therefore printed
-        ``requested <switched model> (<snapshot provider>) → served ...`` in
-        ``hermes sessions list``: a route nobody ever asked for, which is the
-        one report these columns exist to rule out.
+        Both halves are normalized to NULL at bind time in all three writers
+        (``x or None``), so "not requested" has exactly one representation and
+        the SQL gates below never have to compare ``''`` against a real name.
+
+        ``COALESCE``-ing the two halves independently breaks the invariant in
+        both directions. This upsert runs on the FIRST TURN OF EVERY PROCESS for
+        an existing session id (that is what the ``ON CONFLICT`` is for) with
+        that process's immutable start-of-run snapshot, which is unrelated to
+        what the row may already record:
+
+        * *model recorded, provider NULL* — a mid-session ``/model`` switch
+          whose provider-less form deliberately stores NULL, i.e. "no provider
+          requested", an answer and not a gap to patch. An ungated provider
+          ``COALESCE`` printed ``requested <switched model> (<snapshot
+          provider>) → served ...`` in ``hermes sessions list``.
+        * *provider recorded, model NULL* — the mirror image, and ordinary
+          production state: ``hermes --provider vllm`` with no ``model.default``
+          leaves ``self.model == ""``, so ``agent_init`` snapshots an empty
+          requested model while ``requested_provider`` has an ``"auto"`` floor
+          and is effectively never empty (and ``vllm``/``ollama``/``custom``
+          have no catalog default to heal it with). The row is written before
+          the first API call, so it outlives even a request that 400s. An
+          ungated model ``COALESCE`` then stitched the NEXT process's model onto
+          that stored provider: ``requested glm-5.4 (vllm) → served grok-4
+          (xai)`` when process 1 asked for vllm with no model and process 2 for
+          glm-5.4 via minimax.
+
+        The two halves are deliberately NOT symmetric about who wins, because
+        their provenance differs. A recorded *model* can be newer than any
+        snapshot (``update_session_model`` writes it mid-run on every ``/model``
+        switch), so it is authoritative and is never overwritten. A recorded
+        *provider with no model* can only come from a process-start snapshot —
+        no switch can produce it, since a switch always names a model — so it
+        has no claim to be newer, and it describes a request that never named a
+        model at all. When a later snapshot names a model, that model has to
+        come with its own provider; keeping the old one would be the very lie
+        above, and refusing the model would leave the loud warning naming a bare
+        provider from an abandoned start while suppressing the provider of the
+        request that actually got abandoned. So a provider-only row yields to a
+        model-naming snapshot as a whole pair. A snapshot that names no model
+        adds nothing, and leaves the provider-only row as it stands.
 
         ``chat_id``/``thread_id`` record the messaging origin (the chat/room and
         thread the session was started in) so that gateway ``/resume`` can prove
@@ -5164,16 +5196,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
-                       -- Audit-pair invariant (see docstring): the request is
-                       -- adopted from this snapshot as a WHOLE route. The
-                       -- provider half is only taken when the row records no
-                       -- request at all, or records the very model this
-                       -- snapshot names; a row whose requested_model came from
-                       -- somewhere else keeps its own provider (NULL included).
+                       -- Audit-pair invariant (see docstring): these two are
+                       -- one route, so the halves may never come from
+                       -- different requests. A recorded model is
+                       -- authoritative (a /model switch can have written it
+                       -- after this snapshot was taken) and is kept.
                        requested_model = COALESCE(
                            sessions.requested_model, excluded.requested_model
                        ),
                        requested_provider = CASE
+                           -- Row records no model but this snapshot names
+                           -- one: the model half above is taking it, so the
+                           -- provider must come from the SAME snapshot. Any
+                           -- provider the row held belongs to a request that
+                           -- never named a model (only a process start can
+                           -- record that, so it is not newer than this one) —
+                           -- it cannot stay beside a foreign model.
+                           WHEN sessions.requested_model IS NULL
+                                AND excluded.requested_model IS NOT NULL
+                           THEN excluded.requested_provider
+                           -- Otherwise only ever FILL a NULL: for a row with
+                           -- no request at all, or one recording the very
+                           -- model this snapshot names (same route, provider
+                           -- half now known). A row whose model came from
+                           -- somewhere else keeps its own provider, NULL
+                           -- ("no provider requested") included.
                            WHEN sessions.requested_model IS NULL
                                 OR sessions.requested_model
                                    = excluded.requested_model
@@ -7502,10 +7549,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         request must never be rewritten by a later observation.
 
         The backfill obeys the audit-pair invariant stated in
-        ``_insert_session_row``: the caller's snapshot describes ONE route, so
-        it may fill both halves of a row that records no request at all, or
-        complete the provider of a row that records the very model the snapshot
-        names — but never donate its provider to some other model. Filling the
+        ``_insert_session_row``, with the same SQL: the caller's snapshot
+        describes ONE route, so it may fill both halves of a row that records no
+        request at all, complete the provider of a row that records the very
+        model the snapshot names, or supersede a provider-only row as a whole
+        pair — but never donate its provider to some other model. Filling the
         provider half unconditionally would pair it with whatever model a
         mid-session ``/model`` switch has since requested (a provider-less
         switch deliberately stores NULL, "no provider requested" — an answer,
@@ -7513,7 +7561,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         it whenever ``requested_model`` is merely non-NULL is the opposite
         mistake: it would drop the provider from the loud warning for every
         resumed session that genuinely re-requested the recorded model through a
-        known provider.
+        known provider. And filling the MODEL half over a stored provider-only
+        request — the mirror mistake, reachable inside this one call for a
+        process that starts ``--provider vllm`` with no model and falls back on
+        its first turn — pairs this snapshot's model with that stored provider,
+        while the stale provider also suppresses the correct one this very
+        snapshot carries.
 
         Best-effort and idempotent: a fallback swap is a recovery path and must
         not be aborted by a bookkeeping write.
@@ -7523,12 +7576,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             # SQLite evaluates every SET expression against the pre-UPDATE row,
-            # so the CASE reads the requested_model the row had on entry.
+            # so both CASE arms read the requested_model the row had on entry.
+            # Same three-way gate as _insert_session_row's upsert (see the
+            # invariant there): keep a recorded model, take the provider from
+            # whichever request supplies the model that ends up stored.
             conn.execute(
                 """UPDATE sessions
                       SET fallback_activated = 1,
                           requested_model = COALESCE(requested_model, :model),
                           requested_provider = CASE
+                              WHEN requested_model IS NULL
+                                   AND :model IS NOT NULL
+                                  THEN :provider
                               WHEN requested_model IS NULL
                                    OR requested_model = :model
                                   THEN COALESCE(requested_provider, :provider)
@@ -7566,8 +7625,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           without provider knowledge leave any stored provider untouched.
         * the request audit columns are a statement about THIS call, so they
           are rewritten wholesale: ``requested_model`` becomes *model*,
-          ``requested_provider`` becomes *provider* — NULL when the caller
-          names none — and ``fallback_activated`` clears. A mid-session
+          ``requested_provider`` becomes *provider* — either half NULL when the
+          caller names none — and ``fallback_activated`` clears. Being written
+          as a unit, the pair is coherent from any of the four prior row states
+          (neither half / model only / provider only / both). A mid-session
           /model switch is a NEW explicit request: the old requested route is
           no longer what the operator is asking for, and any fallback flag
           raised against it would now be misleading.
@@ -7609,6 +7670,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # abandoned request's provider; the stored model_config provider
             # above is the resume route and keeps its own COALESCE-like
             # semantics (untouched when the caller names no provider).
+            # Both audit halves go through `or None` like the other two
+            # writers': "not requested" must have ONE representation, or the
+            # NULL gates in those writers would silently treat a stored ''
+            # as a recorded name (and `'' = :model` would never match).
             conn.execute(
                 "UPDATE sessions SET "
                 "model = ?, model_config = ?, "
@@ -7617,7 +7682,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "fallback_activated = 0, "
                 "system_prompt = NULL, system_prompt_hash = NULL "
                 "WHERE id = ?",
-                (model, merged, model, provider or None, session_id),
+                (model, merged, model or None, provider or None, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)

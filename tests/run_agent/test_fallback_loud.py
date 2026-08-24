@@ -317,6 +317,151 @@ def test_session_upsert_adopts_the_request_pair_only_as_a_unit(db):
     assert kept["requested_provider"] == "zai"
 
 
+# ---------------------------------------------------------------------------
+# The whole state machine: 4 row states x 3 writers
+# ---------------------------------------------------------------------------
+
+#: ``(row state, row pair, snapshot pair, expected pair after the write)``.
+#: Both snapshot-carrying writers (``create_session``'s ON CONFLICT upsert and
+#: ``record_session_fallback``'s backfill) share one gate, so one table pins
+#: both. The two earlier rounds of this fix each enumerated three of the four
+#: row states and shipped the bug living in the fourth.
+_AUDIT_PAIR_TABLE = [
+    # Nothing recorded: the snapshot's request is adopted as a whole pair,
+    # whatever shape it has.
+    ("neither", (None, None), ("glm-5.4", "minimax"), ("glm-5.4", "minimax")),
+    ("neither", (None, None), (None, "minimax"), (None, "minimax")),
+    ("neither", (None, None), (None, None), (None, None)),
+    # Model only: the recorded model can be newer than any snapshot (a /model
+    # switch writes it mid-run), so it wins — and its NULL provider means "no
+    # provider requested", which only a snapshot naming that SAME model may
+    # fill in.
+    ("model only", ("gpt-5.4", None), ("glm-5.4", "minimax"), ("gpt-5.4", None)),
+    ("model only", ("gpt-5.4", None), ("gpt-5.4", "minimax"), ("gpt-5.4", "minimax")),
+    ("model only", ("gpt-5.4", None), (None, "minimax"), ("gpt-5.4", None)),
+    # Provider only (`hermes --provider vllm`, no model.default): a request
+    # that never named a model, and one no switch can have written. A snapshot
+    # that names a model supersedes it as a whole pair — the model may not be
+    # stitched onto the stored provider, and refusing the model would strand
+    # the warning on a bare provider from an abandoned start.
+    ("provider only", (None, "vllm"), ("glm-5.4", "minimax"), ("glm-5.4", "minimax")),
+    ("provider only", (None, "vllm"), ("glm-5.4", "vllm"), ("glm-5.4", "vllm")),
+    # A snapshot naming no model adds nothing, so the row stands.
+    ("provider only", (None, "vllm"), (None, "minimax"), (None, "vllm")),
+    ("provider only", (None, "vllm"), (None, None), (None, "vllm")),
+    # Both halves: a complete request is never rewritten by a later snapshot.
+    ("both", ("gpt-5.4", "vllm"), ("glm-5.4", "minimax"), ("gpt-5.4", "vllm")),
+    ("both", ("gpt-5.4", "vllm"), ("gpt-5.4", "minimax"), ("gpt-5.4", "vllm")),
+    ("both", ("gpt-5.4", "vllm"), (None, None), ("gpt-5.4", "vllm")),
+]
+
+
+def _assert_one_whole_request(result, row, snapshot):
+    """The pair must be one of the two requests in play, never a mix of both.
+
+    Completing a half is not an exception to this: a half may only be taken
+    from a snapshot that agrees with the row about the half they share, so
+    every legal completion equals the snapshot's own pair.
+    """
+    assert result in (row, snapshot), (
+        f"{result} mixes the two requests {row} and {snapshot}"
+    )
+
+
+@pytest.mark.parametrize(
+    "state,row,snapshot,expected",
+    _AUDIT_PAIR_TABLE,
+    ids=[
+        f"{s}-{'x'.join(str(v) for v in snap)}"
+        for s, _row, snap, _exp in _AUDIT_PAIR_TABLE
+    ],
+)
+def test_upsert_audit_pair_table(db, state, row, snapshot, expected):
+    """``create_session``'s ON CONFLICT upsert, over the whole state machine."""
+    db.create_session(
+        "s_tbl", source="cli", model="glm-5.2",
+        requested_model=row[0], requested_provider=row[1],
+    )
+    assert (
+        db.get_session("s_tbl")["requested_model"],
+        db.get_session("s_tbl")["requested_provider"],
+    ) == row, f"could not set up the {state} row state"
+
+    # The next process's first turn, carrying its own start-of-run snapshot.
+    db.create_session(
+        "s_tbl", source="cli", model="glm-5.2",
+        requested_model=snapshot[0], requested_provider=snapshot[1],
+    )
+    stored = db.get_session("s_tbl")
+    result = (stored["requested_model"], stored["requested_provider"])
+    assert result == expected
+    _assert_one_whole_request(result, row, snapshot)
+
+
+@pytest.mark.parametrize(
+    "state,row,snapshot,expected",
+    _AUDIT_PAIR_TABLE,
+    ids=[
+        f"{s}-{'x'.join(str(v) for v in snap)}"
+        for s, _row, snap, _exp in _AUDIT_PAIR_TABLE
+    ],
+)
+def test_fallback_backfill_audit_pair_table(db, state, row, snapshot, expected):
+    """``record_session_fallback``'s backfill, over the whole state machine.
+
+    Same expectations as the upsert: both writers carry a process-start
+    snapshot into a row they did not write, so they answer to one gate.
+    """
+    db.create_session(
+        "s_tbl", source="cli", model="glm-5.2",
+        requested_model=row[0], requested_provider=row[1],
+    )
+    db.record_session_fallback(
+        "s_tbl", requested_model=snapshot[0], requested_provider=snapshot[1],
+    )
+    stored = db.get_session("s_tbl")
+    result = (stored["requested_model"], stored["requested_provider"])
+    assert result == expected
+    _assert_one_whole_request(result, row, snapshot)
+    assert stored["fallback_activated"] == 1, "the flag is the point of the call"
+
+
+@pytest.mark.parametrize(
+    "state,row",
+    [(state, row) for state, row, _snap, _exp in _AUDIT_PAIR_TABLE],
+    ids=[
+        f"{state}-{'x'.join(str(v) for v in row)}"
+        for state, row, _snap, _exp in _AUDIT_PAIR_TABLE
+    ],
+)
+@pytest.mark.parametrize(
+    "switch", [("glm-5.4", "minimax"), ("glm-5.4", None), ("", "minimax")]
+)
+def test_update_session_model_audit_pair_table(db, state, row, switch):
+    """``update_session_model``: the third writer, from all four row states.
+
+    A /model switch is a new explicit request, so it writes both halves from
+    THIS call — which makes it coherent from every prior state by construction,
+    including the provider-only one. Nothing is coalesced in, so nothing can be
+    mixed in. The empty-model case pins the ``or None`` normalization: '' and
+    None both mean "no model requested" and must be stored identically, or the
+    NULL gates in the other two writers would read '' as a recorded name.
+    """
+    db.create_session(
+        "s_tbl", source="cli", model="glm-5.2",
+        requested_model=row[0], requested_provider=row[1],
+    )
+    db.record_session_fallback("s_tbl")
+    db.update_session_model("s_tbl", switch[0], provider=switch[1])
+
+    stored = db.get_session("s_tbl")
+    assert (stored["requested_model"], stored["requested_provider"]) == (
+        switch[0] or None,
+        switch[1],
+    )
+    assert stored["fallback_activated"] == 0
+
+
 def test_audit_columns_are_declared_so_existing_dbs_reconcile(tmp_path):
     """The columns are declarative: an older DB gains them on next open."""
     import sqlite3
@@ -745,3 +890,87 @@ def test_next_process_first_turn_cannot_make_the_warning_lie(db, capsys):
     out = capsys.readouterr().out
     assert "requested gpt-5.4 → served grok-4 (xai)" in out
     assert "minimax" not in out
+
+
+def test_provider_only_row_cannot_lend_its_provider_to_a_foreign_model(db, capsys):
+    """The mirror of the above: a stored PROVIDER must not adopt a foreign model.
+
+    A provider-only row (``requested_provider`` set, ``requested_model`` NULL)
+    is ordinary production state, not a test poke: ``hermes --provider vllm``
+    with no ``model.default`` in config leaves ``self.model == ""``, so
+    ``agent_init`` snapshots an empty requested model while
+    ``requested_provider`` has an ``"auto"`` floor and is effectively never
+    empty. The row is written before the first API call (the titler forces
+    ``_ensure_db_session``), so it survives even when that model-less request
+    400s.
+
+    The next process on that session id then arrives with its own complete
+    request. Independent ``COALESCE``s stitched THAT process's model onto the
+    stored provider and `hermes sessions list` printed
+
+        s1  requested glm-5.4 (vllm) → served grok-4 (xai)
+
+    Nobody ever requested that: the first process asked for vllm with no model,
+    the second asked for glm-5.4 via minimax. Double harm — the stale ``vllm``
+    also suppressed the correct ``minimax`` the backfill would have supplied.
+    """
+    from hermes_cli import sessions_cmd
+
+    # First process: `hermes --provider vllm` with no default model.
+    db.create_session(
+        "s_provider_only", source="cli", model="",
+        requested_model=None, requested_provider="vllm",
+    )
+    row = db.get_session("s_provider_only")
+    assert row["requested_model"] is None
+    assert row["requested_provider"] == "vllm"
+
+    # Next process's first turn: a whole request of its own.
+    db.create_session(
+        "s_provider_only", source="cli", model="glm-5.4",
+        requested_model="glm-5.4", requested_provider="minimax",
+    )
+    # ...which is not honored: another route serves and bills the turn.
+    db.update_token_counts(
+        "s_provider_only", input_tokens=10, output_tokens=5,
+        model="grok-4", billing_provider="xai", api_call_count=1,
+    )
+    db.flush_token_counts()
+    db.record_session_fallback(
+        "s_provider_only", requested_model="glm-5.4", requested_provider="minimax",
+    )
+
+    rows = [
+        s for s in db.list_sessions_rich(limit=10)
+        if s["id"] == "s_provider_only"
+    ]
+    assert rows, "the flagged session must be listable"
+    assert rows[0]["requested_model"] == "glm-5.4"
+    assert rows[0]["requested_provider"] == "minimax", (
+        "the model came from this snapshot, so the provider must too"
+    )
+
+    sessions_cmd._print_fallback_warnings(rows)
+    out = capsys.readouterr().out
+    assert "requested glm-5.4 (minimax) → served grok-4 (xai)" in out
+    assert "vllm" not in out
+
+
+def test_fallback_backfill_alone_cannot_mispair_a_provider_only_row(db):
+    """The same mis-pairing arises purely inside ``record_session_fallback``.
+
+    No second ``create_session`` needed: the process that starts provider-only
+    and falls back on its very first turn backfills through this writer, whose
+    model half was an ungated ``COALESCE`` too.
+    """
+    db.create_session(
+        "s_backfill_only", source="cli", model="",
+        requested_model=None, requested_provider="vllm",
+    )
+    db.record_session_fallback(
+        "s_backfill_only", requested_model="glm-5.4", requested_provider="minimax",
+    )
+    row = db.get_session("s_backfill_only")
+    assert row["fallback_activated"] == 1
+    assert row["requested_model"] == "glm-5.4"
+    assert row["requested_provider"] == "minimax"
