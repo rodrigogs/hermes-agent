@@ -698,14 +698,20 @@ class AIAgent:
             # silently did nothing. Re-apply the flag now that there is a row.
             if getattr(self, "_fallback_activated", False):
                 try:
+                    # Same request the swap itself would have recorded: the
+                    # route it ABANDONED, not this process's start-of-run
+                    # snapshot (which a /model switch can have superseded).
+                    # One helper so both call sites can never disagree about
+                    # what the flag's pair means.
+                    from agent.chat_completion_helpers import (
+                        abandoned_route_for_audit,
+                    )
+
+                    _req_model, _req_provider = abandoned_route_for_audit(self)
                     self._session_db.record_session_fallback(
                         self.session_id,
-                        requested_model=(
-                            getattr(self, "origin_requested_model", "") or None
-                        ),
-                        requested_provider=(
-                            getattr(self, "origin_requested_provider", "") or None
-                        ),
+                        requested_model=_req_model,
+                        requested_provider=_req_provider,
                     )
                 except Exception:
                     logger.debug(
