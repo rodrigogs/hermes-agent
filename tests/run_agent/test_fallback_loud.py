@@ -122,6 +122,33 @@ def test_record_session_fallback_backfills_a_row_created_before_the_columns(db):
     assert row["requested_provider"] == "openrouter"
 
 
+def test_fallback_backfill_never_pairs_a_new_request_with_an_old_provider(db):
+    """Backfill completes the request pair as a unit, or leaves it alone.
+
+    A provider-less ``/model`` switch records "no provider requested" (NULL) on
+    purpose. Backfilling that half independently from the process-start
+    snapshot would put the switched model beside the provider of a request that
+    no longer exists — the same incoherent pair, through the back door. The
+    snapshot only describes the ORIGINAL request, so it may only fill a row
+    that has no request recorded at all.
+    """
+    db.create_session(
+        "s_pair", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    db.update_session_model("s_pair", "gpt-5.4")  # provider-less switch
+
+    # A fallback later in the same process still carries the init snapshot.
+    db.record_session_fallback(
+        "s_pair", requested_model="glm-5.3", requested_provider="zai",
+    )
+
+    row = db.get_session("s_pair")
+    assert row["fallback_activated"] == 1
+    assert row["requested_model"] == "gpt-5.4"
+    assert row["requested_provider"] is None
+
+
 def test_record_session_fallback_tolerates_a_missing_row(db):
     """Never raise on the recovery path — the row is created lazily."""
     db.record_session_fallback("s_does_not_exist", requested_model="x")
@@ -140,6 +167,74 @@ def test_explicit_model_switch_resets_the_request_audit(db):
     row = db.get_session("s_switch")
     assert row["requested_model"] == "deepseek-v4-flash"
     assert row["requested_provider"] == "deepseek"
+    assert row["fallback_activated"] == 0
+
+
+def test_provider_less_switch_does_not_keep_the_previous_request_provider(db):
+    """The audit pair must describe ONE request, not halves of two.
+
+    ``/model deepseek-v4-flash`` without a provider asks for a model and
+    nothing else. COALESCE-ing the provider half of the audit left the PREVIOUS
+    request's provider standing beside the NEW model, so the row described a
+    route nobody had ever asked for ("requested deepseek-v4-flash via zai") —
+    and the `hermes sessions list` warning would have printed exactly that.
+    "No provider requested" is NULL, not the last one.
+    """
+    db.create_session(
+        "s_noprov", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    db.record_session_fallback("s_noprov")
+
+    db.update_session_model("s_noprov", "deepseek-v4-flash")
+
+    row = db.get_session("s_noprov")
+    assert row["requested_model"] == "deepseek-v4-flash"
+    assert row["requested_provider"] is None
+    assert row["fallback_activated"] == 0
+
+
+def test_switch_audit_and_resume_route_have_separate_provider_semantics(db):
+    """The audit column and ``model_config.$.provider`` are different things.
+
+    The stored ``$.provider`` exists so a later resume recombines the model
+    with the provider that serves it (#79536) and must survive a provider-less
+    switch; the audit column must state what THIS request asked for. Lineage
+    markers survive both, since the switch goes through the shared merge.
+    """
+    db.create_session(
+        "s_cfg", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+        model_config={
+            "provider": "custom:feather",
+            "_branched_from": "parent-session",
+            "_delegate_from": "boss-session",
+        },
+    )
+    db.record_session_fallback("s_cfg")
+
+    # Provider-less switch: the audit forgets the provider, the resume route
+    # keeps it (the caller made no statement about routing).
+    db.update_session_model("s_cfg", "deepseek-v4-flash")
+    row = db.get_session("s_cfg")
+    config = json.loads(row["model_config"])
+    assert config["provider"] == "custom:feather"
+    assert config["_branched_from"] == "parent-session"
+    assert config["_delegate_from"] == "boss-session"
+    assert row["requested_model"] == "deepseek-v4-flash"
+    assert row["requested_provider"] is None
+    assert row["fallback_activated"] == 0
+
+    # Provider-bearing switch: both halves move to the new request together.
+    db.record_session_fallback("s_cfg")
+    db.update_session_model("s_cfg", "glm-5.4", provider="zai")
+    row = db.get_session("s_cfg")
+    config = json.loads(row["model_config"])
+    assert config["provider"] == "zai"
+    assert config["_branched_from"] == "parent-session"
+    assert config["_delegate_from"] == "boss-session"
+    assert row["requested_model"] == "glm-5.4"
+    assert row["requested_provider"] == "zai"
     assert row["fallback_activated"] == 0
 
 
@@ -476,4 +571,43 @@ def test_sessions_list_stays_quiet_when_nothing_fell_back(capsys):
     sessions_cmd._print_fallback_warnings(
         [{"id": "s1", "model": "glm-5.3", "fallback_activated": 0}]
     )
+    assert capsys.readouterr().out == ""
+
+
+def test_sessions_list_warns_off_real_listing_rows(db, capsys):
+    """Same warning, driven by the real listing query instead of hand-made dicts.
+
+    The tests above feed ``_print_fallback_warnings`` literal dicts, so they
+    would keep passing if the listing SELECT stopped carrying the audit
+    columns. This walks the whole path: request persisted at creation, served
+    route overwriting ``model``, listing row read back, warning printed — and
+    then a ``/model`` switch making the warning stop, since it is a new request.
+    """
+    from hermes_cli import sessions_cmd
+
+    db.create_session(
+        "s_listed", source="cli", model="openrouter/zai/glm-5.3",
+        requested_model="openrouter/zai/glm-5.3", requested_provider="openrouter",
+    )
+    db.record_session_fallback("s_listed")
+    db.update_token_counts(
+        "s_listed", input_tokens=10, output_tokens=5,
+        model="glm-5.2", billing_provider="zai", api_call_count=1,
+    )
+    db.flush_token_counts()
+
+    rows = [s for s in db.list_sessions_rich(limit=10) if s["id"] == "s_listed"]
+    assert rows, "the flagged session must be listable"
+    sessions_cmd._print_fallback_warnings(rows)
+    out = capsys.readouterr().out
+    assert "openrouter/zai/glm-5.3 (openrouter)" in out
+    assert "glm-5.2 (zai)" in out
+
+    # A provider-less /model switch is a new request: the warning stops, and
+    # nothing may reintroduce the abandoned provider as the requested one.
+    db.update_session_model("s_listed", "glm-5.4")
+    rows = [s for s in db.list_sessions_rich(limit=10) if s["id"] == "s_listed"]
+    assert rows[0]["requested_model"] == "glm-5.4"
+    assert rows[0]["requested_provider"] is None
+    sessions_cmd._print_fallback_warnings(rows)
     assert capsys.readouterr().out == ""

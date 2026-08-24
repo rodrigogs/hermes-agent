@@ -7462,8 +7462,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         ``requested_*`` backfill the audit columns when the row predates them
         being populated (a session created before this build, or one whose
-        creation raced the first API call). Existing non-NULL values win — the
-        original request must never be rewritten by a later observation.
+        creation raced the first API call). Existing values win — the original
+        request must never be rewritten by a later observation.
+
+        The backfill is pair-atomic: the caller's snapshot describes ONE route,
+        so it only lands on a row that records no request at all. Filling the
+        provider half alone would pair it with whatever model a mid-session
+        ``/model`` switch has since requested — a route nobody asked for, which
+        is precisely what these columns exist to rule out. A provider-less
+        switch deliberately stores NULL ("no provider requested"), and that is
+        an answer, not a gap to be patched.
 
         Best-effort and idempotent: a fallback swap is a recovery path and must
         not be aborted by a bookkeeping write.
@@ -7472,11 +7480,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # SQLite evaluates every SET expression against the pre-UPDATE row,
+            # so the CASE reads the requested_model the row had on entry.
             conn.execute(
                 """UPDATE sessions
                       SET fallback_activated = 1,
                           requested_model = COALESCE(requested_model, ?),
-                          requested_provider = COALESCE(requested_provider, ?)
+                          requested_provider = CASE
+                              WHEN requested_model IS NULL
+                                  THEN COALESCE(requested_provider, ?)
+                              ELSE requested_provider
+                          END
                     WHERE id = ?""",
                 (requested_model or None, requested_provider or None, session_id),
             )
@@ -7496,12 +7510,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         switch explicitly replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
 
-        When *provider* is given, it is merged into ``model_config``
-        alongside the model (``$.model`` / ``$.provider``) so a later
-        resume recombines the persisted model with the provider that
-        actually serves it instead of the config.yaml primary provider
-        (#79536). Callers without provider knowledge leave any stored
-        provider untouched.
+        *provider* drives two deliberately different writes:
+
+        * ``model_config`` (``$.model`` / ``$.provider``) is a RESUME route:
+          it exists so a later resume recombines the persisted model with the
+          provider that actually serves it instead of the config.yaml primary
+          provider (#79536). Only touched when *provider* is given — callers
+          without provider knowledge leave any stored provider untouched.
+        * the request audit columns are a statement about THIS call, so they
+          are rewritten wholesale: ``requested_model`` becomes *model*,
+          ``requested_provider`` becomes *provider* — NULL when the caller
+          names none — and ``fallback_activated`` clears. A mid-session
+          /model switch is a NEW explicit request: the old requested route is
+          no longer what the operator is asking for, and any fallback flag
+          raised against it would now be misleading.
+
+        The audit provider is NOT coalesced with the stored one: keeping the
+        previous request's provider beside the newly requested model would
+        make the pair describe a route nobody ever asked for (requested model
+        Y via the provider of abandoned request X), which is exactly what the
+        columns exist to rule out. Callers that know the provider they are
+        switching to must therefore pass it — every /model path does.
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
@@ -7525,14 +7554,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
             # A mid-session /model switch is a NEW explicit request, so it
-            # also resets the request audit: the old requested route is no
-            # longer what the operator is asking for, and any fallback flag
-            # raised against it would now be misleading.
+            # resets the whole request audit — both halves from THIS call, so
+            # the pair always names one route. A provider-less switch records
+            # "no provider requested" (NULL) rather than inheriting the
+            # abandoned request's provider; the stored model_config provider
+            # above is the resume route and keeps its own COALESCE-like
+            # semantics (untouched when the caller names no provider).
             conn.execute(
                 "UPDATE sessions SET "
                 "model = ?, model_config = ?, "
                 "requested_model = ?, "
-                "requested_provider = COALESCE(?, requested_provider), "
+                "requested_provider = ?, "
                 "fallback_activated = 0, "
                 "system_prompt = NULL, system_prompt_hash = NULL "
                 "WHERE id = ?",
