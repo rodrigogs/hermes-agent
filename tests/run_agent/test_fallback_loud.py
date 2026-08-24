@@ -318,14 +318,16 @@ def test_session_upsert_adopts_the_request_pair_only_as_a_unit(db):
 
 
 # ---------------------------------------------------------------------------
-# The whole state machine: 4 row states x 3 writers
+# The whole state machine: 8 row states (4 pairs x 2 flag values) x 3 writers
 # ---------------------------------------------------------------------------
 
-#: ``(row state, row pair, snapshot pair, expected pair after the write)``.
+#: ``(row state, row pair, snapshot pair, expected pair after the write)`` for
+#: a row whose ``fallback_activated`` is DOWN.
 #: Both snapshot-carrying writers (``create_session``'s ON CONFLICT upsert and
 #: ``record_session_fallback``'s backfill) share one gate, so one table pins
-#: both. The two earlier rounds of this fix each enumerated three of the four
-#: row states and shipped the bug living in the fourth.
+#: both. The three earlier rounds of this fix each enumerated one axis short:
+#: two enumerated three of the four pair states and shipped the bug living in
+#: the fourth, and the third left the flag axis (below) unswept entirely.
 _AUDIT_PAIR_TABLE = [
     # Nothing recorded: the snapshot's request is adopted as a whole pair,
     # whatever shape it has.
@@ -356,18 +358,58 @@ _AUDIT_PAIR_TABLE = [
 ]
 
 
-def _assert_one_whole_request(result, row, snapshot):
-    """The pair must be one of the two requests in play, never a mix of both.
+#: Row states are the TRIPLE, so every case above is played twice: once against
+#: a row carrying no verdict and once against a row whose ``fallback_activated``
+#: is already up. The flag is not a fourth independent column — it is the
+#: verdict on the pair beside it ("the request these two name was abandoned") —
+#: so what a writer may do to the pair depends on it, and vice versa.
+_ROW_FLAGS = [0, 1]
 
-    Completing a half is not an exception to this: a half may only be taken
-    from a snapshot that agrees with the row about the half they share, so
-    every legal completion equals the snapshot's own pair.
+
+def _setup_row(db, session_id, row, flag):
+    """Put the row into one of the eight ``(pair, flag)`` states, and prove it.
+
+    The flag is raised with a snapshot-less ``record_session_fallback``, which
+    is a pure flag raise from every pair state (pinned by
+    ``test_a_bare_record_session_fallback_raises_only_the_flag``) — so the row
+    really is the state the parametrization claims, with no pair write smuggled
+    into the setup.
     """
-    assert result in (row, snapshot), (
-        f"{result} mixes the two requests {row} and {snapshot}"
+    db.create_session(
+        session_id, source="cli", model="glm-5.2",
+        requested_model=row[0], requested_provider=row[1],
+    )
+    if flag:
+        db.record_session_fallback(session_id)
+    stored = db.get_session(session_id)
+    assert (
+        stored["requested_model"],
+        stored["requested_provider"],
+        stored["fallback_activated"],
+    ) == (row[0], row[1], flag), "could not set up the row state"
+
+
+def _assert_one_whole_request(result, *candidates):
+    """The stored TRIPLE must be one whole record, never a mix of two.
+
+    The pair rule ("one of the two requests in play, never the model of one
+    beside the provider of another") extended to the verdict: a request and the
+    verdict reached about it are one record, so ``result`` must equal one of the
+    whole records the writer had to choose between — pair and flag together.
+
+    Completing a half is not an exception: a half may only be taken from a
+    snapshot that agrees with the row about the half they share, so every legal
+    completion equals the snapshot's own pair. And splicing is not a harmless
+    approximation in either direction — a flag from record A over pair B cries
+    wolf about a request that was honored, while a pair from B over a flag
+    belonging to A drops the provider of the request that really was abandoned.
+    """
+    assert result in candidates, (
+        f"{result} is not one of the whole records in play: {candidates}"
     )
 
 
+@pytest.mark.parametrize("flag", _ROW_FLAGS, ids=["unflagged", "flagged"])
 @pytest.mark.parametrize(
     "state,row,snapshot,expected",
     _AUDIT_PAIR_TABLE,
@@ -376,16 +418,22 @@ def _assert_one_whole_request(result, row, snapshot):
         for s, _row, snap, _exp in _AUDIT_PAIR_TABLE
     ],
 )
-def test_upsert_audit_pair_table(db, state, row, snapshot, expected):
-    """``create_session``'s ON CONFLICT upsert, over the whole state machine."""
-    db.create_session(
-        "s_tbl", source="cli", model="glm-5.2",
-        requested_model=row[0], requested_provider=row[1],
-    )
-    assert (
-        db.get_session("s_tbl")["requested_model"],
-        db.get_session("s_tbl")["requested_provider"],
-    ) == row, f"could not set up the {state} row state"
+def test_upsert_audit_pair_table(db, state, row, snapshot, expected, flag):
+    """``create_session``'s ON CONFLICT upsert, over the whole state machine.
+
+    The flag axis splits every case in two. ``create_session``'s snapshot is a
+    process START — a request that has not been answered yet, let alone
+    abandoned — so this writer may never move a raised verdict:
+
+    * flag DOWN: no verdict to contradict, the ordinary pair gate applies, and
+      an adopted snapshot arrives with the only verdict a just-made request can
+      carry, ``0``. This writer never touches the flag, so that is automatic.
+    * flag UP: the stored pair is what the verdict is ABOUT, so it is frozen
+      whole. Freezing loses nothing — should this snapshot's own request also be
+      abandoned, ``record_session_fallback`` restates pair and flag together at
+      the moment the new pair becomes a true statement.
+    """
+    _setup_row(db, "s_tbl", row, flag)
 
     # The next process's first turn, carrying its own start-of-run snapshot.
     db.create_session(
@@ -393,11 +441,20 @@ def test_upsert_audit_pair_table(db, state, row, snapshot, expected):
         requested_model=snapshot[0], requested_provider=snapshot[1],
     )
     stored = db.get_session("s_tbl")
-    result = (stored["requested_model"], stored["requested_provider"])
-    assert result == expected
-    _assert_one_whole_request(result, row, snapshot)
+    result = (
+        stored["requested_model"],
+        stored["requested_provider"],
+        stored["fallback_activated"],
+    )
+    assert result == (
+        (row[0], row[1], 1) if flag else (expected[0], expected[1], 0)
+    )
+    # The verdict is never invented and never discarded by this writer: it may
+    # keep the row's whole record, or take a snapshot's pair with the flag down.
+    _assert_one_whole_request(result, (row[0], row[1], flag), (*snapshot, 0))
 
 
+@pytest.mark.parametrize("flag", _ROW_FLAGS, ids=["unflagged", "flagged"])
 @pytest.mark.parametrize(
     "state,row,snapshot,expected",
     _AUDIT_PAIR_TABLE,
@@ -406,26 +463,40 @@ def test_upsert_audit_pair_table(db, state, row, snapshot, expected):
         for s, _row, snap, _exp in _AUDIT_PAIR_TABLE
     ],
 )
-def test_fallback_backfill_audit_pair_table(db, state, row, snapshot, expected):
+def test_fallback_backfill_audit_pair_table(db, state, row, snapshot, expected, flag):
     """``record_session_fallback``'s backfill, over the whole state machine.
 
-    Same expectations as the upsert: both writers carry a process-start
-    snapshot into a row they did not write, so they answer to one gate.
+    Same pair expectations as the upsert — both writers carry a process-start
+    snapshot into a row they did not write, so they answer to one gate — but
+    deliberately NO flag guard, and the incoming flag changes nothing. This
+    writer's call site is ``try_activate_fallback`` swapping away from the live
+    route, so it is the one writer that may move pair and raised flag together:
+    whichever pair an arm takes, that pair is being abandoned as we write, and
+    the ``= 1`` in the same statement is the verdict on it. Superseding an
+    already-flagged pair swaps one truthfully flagged request for another, which
+    is the best a single-pair row can do; the arms that keep a recorded model
+    already cover the case where the live route is not this snapshot.
     """
-    db.create_session(
-        "s_tbl", source="cli", model="glm-5.2",
-        requested_model=row[0], requested_provider=row[1],
-    )
+    _setup_row(db, "s_tbl", row, flag)
     db.record_session_fallback(
         "s_tbl", requested_model=snapshot[0], requested_provider=snapshot[1],
     )
     stored = db.get_session("s_tbl")
-    result = (stored["requested_model"], stored["requested_provider"])
-    assert result == expected
-    _assert_one_whole_request(result, row, snapshot)
+    result = (
+        stored["requested_model"],
+        stored["requested_provider"],
+        stored["fallback_activated"],
+    )
+    assert result == (expected[0], expected[1], 1), (
+        "the incoming flag must not change the backfill's pair gate"
+    )
     assert stored["fallback_activated"] == 1, "the flag is the point of the call"
+    # Either request may end up stored, but the verdict this call asserts
+    # applies to whichever one does.
+    _assert_one_whole_request(result, (row[0], row[1], 1), (*snapshot, 1))
 
 
+@pytest.mark.parametrize("flag", _ROW_FLAGS, ids=["unflagged", "flagged"])
 @pytest.mark.parametrize(
     "state,row",
     [(state, row) for state, row, _snap, _exp in _AUDIT_PAIR_TABLE],
@@ -437,29 +508,32 @@ def test_fallback_backfill_audit_pair_table(db, state, row, snapshot, expected):
 @pytest.mark.parametrize(
     "switch", [("glm-5.4", "minimax"), ("glm-5.4", None), ("", "minimax")]
 )
-def test_update_session_model_audit_pair_table(db, state, row, switch):
-    """``update_session_model``: the third writer, from all four row states.
+def test_update_session_model_audit_pair_table(db, state, row, switch, flag):
+    """``update_session_model``: the third writer, from all eight row states.
 
-    A /model switch is a new explicit request, so it writes both halves from
-    THIS call — which makes it coherent from every prior state by construction,
-    including the provider-only one. Nothing is coalesced in, so nothing can be
-    mixed in. The empty-model case pins the ``or None`` normalization: '' and
-    None both mean "no model requested" and must be stored identically, or the
-    NULL gates in the other two writers would read '' as a recorded name.
+    A /model switch is a new explicit request, so it writes all THREE columns
+    from THIS call — which makes it coherent from every prior state by
+    construction, including the provider-only one and including either incoming
+    flag. Nothing is coalesced in, so nothing can be mixed in. Clearing the flag
+    is legitimate here precisely because the request it judged is being
+    discarded in the same statement; the upsert, which discards nothing, must
+    freeze a flagged pair instead. The empty-model case pins the ``or None``
+    normalization: '' and None both mean "no model requested" and must be stored
+    identically, or the NULL gates in the other two writers would read '' as a
+    recorded name.
     """
-    db.create_session(
-        "s_tbl", source="cli", model="glm-5.2",
-        requested_model=row[0], requested_provider=row[1],
-    )
-    db.record_session_fallback("s_tbl")
+    _setup_row(db, "s_tbl", row, flag)
     db.update_session_model("s_tbl", switch[0], provider=switch[1])
 
     stored = db.get_session("s_tbl")
-    assert (stored["requested_model"], stored["requested_provider"]) == (
-        switch[0] or None,
-        switch[1],
+    result = (
+        stored["requested_model"],
+        stored["requested_provider"],
+        stored["fallback_activated"],
     )
-    assert stored["fallback_activated"] == 0
+    assert result == (switch[0] or None, switch[1], 0)
+    # This writer has exactly one legal outcome: its own request, unjudged.
+    _assert_one_whole_request(result, (switch[0] or None, switch[1], 0))
 
 
 def test_audit_columns_are_declared_so_existing_dbs_reconcile(tmp_path):
@@ -974,3 +1048,231 @@ def test_fallback_backfill_alone_cannot_mispair_a_provider_only_row(db):
     assert row["fallback_activated"] == 1
     assert row["requested_model"] == "glm-5.4"
     assert row["requested_provider"] == "minimax"
+
+
+# ---------------------------------------------------------------------------
+# The flag is part of the record: a raised flag is a verdict ON the stored pair
+# ---------------------------------------------------------------------------
+
+def _provider_only_flagged_then_honored_run(db, *, account_the_abandoned_route):
+    """Set up the two-process history both flag tests share.
+
+    P1 = ``hermes --provider vllm`` with no ``model.default``: a provider-only
+    row is written before the first API call, that model-less request is
+    abandoned by ``try_activate_fallback`` (flag up), and the fallback route
+    either does or does not manage to bill a turn.
+
+    P2 = ``hermes -c -m glm-5.4 --provider minimax`` on the same session id,
+    honored end to end: its own request is what serves and bills.
+    """
+    db.create_session(
+        "s_flagged", source="cli", model="",
+        requested_model=None, requested_provider="vllm",
+    )
+    db.record_session_fallback(
+        "s_flagged", requested_model=None, requested_provider="vllm",
+    )
+    flagged = db.get_session("s_flagged")
+    assert (
+        flagged["requested_model"],
+        flagged["requested_provider"],
+        flagged["fallback_activated"],
+    ) == (None, "vllm", 1), "P1 must leave a flagged provider-only row"
+
+    if account_the_abandoned_route:
+        db.update_token_counts(
+            "s_flagged", input_tokens=10, output_tokens=5,
+            model="grok-4", billing_provider="xai", api_call_count=1,
+        )
+        db.flush_token_counts()
+
+    # P2's first turn re-runs create_session with its own start-of-run snapshot.
+    db.create_session(
+        "s_flagged", source="cli", model="glm-5.4",
+        requested_model="glm-5.4", requested_provider="minimax",
+    )
+    db.update_token_counts(
+        "s_flagged", input_tokens=10, output_tokens=5,
+        model="glm-5.4", billing_provider="minimax", api_call_count=1,
+    )
+    db.flush_token_counts()
+
+    rows = [s for s in db.list_sessions_rich(limit=10) if s["id"] == "s_flagged"]
+    assert rows, "the flagged session must be listable"
+    return rows
+
+
+def test_flagged_row_does_not_cry_wolf_about_a_request_that_was_honored(db, capsys):
+    """A raised flag may not be handed to a request nobody abandoned.
+
+    The upsert learned (round 3) to let a snapshot's whole pair supersede a
+    provider-only row's request — correct while the row carries no verdict, but
+    that row is exactly the shape ``hermes --provider vllm`` leaves behind when
+    its model-less request is the one that got abandoned, and the proof sits in
+    the same row: ``fallback_activated = 1``. Superseding the pair without
+    reading the flag left P1's verdict standing over P2's request, and
+    `hermes sessions list` printed
+
+        s1  requested glm-5.4 (minimax) → served glm-5.4 (minimax)
+
+    announcing that a session "ran a model other than the one requested" about
+    a request whose requested and served routes are character-for-character
+    identical — the wolf-cry the sticky flag exists to prevent. It also erased
+    ``vllm``, the provider of the request that actually WAS abandoned, from the
+    row and from the output; before round 3 it was at least still printed.
+    """
+    from hermes_cli import sessions_cmd
+
+    rows = _provider_only_flagged_then_honored_run(
+        db, account_the_abandoned_route=False
+    )
+    assert (
+        rows[0]["requested_model"],
+        rows[0]["requested_provider"],
+        rows[0]["fallback_activated"],
+    ) == (None, "vllm", 1), (
+        "the flag is a verdict on P1's request, so P1's request must stay"
+    )
+
+    sessions_cmd._print_fallback_warnings(rows)
+    out = capsys.readouterr().out
+    # The truth: the vllm request that named no model was abandoned, and the
+    # session went on to run glm-5.4 via minimax.
+    assert "requested vllm → served glm-5.4 (minimax)" in out
+    assert "requested glm-5.4 (minimax) → served glm-5.4 (minimax)" not in out
+
+
+def test_flagged_row_keeps_the_provider_of_the_request_that_was_abandoned(db, capsys):
+    """Same history, but the abandoned route billed a turn before P2 arrived.
+
+    The wolf-cry above needs the served columns to coincide with P2's request;
+    with P1's fallback route accounted, the served half is grok-4 via xai and
+    the printed line stopped looking self-contradictory while saying something
+    worse: ``requested glm-5.4 (minimax) → served grok-4 (xai)`` asserts that
+    P2's request — honored end to end — was not honored. The flag belongs to
+    P1's vllm request, and so must the requested half.
+    """
+    from hermes_cli import sessions_cmd
+
+    rows = _provider_only_flagged_then_honored_run(
+        db, account_the_abandoned_route=True
+    )
+    assert (
+        rows[0]["requested_model"],
+        rows[0]["requested_provider"],
+        rows[0]["fallback_activated"],
+    ) == (None, "vllm", 1)
+
+    sessions_cmd._print_fallback_warnings(rows)
+    out = capsys.readouterr().out
+    assert "requested vllm → served grok-4 (xai)" in out
+    assert "requested glm-5.4 (minimax)" not in out
+
+
+def test_the_guard_does_not_silence_the_next_requests_own_fallback(db, capsys):
+    """Freezing a flagged pair against snapshots must not hide a real fallback.
+
+    The guard above refuses ``create_session``'s snapshot because a process
+    START is a request that has not been answered yet, let alone abandoned. If
+    that request IS later abandoned, the writer whose call site asserts the
+    abandonment — ``record_session_fallback`` — restates the pair and the flag
+    together, so the warning still names P2's route, provider included. The
+    verdict and the request it judges always move as one record.
+    """
+    from hermes_cli import sessions_cmd
+
+    db.create_session(
+        "s_two_falls", source="cli", model="",
+        requested_model=None, requested_provider="vllm",
+    )
+    db.record_session_fallback(
+        "s_two_falls", requested_model=None, requested_provider="vllm",
+    )
+    db.create_session(
+        "s_two_falls", source="cli", model="glm-5.4",
+        requested_model="glm-5.4", requested_provider="minimax",
+    )
+    # P2's own request is not honored either: it falls back to grok-4 via xai.
+    db.update_token_counts(
+        "s_two_falls", input_tokens=10, output_tokens=5,
+        model="grok-4", billing_provider="xai", api_call_count=1,
+    )
+    db.flush_token_counts()
+    db.record_session_fallback(
+        "s_two_falls", requested_model="glm-5.4", requested_provider="minimax",
+    )
+
+    rows = [s for s in db.list_sessions_rich(limit=10) if s["id"] == "s_two_falls"]
+    assert (
+        rows[0]["requested_model"],
+        rows[0]["requested_provider"],
+        rows[0]["fallback_activated"],
+    ) == ("glm-5.4", "minimax", 1)
+    sessions_cmd._print_fallback_warnings(rows)
+    assert (
+        "requested glm-5.4 (minimax) → served grok-4 (xai)"
+        in capsys.readouterr().out
+    )
+
+
+def test_the_guard_does_not_drop_the_provider_from_a_reasserted_request(db):
+    """The round-2 completion still reaches the warning, via the right writer.
+
+    A flagged ``model only`` row plus a snapshot naming that very model is the
+    case round 2 added the completion arm for: dropping the provider would print
+    ``requested glm-5.3 → served ...`` for a session that genuinely re-requested
+    glm-5.3 through a known provider. The upsert now declines it — the stored
+    verdict is about the provider-less request the row records — but the
+    fallback backfill supplies it the moment the re-request is itself abandoned,
+    which is the only moment at which the completed pair is a true statement.
+    """
+    db.create_session(
+        "s_complete", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider=None,
+    )
+    db.record_session_fallback("s_complete")  # flag only, pair untouched
+
+    # Next process's first turn re-requests glm-5.3, this time naming zai.
+    db.create_session(
+        "s_complete", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    frozen = db.get_session("s_complete")
+    assert frozen["requested_provider"] is None, (
+        "while the flag is up, the verdict's own request may not be re-labelled"
+    )
+
+    # ...and that re-request is abandoned too, so the pair is restated whole.
+    db.record_session_fallback(
+        "s_complete", requested_model="glm-5.3", requested_provider="zai",
+    )
+    row = db.get_session("s_complete")
+    assert row["requested_model"] == "glm-5.3"
+    assert row["requested_provider"] == "zai"
+    assert row["fallback_activated"] == 1
+
+
+def test_a_bare_record_session_fallback_raises_only_the_flag(db):
+    """The flag-only setup the table tests rely on must really be flag-only.
+
+    ``record_session_fallback(sid)`` with no snapshot is how a caller with no
+    request knowledge flags a row (and how ``_record_fallback_on_session``
+    behaves when the origin snapshot is empty). It must leave the pair exactly
+    as it stands from every row state — otherwise the flagged rows in the table
+    below would not be the row states they claim to be.
+    """
+    for name, pair in (
+        ("neither", (None, None)),
+        ("model only", ("gpt-5.4", None)),
+        ("provider only", (None, "vllm")),
+        ("both", ("gpt-5.4", "vllm")),
+    ):
+        sid = f"s_bare_{name.replace(' ', '_')}"
+        db.create_session(
+            sid, source="cli", model="glm-5.2",
+            requested_model=pair[0], requested_provider=pair[1],
+        )
+        db.record_session_fallback(sid)
+        row = db.get_session(sid)
+        assert (row["requested_model"], row["requested_provider"]) == pair, name
+        assert row["fallback_activated"] == 1, name
