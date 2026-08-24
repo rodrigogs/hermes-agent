@@ -238,6 +238,85 @@ def test_switch_audit_and_resume_route_have_separate_provider_semantics(db):
     assert row["fallback_activated"] == 0
 
 
+def test_fallback_backfill_completes_the_provider_of_the_same_request(db):
+    """Backfilling the pair as a unit is not the same as refusing to backfill.
+
+    The rule is "one route, adopted whole" — so a snapshot naming the model the
+    row already records is not a foreign route, it is the SAME route with the
+    provider half known. Refusing it (because ``requested_model`` is merely
+    non-NULL) drops the provider from the loud warning for every resumed
+    session whose recorded model was genuinely re-requested via a real
+    provider: `requested glm-5.3 → served grok-4 (xai)` instead of
+    `requested glm-5.3 (zai) → ...`.
+    """
+    db.create_session(
+        "s_same", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    # Provider-less /model switch back to the same model: "no provider
+    # requested" is recorded, on purpose.
+    db.update_session_model("s_same", "glm-5.3")
+    assert db.get_session("s_same")["requested_provider"] is None
+
+    # A later process re-requests that very model, this time knowing the
+    # provider; the fallback snapshot may complete the pair it already names.
+    db.record_session_fallback(
+        "s_same", requested_model="glm-5.3", requested_provider="zai",
+    )
+    row = db.get_session("s_same")
+    assert row["fallback_activated"] == 1
+    assert row["requested_model"] == "glm-5.3"
+    assert row["requested_provider"] == "zai"
+
+
+def test_session_upsert_adopts_the_request_pair_only_as_a_unit(db):
+    """``create_session``'s upsert is the third writer of the audit pair.
+
+    Every process's first turn re-runs ``create_session`` for an existing
+    session id — that is what the ``ON CONFLICT`` upsert is for — carrying THAT
+    process's immutable start-of-run snapshot. COALESCE-ing the two halves
+    independently lets the snapshot's provider land beside a model some earlier
+    ``/model`` switch requested, describing a route nobody ever asked for.
+    """
+    # Row already records a provider-less request (a `/model` switch, or an
+    # ad-hoc --base-url endpoint whose provider key cannot be recovered).
+    db.create_session(
+        "s_upsert", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    db.update_session_model("s_upsert", "gpt-5.4")
+
+    # A later process's first turn, whose own request differs.
+    db.create_session(
+        "s_upsert", source="cli", model="glm-5.4",
+        requested_model="glm-5.4", requested_provider="minimax",
+    )
+    row = db.get_session("s_upsert")
+    assert row["requested_model"] == "gpt-5.4"
+    assert row["requested_provider"] is None, (
+        "the upsert must not pair a foreign provider with the recorded model"
+    )
+
+    # A row with NEITHER half still adopts the snapshot's whole pair.
+    db.create_session("s_bare", source="cli", model="glm-5.2")
+    db.create_session(
+        "s_bare", source="cli", model="glm-5.2",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    bare = db.get_session("s_bare")
+    assert bare["requested_model"] == "glm-5.3"
+    assert bare["requested_provider"] == "zai"
+
+    # A row with BOTH halves is never rewritten by a later snapshot.
+    db.create_session(
+        "s_bare", source="cli", model="glm-5.2",
+        requested_model="gpt-5.4", requested_provider="minimax",
+    )
+    kept = db.get_session("s_bare")
+    assert kept["requested_model"] == "glm-5.3"
+    assert kept["requested_provider"] == "zai"
+
+
 def test_audit_columns_are_declared_so_existing_dbs_reconcile(tmp_path):
     """The columns are declarative: an older DB gains them on next open."""
     import sqlite3
@@ -611,3 +690,58 @@ def test_sessions_list_warns_off_real_listing_rows(db, capsys):
     assert rows[0]["requested_provider"] is None
     sessions_cmd._print_fallback_warnings(rows)
     assert capsys.readouterr().out == ""
+
+
+def test_next_process_first_turn_cannot_make_the_warning_lie(db, capsys):
+    """The printed warning must never name a route nobody asked for.
+
+    Walks the three writes a real session takes, off a real DB, the real
+    listing SELECT and the real printer:
+
+    1. request glm-5.3 via zai, then a provider-less ``/model gpt-5.4`` —
+       the audit pair becomes ``gpt-5.4`` / NULL ("no provider requested").
+    2. the served route (grok-4 via xai) is accounted and the fallback flag is
+       raised, carrying the process's original glm-5.3/zai snapshot.
+    3. the NEXT process's first turn re-runs ``create_session`` for the same id
+       with its own snapshot (``hermes --resume -m glm-5.4 --provider
+       minimax`` skips the model restore, so the snapshot need not match the
+       row).
+
+    The upsert used to complete the pair's provider half from step 3's
+    snapshot, and `hermes sessions list` printed
+    ``requested gpt-5.4 (minimax) → served grok-4 (xai)``. Nobody ever
+    requested gpt-5.4 via minimax.
+    """
+    from hermes_cli import sessions_cmd
+
+    db.create_session(
+        "s_third_writer", source="cli", model="glm-5.3",
+        requested_model="glm-5.3", requested_provider="zai",
+    )
+    db.update_session_model("s_third_writer", "gpt-5.4")
+
+    db.update_token_counts(
+        "s_third_writer", input_tokens=10, output_tokens=5,
+        model="grok-4", billing_provider="xai", api_call_count=1,
+    )
+    db.flush_token_counts()
+    db.record_session_fallback(
+        "s_third_writer", requested_model="glm-5.3", requested_provider="zai",
+    )
+
+    db.create_session(
+        "s_third_writer", source="cli", model="glm-5.4",
+        requested_model="glm-5.4", requested_provider="minimax",
+    )
+
+    rows = [
+        s for s in db.list_sessions_rich(limit=10) if s["id"] == "s_third_writer"
+    ]
+    assert rows, "the flagged session must be listable"
+    assert rows[0]["requested_model"] == "gpt-5.4"
+    assert rows[0]["requested_provider"] is None
+
+    sessions_cmd._print_fallback_warnings(rows)
+    out = capsys.readouterr().out
+    assert "requested gpt-5.4 → served grok-4 (xai)" in out
+    assert "minimax" not in out

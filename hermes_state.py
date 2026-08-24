@@ -5105,6 +5105,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the request beside the delivery is what makes a silent fallback
         (requested model X, served model Y, no warning) visible after the fact.
 
+        THE AUDIT-PAIR INVARIANT (canonical statement; the three writers of
+        these columns — this upsert, ``record_session_fallback`` and
+        ``update_session_model`` — all obey it):
+
+            ``requested_model`` and ``requested_provider`` are not two columns,
+            they are one route. Every write must leave them describing a route
+            that some caller actually asked for. So a writer may only fill the
+            provider half from a snapshot that names the model half the row
+            already records (or fill both halves at once, when the row records
+            no request at all) — never combine the model of one request with
+            the provider of another.
+
+        ``COALESCE``-ing the two halves independently breaks that. This upsert
+        runs on the FIRST TURN OF EVERY PROCESS for an existing session id
+        (that is what the ``ON CONFLICT`` is for) with that process's immutable
+        start-of-run snapshot, while ``requested_model`` may meanwhile have been
+        rewritten by a mid-session ``/model`` switch — whose provider-less form
+        deliberately stores NULL, i.e. "no provider requested", an answer and
+        not a gap to patch. Independent halves therefore printed
+        ``requested <switched model> (<snapshot provider>) → served ...`` in
+        ``hermes sessions list``: a route nobody ever asked for, which is the
+        one report these columns exist to rule out.
+
         ``chat_id``/``thread_id`` record the messaging origin (the chat/room and
         thread the session was started in) so that gateway ``/resume`` can prove
         a persisted, now-inactive row belongs to the caller's chat/thread before
@@ -5141,12 +5164,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
+                       -- Audit-pair invariant (see docstring): the request is
+                       -- adopted from this snapshot as a WHOLE route. The
+                       -- provider half is only taken when the row records no
+                       -- request at all, or records the very model this
+                       -- snapshot names; a row whose requested_model came from
+                       -- somewhere else keeps its own provider (NULL included).
                        requested_model = COALESCE(
                            sessions.requested_model, excluded.requested_model
                        ),
-                       requested_provider = COALESCE(
-                           sessions.requested_provider, excluded.requested_provider
-                       ),
+                       requested_provider = CASE
+                           WHEN sessions.requested_model IS NULL
+                                OR sessions.requested_model
+                                   = excluded.requested_model
+                           THEN COALESCE(
+                               sessions.requested_provider,
+                               excluded.requested_provider
+                           )
+                           ELSE sessions.requested_provider
+                       END,
                        model_config = CASE
                            WHEN excluded.model_config IS NOT NULL
                                 AND json_type(
@@ -7465,13 +7501,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         creation raced the first API call). Existing values win — the original
         request must never be rewritten by a later observation.
 
-        The backfill is pair-atomic: the caller's snapshot describes ONE route,
-        so it only lands on a row that records no request at all. Filling the
-        provider half alone would pair it with whatever model a mid-session
-        ``/model`` switch has since requested — a route nobody asked for, which
-        is precisely what these columns exist to rule out. A provider-less
-        switch deliberately stores NULL ("no provider requested"), and that is
-        an answer, not a gap to be patched.
+        The backfill obeys the audit-pair invariant stated in
+        ``_insert_session_row``: the caller's snapshot describes ONE route, so
+        it may fill both halves of a row that records no request at all, or
+        complete the provider of a row that records the very model the snapshot
+        names — but never donate its provider to some other model. Filling the
+        provider half unconditionally would pair it with whatever model a
+        mid-session ``/model`` switch has since requested (a provider-less
+        switch deliberately stores NULL, "no provider requested" — an answer,
+        not a gap to be patched), producing a route nobody asked for. Refusing
+        it whenever ``requested_model`` is merely non-NULL is the opposite
+        mistake: it would drop the provider from the loud warning for every
+        resumed session that genuinely re-requested the recorded model through a
+        known provider.
 
         Best-effort and idempotent: a fallback swap is a recovery path and must
         not be aborted by a bookkeeping write.
@@ -7485,14 +7527,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE sessions
                       SET fallback_activated = 1,
-                          requested_model = COALESCE(requested_model, ?),
+                          requested_model = COALESCE(requested_model, :model),
                           requested_provider = CASE
                               WHEN requested_model IS NULL
-                                  THEN COALESCE(requested_provider, ?)
+                                   OR requested_model = :model
+                                  THEN COALESCE(requested_provider, :provider)
                               ELSE requested_provider
                           END
-                    WHERE id = ?""",
-                (requested_model or None, requested_provider or None, session_id),
+                    WHERE id = :session_id""",
+                {
+                    "model": requested_model or None,
+                    "provider": requested_provider or None,
+                    "session_id": session_id,
+                },
             )
 
         self._execute_write(_do)
@@ -7529,8 +7576,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         previous request's provider beside the newly requested model would
         make the pair describe a route nobody ever asked for (requested model
         Y via the provider of abandoned request X), which is exactly what the
-        columns exist to rule out. Callers that know the provider they are
-        switching to must therefore pass it — every /model path does.
+        columns exist to rule out — see the audit-pair invariant stated in
+        ``_insert_session_row``, which every writer of these two columns obeys.
+        Callers that know the provider they are switching to must therefore
+        pass it — every /model path does.
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
