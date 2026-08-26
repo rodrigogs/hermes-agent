@@ -446,6 +446,7 @@ def get_nous_subscription_features(
     # Per-capability overrides: if set, they determine which backend is active for
     # search/extract independently of web.backend.
     web_search_backend = str(web_cfg.get("search_backend") or "").strip().lower()
+    web_extract_backend = str(web_cfg.get("extract_backend") or "").strip().lower()
     tts_provider = str(tts_cfg.get("provider") or "edge").strip().lower()
     # STT default is "local" (faster-whisper) per DEFAULT_CONFIG, which
     # requires `pip install faster-whisper`. For Nous subscribers we'd
@@ -505,6 +506,9 @@ def get_nous_subscription_features(
     direct_firecrawl = bool(get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL"))
     direct_parallel = bool(get_env_value("PARALLEL_API_KEY"))
     direct_tavily = bool(get_env_value("TAVILY_API_KEY"))
+    # Keyless Tavily is opt-in: selecting it in `hermes tools` / setup writes
+    # web.backend (or a per-capability override) without requiring a key.
+    tavily_selected = "tavily" in {web_backend, web_search_backend, web_extract_backend}
     direct_searxng = bool(get_env_value("SEARXNG_URL"))
     direct_fal = fal_key_is_configured()
     direct_fal_video = direct_fal  # same FAL_KEY; separate var so use_gateway is independent
@@ -537,6 +541,7 @@ def get_nous_subscription_features(
         direct_exa = False
         direct_parallel = False
         direct_tavily = False
+        tavily_selected = False
     if image_use_gateway:
         direct_fal = False
     if video_use_gateway:
@@ -624,6 +629,8 @@ def get_nous_subscription_features(
         # different browser choice wins over the env var.
         direct_camofox = False
 
+
+    tavily_ready = direct_tavily or tavily_selected
     web_managed = web_backend == "firecrawl" and managed_web_available and not direct_firecrawl
     web_active = bool(
         web_tool_enabled
@@ -632,7 +639,7 @@ def get_nous_subscription_features(
             or (web_backend == "exa" and direct_exa)
             or (web_backend == "firecrawl" and direct_firecrawl)
             or (web_backend == "parallel" and direct_parallel)
-            or (web_backend == "tavily" and direct_tavily)
+            or (web_backend == "tavily" and tavily_ready)
             or (web_backend == "searxng" and direct_searxng)
             # Per-capability overrides: search_backend or extract_backend may be set
             # without web.backend (using the new split config from #20061)
@@ -640,11 +647,17 @@ def get_nous_subscription_features(
             or (web_search_backend == "exa" and direct_exa)
             or (web_search_backend == "firecrawl" and direct_firecrawl)
             or (web_search_backend == "parallel" and direct_parallel)
-            or (web_search_backend == "tavily" and direct_tavily)
+            or (web_search_backend == "tavily" and tavily_ready)
+            or (web_extract_backend == "tavily" and tavily_ready)
         )
     )
     web_available = bool(
-        managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily or direct_searxng
+        managed_web_available
+        or direct_exa
+        or direct_firecrawl
+        or direct_parallel
+        or tavily_ready
+        or direct_searxng
     )
 
     image_managed = image_tool_enabled and managed_image_available and not direct_fal
@@ -754,8 +767,8 @@ def get_nous_subscription_features(
             managed_by_nous=web_managed,
             direct_override=web_active and not web_managed,
             toolset_enabled=web_tool_enabled,
-            current_provider=web_backend or web_search_backend or "",
-            explicit_configured=bool(web_backend or web_search_backend),
+            current_provider=web_backend or web_search_backend or web_extract_backend or "",
+            explicit_configured=bool(web_backend or web_search_backend or web_extract_backend),
         ),
         "image_gen": NousFeatureState(
             key="image_gen",
@@ -987,6 +1000,11 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
             or get_env_value("PARALLEL_API_KEY")
             or get_env_value("TAVILY_API_KEY")
             or get_env_value("EXA_API_KEY")
+            # Env-configured keyless local backend: a reachable self-hosted
+            # SearXNG is a working web setup even with no stored selection
+            # (the autodetect cascade in tools/web_tools.py picks it up), so
+            # it must not be classified "unconfigured" and pre-checked (#92647).
+            or get_env_value("SEARXNG_URL")
         ),
         "image_gen": fal_direct,
         "video_gen": fal_direct,
@@ -1006,31 +1024,54 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
         "browser": bool(
             get_env_value("BROWSER_USE_API_KEY")
             or (get_env_value("BROWSERBASE_API_KEY") and get_env_value("BROWSERBASE_PROJECT_ID"))
+            # Env-configured keyless local backend: CAMOFOX_URL activates the
+            # Camofox browser via never-configured autodetect (see
+            # _resolve_browser_state above), so it counts as configured even
+            # with no stored cloud_provider selection (#92647).
+            or get_env_value("CAMOFOX_URL")
         ),
     }
 
 
 _GATEWAY_DIRECT_LABELS = {
-    "web": "Firecrawl/Exa/Parallel/Tavily key",
+    "web": "Firecrawl/Exa/Parallel/Tavily key or SearXNG",
     "image_gen": "FAL key",
     "video_gen": "FAL key",
     "tts": "OpenAI/ElevenLabs key",
     "stt": "OpenAI/Groq/Mistral key",
-    "browser": "Browser Use/Browserbase key",
+    "browser": "Browser Use/Browserbase key or Camofox",
 }
 
 _ALL_GATEWAY_KEYS = ("web", "image_gen", "video_gen", "tts", "stt", "browser")
+
+# Config section + selection field for each gateway key, matching the
+# field names ``apply_gateway_defaults`` writes and
+# ``get_nous_subscription_features`` reads (web uses "backend", browser
+# uses "cloud_provider", everything else uses "provider").
+_GATEWAY_SECTION_FIELDS = {
+    "web": ("web", "backend"),
+    "image_gen": ("image_gen", "provider"),
+    "video_gen": ("video_gen", "provider"),
+    "tts": ("tts", "provider"),
+    "stt": ("stt", "provider"),
+    "browser": ("browser", "cloud_provider"),
+}
 
 
 def get_gateway_eligible_tools(
     config: Optional[Dict[str, object]] = None,
     *,
     force_fresh: bool = False,
-) -> tuple[list[str], list[str], list[str]]:
-    """Return (unconfigured, has_direct, already_managed) tool key lists.
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Return (unconfigured, has_direct, explicit_configured, already_managed)
+    tool key lists.
 
-    - unconfigured: tools with no direct credentials (easy switch)
+    - unconfigured: tools with no direct credentials and no explicit
+      non-nous selection (easy switch, safe to pre-check)
     - has_direct: tools where the user has their own API keys
+    - explicit_configured: tools with an explicit non-nous selection stored
+      (e.g. ``web.backend: searxng``), including keyless backends that would
+      otherwise look unconfigured
     - already_managed: tools already routed through the gateway
 
     All lists are empty when the user is not a paid Nous subscriber or
@@ -1042,9 +1083,9 @@ def get_gateway_eligible_tools(
     try:
         account_info = get_nous_portal_account_info(force_fresh=force_fresh)
     except Exception:
-        return [], [], []
+        return [], [], [], []
     if not (account_info and account_info.logged_in and account_info.tool_gateway_entitled):
-        return [], [], []
+        return [], [], [], []
 
     if config is None:
         config = load_config() or {}
@@ -1052,7 +1093,7 @@ def get_gateway_eligible_tools(
     # Quick provider check without the heavy get_nous_subscription_features call
     model_cfg = config.get("model")
     if not isinstance(model_cfg, dict) or str(model_cfg.get("provider") or "").strip().lower() != "nous":
-        return [], [], []
+        return [], [], [], []
 
     direct = _get_gateway_direct_credentials()
 
@@ -1071,6 +1112,7 @@ def get_gateway_eligible_tools(
 
     unconfigured: list[str] = []
     has_direct: list[str] = []
+    explicit_configured: list[str] = []
     already_managed: list[str] = []
     for key in _ALL_GATEWAY_KEYS:
         # Only offer tools the user's entitlement actually covers. For a free
@@ -1080,13 +1122,20 @@ def get_gateway_eligible_tools(
             MANAGED_FEATURE_COVERAGE_CATEGORY[key]
         ):
             continue
+        section_key, field = _GATEWAY_SECTION_FIELDS[key]
+        selected = _selected_provider(config.get(section_key), field)
         if opted_in.get(key):
             already_managed.append(key)
+        elif selected is not None and selected != "nous":
+            # An explicit non-nous selection (e.g. a keyless local backend
+            # like SearXNG or Camofox) is configured on purpose, even
+            # though it has no direct credentials to detect.
+            explicit_configured.append(key)
         elif direct.get(key):
             has_direct.append(key)
         else:
             unconfigured.append(key)
-    return unconfigured, has_direct, already_managed
+    return unconfigured, has_direct, explicit_configured, already_managed
 
 
 def apply_gateway_defaults(
@@ -1180,7 +1229,10 @@ def prompt_enable_tool_gateway(
     Returns the set of tools that were enabled, or empty set if the user
     declined or no tools were eligible.
     """
-    unconfigured, has_direct, already_managed = get_gateway_eligible_tools(
+    # explicit_configured tools (e.g. an explicit `web.backend: searxng`) are
+    # configured on purpose and are never offered here — same treatment as
+    # already_managed, just for a non-nous vendor.
+    unconfigured, has_direct, _explicit_configured, already_managed = get_gateway_eligible_tools(
         config,
         force_fresh=force_fresh,
     )
@@ -1209,13 +1261,26 @@ def prompt_enable_tool_gateway(
     # Per-tool checklist: unconfigured tools first (pre-checked for new users),
     # then tools where the user already has their own key (left unchecked so we
     # don't override their own setup unless they ask).
+    #
+    # Decline persistence (#92647): tools the user has previously seen offered
+    # and left unchecked are recorded in ``tool_gateway_declined_tools`` and
+    # are never pre-checked again — the offer downgrades to opt-in-only.
+    # Acceptance used to be sticky while refusal was not, so the identical
+    # pre-checked checklist re-fired on every Nous model swap.
+    declined_raw = config.get("tool_gateway_declined_tools")
+    declined: set[str] = (
+        {str(k) for k in declined_raw} if isinstance(declined_raw, list) else set()
+    )
+
     offer_keys: list[str] = list(unconfigured) + list(has_direct)
     labels: list[str] = [_GATEWAY_TOOL_LABELS[k] for k in unconfigured]
     labels += [
         f"{_GATEWAY_TOOL_LABELS[k]} — keep using your {_GATEWAY_DIRECT_LABELS[k]}"
         for k in has_direct
     ]
-    pre_selected = list(range(len(unconfigured)))
+    pre_selected = [
+        i for i, k in enumerate(unconfigured) if k not in declined
+    ]
 
     if pool_only:
         title = "Your free Nous tool pool — pick the tools to enable:"
@@ -1231,11 +1296,28 @@ def prompt_enable_tool_gateway(
         return set()
 
     chosen_keys = [offer_keys[i] for i in chosen_idx if 0 <= i < len(offer_keys)]
+
+    # Persist per-tool declines: every unconfigured tool that was offered and
+    # NOT chosen was actively left (or unchecked) by the user — remember that
+    # so the next Nous model swap doesn't pre-check it again. Cancel paths
+    # (Ctrl-C/ESC above) return before this and record nothing. Choosing a
+    # previously-declined tool clears its decline.
+    newly_declined = [k for k in unconfigured if k not in chosen_keys and k not in declined]
+    undeclined = declined & set(chosen_keys)
+    if newly_declined or undeclined:
+        config["tool_gateway_declined_tools"] = sorted(
+            (declined | set(newly_declined)) - set(chosen_keys)
+        )
+
     if not chosen_keys:
+        if newly_declined:
+            from hermes_cli.config import save_config
+
+            save_config(config)
         return set()
 
     changed = apply_gateway_defaults(config, chosen_keys)
-    if changed:
+    if changed or newly_declined:
         from hermes_cli.config import save_config
 
         save_config(config)

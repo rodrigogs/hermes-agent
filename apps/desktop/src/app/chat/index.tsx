@@ -23,6 +23,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
@@ -32,6 +33,7 @@ import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
 import {
+  $connection,
   $contextSuggestions,
   $freshDraftReady,
   $gatewayState,
@@ -39,13 +41,14 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $sessions,
+  getSessionOwnerHint,
   resolveComposerSessionKey,
   sessionMatchesStoredId,
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
-import { sessionTileDelegate } from '@/store/session-states'
-import { $transcriptTailBySessionId } from '@/store/transcript-tail'
+import { $focusedStoredSessionId, sessionTileDelegate } from '@/store/session-states'
+import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
@@ -263,10 +266,23 @@ function ChatRuntimeBoundary({
   const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
 
   const storedId = useStore(view.$storedId)
+  const connection = useStore($connection)
+  const activeProfile = useStore($activeGatewayProfile)
   // Subscribed (not read imperatively) so the "Show earlier" affordance
   // appears/retires as tail hydrations and backfill pages record their state.
   const transcriptTailStates = useStore($transcriptTailBySessionId)
-  const restBackfillAvailable = Boolean(storedId && transcriptTailStates[storedId]?.possiblyTruncated)
+  const connectionId = connection?.connectionId || (connection?.mode === 'local' ? 'local' : '')
+
+  const ownerRoute = storedId
+    ? getSessionOwnerHint(storedId, connectionId ? { connectionId, profile: activeProfile } : undefined)
+    : undefined
+
+  const tailProfile = ownerRoute
+    ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
+    : undefined
+
+  const tailState = storedId && transcriptTailStates ? transcriptTailState(storedId, tailProfile) : undefined
+  const restBackfillAvailable = Boolean(tailState?.possiblyTruncated)
 
   const expandWindow = useCallback(() => {
     // The store window still holds older messages: growing pages is enough.
@@ -275,9 +291,15 @@ function ChatRuntimeBoundary({
     // PREPEND it to the session store before growing, so the grown window has
     // something older to show. Fire-and-forget: the prepend lands through the
     // session-state write path and re-renders this boundary.
-    if (!windowStateRef.current?.window.windowed && runtimeId && storedId && transcriptBackfillAvailable(storedId)) {
+    if (
+      !windowStateRef.current?.window.windowed &&
+      runtimeId &&
+      storedId &&
+      transcriptBackfillAvailable(storedId, tailProfile)
+    ) {
       void backfillOlderTranscriptPage({
         storedSessionId: storedId,
+        profile: tailProfile,
         // Stale-response guard: a session switch remounts/re-keys this view;
         // checking the live atoms (not captured props) discards a page that
         // resolves after the user moved on — same pattern as isCurrentResume.
@@ -293,7 +315,7 @@ function ChatRuntimeBoundary({
     }
 
     setWindowPages(pages => pages + 1)
-  }, [runtimeId, storedId, view])
+  }, [runtimeId, storedId, tailProfile, view])
 
   const olderAvailable = windowed || restBackfillAvailable
 
@@ -371,6 +393,13 @@ const ChatViewContent = memo(function ChatViewContent({
   const isPrimary = view.kind === 'primary'
   const activeSessionId = useStore(view.$runtimeId)
   const storedId = useStore(view.$storedId)
+  // Multi-pane dimming: only the focused surface paints at full strength, so
+  // two sessions side by side read as "this one, and that one over there".
+  // A selector, not a plain useStore — the focused id changes on click, and a
+  // boolean bails every other surface out of the re-render. Sole surface ⇒
+  // always focused (the atom falls back to the primary's selection), so a
+  // single-pane workspace never dims.
+  const surfaceFocused = useStoreSelector($focusedStoredSessionId, focused => focused === storedId)
   // Dock anchor for a session drop onto this surface: the workspace pane for the
   // primary, this tile's pane id for a tile. Read by the session-drop bridge.
   const sessionAnchor = isPrimary ? 'workspace' : `session-tile:${storedId ?? ''}`
@@ -575,6 +604,7 @@ const ChatViewContent = memo(function ChatViewContent({
         className
       )}
       data-chat-surface=""
+      data-chat-unfocused={surfaceFocused ? undefined : ''}
       data-composer-surface-id={composerSurfaceId}
       data-composer-target={composerScope.target}
       data-session-anchor={sessionAnchor}

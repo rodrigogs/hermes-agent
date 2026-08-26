@@ -217,6 +217,15 @@ Hermes run declares a public cua-driver **session name** (something like
 concurrent runs and subagents get distinct cursors. The MCP transport owns the
 private lifecycle session inside the runtime; the public name does not.
 
+The overlay cursor is cosmetic — captures, clicks, and typing all work
+without it. Hermes disables it automatically where it is a known failure
+mode: macOS (idle CPU burn), headless Linux / WSL2 / containers, and
+**Linux X11 desktops** (the overlay is a fullscreen always-on-top window
+that can get stuck over every workspace after an unclean session end,
+wedging desktop input). Linux Wayland and Windows keep the overlay. Set
+`computer_use.no_overlay: false` in `config.yaml` to force the cursor on
+(or `true` to force it off) on any platform.
+
 Tune the cursor with `cua-driver`'s CLI flags or the runtime
 `set_agent_cursor_style` MCP tool — see
 [cua.ai/docs/how-to-guides/driver/personalize-cursor](https://cua.ai/docs/how-to-guides/driver/personalize-cursor)
@@ -283,6 +292,34 @@ the model substitutes the platform's idiomatic shortcut and app name):
 
 During all of this, your cursor stays wherever you left it and the email
 app never comes to front.
+
+## Receiving the actual screenshot
+
+Screenshots taken during computer control are normally internal — they exist
+so the model can see the screen, and the agent replies in text. But every
+image capture also saves a bounded, shareable copy under Hermes' image cache
+and reports its path, so on attachment-capable surfaces (Telegram, Discord,
+Desktop, and other gateway platforms) you can simply ask:
+
+> *"Send me a screenshot of my screen."*
+
+and the agent delivers the real image as a native attachment, not just a
+description. On the CLI there is no attachment channel, so the agent gives
+you the saved file's path instead.
+
+Only the 20 most recent capture files are kept, and screenshots are never
+sent automatically — only when you ask for one.
+
+### Whole screen vs. desktop surface
+
+"Screenshot my screen" captures **everything currently displayed** — a
+composited grab of all visible windows, like pressing PrtScn. This image has
+no clickable elements, so to *act* on something in it the agent re-captures
+the specific app.
+
+Asking for the **desktop** instead targets the OS shell surface itself —
+wallpaper, desktop icons, taskbar — with its clickable elements, so requests
+like "open the Recycle Bin on my desktop" still work.
 
 ## Provider compatibility
 

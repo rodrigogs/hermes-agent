@@ -36,8 +36,10 @@ from agent.prompt_builder import (
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    USER_PROFILE_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
@@ -67,7 +69,7 @@ def _ra():
     """Lazy reference to the ``run_agent`` module.
 
     Helpers like ``load_soul_md``, ``build_environment_hints``,
-    ``build_context_files_prompt``, ``build_nous_subscription_prompt``,
+    ``build_context_files_prompt``,
     ``build_skills_system_prompt`` and ``get_toolset_for_tool`` are
     imported into ``run_agent``'s namespace.  Many tests
     ``patch("run_agent.load_soul_md", ...)``; if we imported them
@@ -390,8 +392,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # Pointer to the hermes-agent skill + docs for user questions about Hermes
+    # itself. When the session has no skill tools (Blank Slate with the skills
+    # toolset off), skill_view() would be a dangling reference — inject the
+    # docs-only variant instead. Toolset is fixed per-session, so cache-safe.
+    _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
+    stable_parts.append(
+        HERMES_AGENT_HELP_GUIDANCE if _has_skill_view
+        else HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS
+    )
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -415,8 +424,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
+    # MEMORY_GUIDANCE instructs the model to save facts to the built-in
+    # MEMORY.md/USER.md stores. With both disabled in config no store is built,
+    # so the guidance would steer the model at a tool whose every call returns
+    # "Memory is not available". Defaults to True for the rare code paths that
+    # build an agent view without going through agent_init.
+    # When only the user profile store is enabled, the narrower
+    # USER_PROFILE_GUIDANCE is injected instead — the full block instructs the
+    # model to write notes to a MEMORY.md store that does not exist.
+    _mem_enabled = getattr(agent, "_memory_enabled", True)
+    _profile_enabled = getattr(agent, "_user_profile_enabled", True)
     if "memory" in agent.valid_tool_names:
-        tool_guidance.append(MEMORY_GUIDANCE)
+        if _mem_enabled:
+            tool_guidance.append(MEMORY_GUIDANCE)
+        elif _profile_enabled:
+            tool_guidance.append(USER_PROFILE_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
@@ -447,9 +469,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         from agent.prompt_builder import computer_use_guidance
         stable_parts.append(computer_use_guidance())
 
-    nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
-    if nous_subscription_prompt:
-        stable_parts.append(nous_subscription_prompt)
     # Tool-use enforcement: tells the model to actually call tools instead
     # of describing intended actions.  Controlled by config.yaml
     # agent.tool_use_enforcement:
@@ -507,7 +526,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _exec_inject = any(p in model_lower for p in EXECUTION_GUIDANCE_MODELS)
         if _exec_inject:
-            stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+            from agent.prompt_builder import execution_guidance_text
+            stable_parts.append(execution_guidance_text(agent.valid_tool_names))
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
@@ -576,6 +596,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 platform=agent.platform,
                 cwd=resolve_context_cwd(),
                 model=agent.model,
+                valid_tool_names=agent.valid_tool_names,
             )
             stable_parts.extend(coding_prefix_parts)
         except Exception:
@@ -814,14 +835,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
+    # External memory provider system prompt block (additive to built-in).
+    # Gated on the same check ``inject_memory_provider_tools`` uses so we
+    # never advertise provider tools that the agent's toolset configuration
+    # has already gated off (#81014).
     if agent._memory_manager:
         try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
-            if _ext_mem_block:
-                volatile_parts.append(_ext_mem_block)
+            from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
-            pass
+            _mem_exposed = None
+        if _mem_exposed is None or _mem_exposed(agent):
+            try:
+                _ext_mem_block = agent._memory_manager.build_system_prompt()
+                if _ext_mem_block:
+                    volatile_parts.append(_ext_mem_block)
+            except Exception:
+                pass
 
     # Plugin sections are intentionally confined to one coarse anchor in the
     # volatile tail. This preserves deterministic ordering and lets a resumed

@@ -7,7 +7,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { AudioLines, Ear, EarOff, iconSize, Layers3, Loader2, Square, Volume2, VolumeX } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { $hudMode, closeHud } from '@/store/hud'
+import { $hudMode, closeHud, resetHudLayout } from '@/store/hud'
 import { $wakeWord, toggleWakeWord } from '@/store/wake-word'
 
 import { ACTIVE_ICON_BTN, GHOST_ICON_BTN, PRIMARY_ICON_BTN } from './control-classes'
@@ -39,7 +39,9 @@ export function ComposerControls({
   compactModelPill = false,
   conversation,
   disabled,
+  foldVoice = false,
   hasComposerPayload,
+  minimal = false,
   state,
   voiceStatus,
   onDictate,
@@ -53,7 +55,9 @@ export function ComposerControls({
   compactModelPill?: boolean
   conversation: ConversationProps
   disabled: boolean
+  foldVoice?: boolean
   hasComposerPayload: boolean
+  minimal?: boolean
   state: ChatBarState
   voiceStatus: VoiceStatus
   onDictate: () => void
@@ -73,29 +77,38 @@ export function ComposerControls({
   // only when the composer is empty and a turn is running.
   const showStop = busy && !hasComposerPayload
   const showQueueButton = busyAction !== 'stop' && hasComposerPayload
+  // The HUD is a Spotlight bar a few hundred pixels wide, so the four separate
+  // voice toggles fold into one menu there and leave the row to the input. A
+  // narrow tile hits the same wall from the other direction and folds for the
+  // same reason — same controls, same state, different budget. Below that
+  // even the menu goes: at `minimal` the row is the send button and nothing
+  // else, which is the one thing that must survive every width.
+  const foldedVoice = hudMode || foldVoice
+
+  const voiceControls = foldedVoice ? (
+    <VoiceMenu
+      autoSpeak={autoSpeak}
+      disabled={disabled}
+      onDictate={onDictate}
+      onStartConversation={conversation.onStart}
+      onToggleAutoSpeak={onToggleAutoSpeak}
+      state={state}
+      voiceStatus={voiceStatus}
+    />
+  ) : (
+    <>
+      <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
+      <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
+      <WakeWordButton disabled={disabled} />
+    </>
+  )
 
   return (
-    <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
-      <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
-      {/* The HUD is a Spotlight bar a few hundred pixels wide, so the four
-          separate voice toggles fold into one menu there and leave the row to
-          the input. The docked composer has the width and keeps them inline —
-          same controls, same state, different budget. */}
-      {hudMode ? (
-        <VoiceMenu
-          autoSpeak={autoSpeak}
-          disabled={disabled}
-          onDictate={onDictate}
-          onStartConversation={conversation.onStart}
-          onToggleAutoSpeak={onToggleAutoSpeak}
-          state={state}
-          voiceStatus={voiceStatus}
-        />
-      ) : (
+    <div className="ml-auto flex min-w-0 shrink items-center gap-(--composer-control-gap)">
+      {minimal ? null : (
         <>
-          <DictationButton disabled={disabled} onToggle={onDictate} state={state.voice} status={voiceStatus} />
-          <AutoSpeakButton active={autoSpeak} disabled={disabled} onToggle={onToggleAutoSpeak} />
-          <WakeWordButton disabled={disabled} />
+          <ModelPill compact={compactModelPill} disabled={disabled} model={state.model} />
+          {voiceControls}
         </>
       )}
       {showQueueButton ? (
@@ -160,27 +173,41 @@ export function ComposerControls({
           the surface, paid for in every state, for a control that is invisible
           until hovered. Here it costs no reserved space and sits with the other
           things you can press. */}
-      {hudMode ? <ExitHudButton /> : null}
+      {hudMode ? <HudWindowButtons /> : null}
     </div>
   )
 }
 
-function ExitHudButton() {
+function HudWindowButtons() {
   const { t } = useI18n()
 
   return (
-    <Tip label={t.titlebar.exitHud}>
-      <Button
-        aria-label={t.titlebar.exitHud}
-        className={cn(GHOST_ICON_BTN, 'p-0')}
-        onClick={closeHud}
-        size="icon"
-        type="button"
-        variant="ghost"
-      >
-        <Codicon name="screen-normal" size="0.875rem" />
-      </Button>
-    </Tip>
+    <>
+      <Tip label={t.titlebar.resetHudLayout}>
+        <Button
+          aria-label={t.titlebar.resetHudLayout}
+          className={cn(GHOST_ICON_BTN, 'p-0')}
+          onClick={resetHudLayout}
+          size="icon"
+          type="button"
+          variant="ghost"
+        >
+          <Codicon name="discard" size="0.875rem" />
+        </Button>
+      </Tip>
+      <Tip label={t.titlebar.exitHud}>
+        <Button
+          aria-label={t.titlebar.exitHud}
+          className={cn(GHOST_ICON_BTN, 'p-0')}
+          onClick={closeHud}
+          size="icon"
+          type="button"
+          variant="ghost"
+        >
+          <Codicon name="screen-normal" size="0.875rem" />
+        </Button>
+      </Tip>
+    </>
   )
 }
 

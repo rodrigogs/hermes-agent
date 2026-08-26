@@ -3,6 +3,8 @@ import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { parseErrorSurface } from '@/lib/error-surface'
+import { isMessagingSource, normalizeSessionSource } from '@/lib/session-source'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
@@ -14,6 +16,7 @@ import {
   commitWorkspaceCwdForSelectedSession,
   releaseWorkspaceCwdOwner,
   sessionMatchesStoredId,
+  setCronSessions,
   setCurrentBranch,
   setCurrentCwdTransient,
   setCurrentFastMode,
@@ -23,10 +26,13 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setMessagingSessions,
+  setSessionOwnerHint,
   setSessions,
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 
 // Re-exported for the many session-actions/tile call sites that already import
 // it from here; the canonical definition lives in @/store/session.
@@ -146,6 +152,9 @@ const COMPARED_FIELDS = [
   'role',
   'pending',
   'error',
+  // Structured failure layer — drives the error card's title and action row,
+  // so a change (e.g. resume replay attaching the descriptor) must repaint.
+  'errorSurface',
   'hidden',
   'branchGroupId',
   'interim',
@@ -254,6 +263,11 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.role !== b.role ||
     a.pending !== b.pending ||
     a.error !== b.error ||
+    // Structural compare — the descriptor arrives as a fresh object per
+    // resume/replay, so identity comparison would repaint forever.
+    (a.errorSurface?.layer ?? null) !== (b.errorSurface?.layer ?? null) ||
+    (a.errorSurface?.code ?? null) !== (b.errorSurface?.code ?? null) ||
+    (a.errorSurface?.retryable ?? null) !== (b.errorSurface?.retryable ?? null) ||
     a.hidden !== b.hidden ||
     a.branchGroupId !== b.branchGroupId ||
     a.timestamp !== b.timestamp ||
@@ -742,6 +756,7 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
   // the terminal frame may have been lost to a disconnect) — surface the
   // failure on the projected row instead of rendering the partial as healthy.
   const inflightError = projection.inflight?.error?.trim() ?? ''
+  const inflightErrorSurface = parseErrorSurface(projection.inflight?.error_surface)
   const queuedUser = projection.queued?.user?.trim() ?? ''
 
   if (
@@ -904,7 +919,8 @@ export function appendLiveSessionProjection(messages: ChatMessage[], projection:
         role: 'assistant',
         parts: inflightAssistant ? [assistantTextPart(inflightAssistant)] : [],
         pending: inflightStreaming,
-        ...(inflightError ? { error: inflightError } : {})
+        ...(inflightError ? { error: inflightError } : {}),
+        ...(inflightError && inflightErrorSurface ? { errorSurface: inflightErrorSurface } : {})
       })
     }
 
@@ -1231,13 +1247,16 @@ export function upsertOptimisticSession(
   title: string | null = null,
   preview: string | null = null,
   parentSessionId: string | null = null,
-  lastActive?: number
+  lastActive?: number,
+  ownerRoute?: SessionProfileRoute
 ) {
   const now = lastActive ?? Date.now() / 1000
-  // Stamp the profile the session was just created on (= the live gateway's
-  // profile) so the scoped sidebar shows the new row immediately instead of
-  // filtering it out as "default" until the aggregator re-fetches.
-  const profileKey = normalizeProfileKey($activeGatewayProfile.get())
+  // Stamp the profile/source the session was just created on so the scoped
+  // sidebar shows the new row immediately instead of filtering it out as
+  // "default" until the aggregator re-fetches. The active gateway is only a
+  // presentation detail: a concurrent source switch can move it before this
+  // optimistic row is inserted.
+  const profileKey = normalizeProfileKey(ownerRoute?.profile ?? $activeGatewayProfile.get())
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
@@ -1259,7 +1278,12 @@ export function upsertOptimisticSession(
     source: 'tui',
     started_at: now,
     title,
-    tool_call_count: 0
+    tool_call_count: 0,
+    ...(ownerRoute?.connectionId.trim() ? { connection_id: ownerRoute.connectionId.trim() } : {})
+  }
+
+  if (ownerRoute) {
+    setSessionOwnerHint(id, ownerRoute)
   }
 
   setSessions(prev => [session, ...prev.filter(s => s.id !== id)])
@@ -1277,6 +1301,70 @@ export function sessionShouldHaveTranscript(session: SessionInfo | undefined): b
   return (session?.message_count ?? 0) > 0
 }
 
+export type ListedSessionSlice = 'cron' | 'messaging' | 'sessions'
+
+export function findListedSession(
+  storedSessionId: string
+): { session: SessionInfo; slice: ListedSessionSlice } | undefined {
+  const match = (session: SessionInfo) => sessionMatchesStoredId(session, storedSessionId)
+  const fromMessaging = $messagingSessions.get().find(match)
+
+  if (fromMessaging) {
+    return { session: fromMessaging, slice: 'messaging' }
+  }
+
+  const fromCron = $cronSessions.get().find(match)
+
+  if (fromCron) {
+    return { session: fromCron, slice: 'cron' }
+  }
+
+  const fromSessions = $sessions.get().find(match)
+
+  if (fromSessions) {
+    return { session: fromSessions, slice: 'sessions' }
+  }
+
+  return undefined
+}
+
+export function dropListedSession(storedSessionId: string): void {
+  const keep = (session: SessionInfo) => !sessionMatchesStoredId(session, storedSessionId)
+
+  setSessions(prev => prev.filter(keep))
+  setMessagingSessions(prev => prev.filter(keep))
+  setCronSessions(prev => prev.filter(keep))
+}
+
+export function restoreListedSession(session: SessionInfo, slice?: ListedSessionSlice): void {
+  const target: ListedSessionSlice =
+    slice ??
+    (isMessagingSource(session.source)
+      ? 'messaging'
+      : normalizeSessionSource(session.source) === 'cron'
+        ? 'cron'
+        : 'sessions')
+
+  const prepend = (prev: SessionInfo[]) => [
+    session,
+    ...prev.filter(existing => !sessionMatchesStoredId(existing, session.id))
+  ]
+
+  if (target === 'messaging') {
+    setMessagingSessions(prepend)
+
+    return
+  }
+
+  if (target === 'cron') {
+    setCronSessions(prepend)
+
+    return
+  }
+
+  setSessions(prepend)
+}
+
 function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
   const lineage = session._lineage_root_id ?? session.id
 
@@ -1292,10 +1380,42 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
   ])
 }
 
-export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
+export async function resolveStoredSession(
+  storedSessionId: string,
+  ownerRoute?: SessionProfileRoute
+): Promise<SessionInfo | undefined> {
   const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
     sessionMatchesStoredId(session, storedSessionId)
   )
+
+  if (ownerRoute) {
+    const scope = {
+      connectionId: ownerRoute.connectionId,
+      profile: ownerRoute.targetProfile || ownerRoute.profile
+    }
+
+    const cachedOwnerMatches =
+      cached &&
+      cached.connection_id === ownerRoute.connectionId &&
+      (!cached.profile || normalizeProfileKey(cached.profile) === normalizeProfileKey(ownerRoute.profile))
+
+    if (cached && cachedOwnerMatches) {
+      return cached
+    }
+
+    try {
+      const session = await getSession(storedSessionId, scope)
+      session.profile = normalizeProfileKey(ownerRoute.profile)
+      session.connection_id = ownerRoute.connectionId
+      upsertResolvedSession(session, storedSessionId)
+
+      return session
+    } catch {
+      // An explicit owner is fail-closed. Probing the ambient or another
+      // profile would turn a stale route into a cross-connection open.
+      return undefined
+    }
+  }
 
   // A row with no owning profile can't route a resume when more than one
   // profile exists — a resume without a profile lands on whichever gateway is
