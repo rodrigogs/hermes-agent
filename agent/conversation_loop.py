@@ -1860,6 +1860,16 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # Executor-side route journal: this is deliberately before any call/retry
+    # setup, so hop 1 is the backend the dispatcher actually launched with.
+    # The journal is env-gated; stock installs take one no-op call here.
+    try:
+        from agent.route_attempts import bind_hop
+
+        bind_hop(agent)
+    except Exception:
+        pass
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -6821,6 +6831,17 @@ def run_conversation(
                         assistant_tool_call_count=len(_assistant_tool_calls),
                         moa_references=_moa_reference_metrics_for_hook(agent),
                     )
+            except Exception:
+                pass
+
+            # A normalized response is the executor's success boundary: it
+            # crossed the wire and was accepted as a model result. Marking it
+            # here (not at turn finalization) keeps an earlier tool-call
+            # response served even if a later tool-loop call fails.
+            try:
+                from agent.route_attempts import note_served
+
+                note_served(agent)
             except Exception:
                 pass
 

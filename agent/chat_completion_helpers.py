@@ -2633,6 +2633,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
                 backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
             )
+    # The caller reached failover because the CURRENT backend did not complete
+    # this request. Close it before walking candidates; recursive calls while
+    # skipping invalid candidates find no open hop, so this records it once.
+    try:
+        from agent.route_attempts import close_hop
+
+        close_hop(
+            agent,
+            "failed",
+            error_code=getattr(reason, "value", "fallback") or "fallback",
+            error_message="backend abandoned for fallback",
+        )
+    except Exception:
+        pass
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
@@ -3046,6 +3060,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        try:
+            from agent.route_attempts import bind_hop
+
+            bind_hop(agent)
+        except Exception:
+            pass
         return True
     except Exception as e:
         if fb_provider == "nous":
