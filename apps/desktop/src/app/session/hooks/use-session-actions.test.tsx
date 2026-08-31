@@ -1,3 +1,4 @@
+import { registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
@@ -5,6 +6,7 @@ import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
+import { resolveSessionRpcOwner } from '@/app/contrib/wiring-routing'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import {
@@ -46,6 +48,9 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $turnStartedAt,
+  getSessionOwnerHint,
+  knownSessionOwner,
+  sessionMatchesStoredId,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setAwaitingResponse,
@@ -65,8 +70,8 @@ import {
   setSessions,
   setTurnStartedAt
 } from '@/store/session'
-import type { SessionProfileRoute } from '@/store/session-request-router'
-import { $sessionTiles } from '@/store/session-states'
+import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
+import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
@@ -97,7 +102,8 @@ vi.mock('@/store/profile', async importOriginal => ({
 vi.mock('@/store/gateway', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   requestGatewayForAgent: vi.fn(),
-  requestGatewayForProfile: vi.fn()
+  requestGatewayForProfile: vi.fn(),
+  retainGatewayForAgent: vi.fn(async () => () => undefined)
 }))
 
 vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
@@ -723,6 +729,7 @@ describe('createBackendSessionForSend profile routing', () => {
 // succeeds must NOT leave the flag armed.
 function ResumeHarness({
   onStateUpdate,
+  onViewSync,
   onReady,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
@@ -730,6 +737,7 @@ function ResumeHarness({
   sessionStateByRuntimeIdRef
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
+  onViewSync?: (sessionId: string, state: ClientSessionState) => void
   onReady: (
     resume: (storedSessionId: string, replaceRoute?: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   ) => void
@@ -757,7 +765,7 @@ function ResumeHarness({
     selectedStoredSessionId,
     selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
     sessionStateByRuntimeIdRef: stateMapRef,
-    syncSessionStateToView: vi.fn(),
+    syncSessionStateToView: (sessionId, state) => onViewSync?.(sessionId, state),
     updateSessionState: (sessionId, updater, storedSessionId) => {
       // Full default shape (not a bare {} cast) so seeded/derived fields like
       // turnStartedAt behave as in production state updates.
@@ -811,6 +819,7 @@ function ResumeTimerHarness({
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: cache.selectedStoredSessionIdRef,
     sessionStateByRuntimeIdRef: cache.sessionStateByRuntimeIdRef,
+    holdSessionTranscriptView: cache.holdSessionTranscriptView,
     syncSessionStateToView: cache.syncSessionStateToView,
     getRoutedStoredSessionId: () => null,
     updateSessionState: cache.updateSessionState
@@ -3479,6 +3488,105 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
     expect(sessionStateByRuntimeIdRef.current.get('rt-A')?.messages[0]?.id).toBe('user-optimistic')
   })
+
+  it('never publishes a tail-only warm cache before the full persisted history', async () => {
+    const cachedState = clientState('stored-1')
+    cachedState.messages = [
+      {
+        id: 'user-latest',
+        role: 'user',
+        parts: [{ type: 'text', text: 'latest question after long-context completion' }]
+      },
+      {
+        id: 'assistant-latest',
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'latest answer after long-context completion' }]
+      }
+    ]
+
+    const runtimeIdByStoredSessionIdRef = {
+      current: new Map([['stored-1', 'runtime-warm']])
+    } satisfies MutableRefObject<Map<string, string>>
+
+    const sessionStateByRuntimeIdRef = {
+      current: new Map([['runtime-warm', cachedState]])
+    } satisfies MutableRefObject<Map<string, ClientSessionState>>
+
+    const persistedAuthority = deferred<{
+      messages: Array<{ content: string; role: 'assistant' | 'user'; timestamp: number }>
+      session_id: string
+    }>()
+
+    const publications: Array<{ older: boolean; latest: boolean }> = []
+
+    setSessions([storedSession({ message_count: 4 })])
+    vi.mocked(getLatestSessionMessages).mockReturnValue(persistedAuthority.promise as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-1',
+          running: false,
+          session_id: 'runtime-warm',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={ready => (resume = ready)}
+        onViewSync={(_sessionId, state) => {
+          const snapshot = JSON.stringify(state.messages)
+          publications.push({
+            latest: snapshot.includes('latest question after long-context completion'),
+            older: snapshot.includes('earlier question before long-context completion')
+          })
+        }}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    const resumePromise = resume!('stored-1', true)
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith(
+        'session.activate',
+        expect.objectContaining({ omit_messages: true, session_id: 'runtime-warm' })
+      )
+    )
+
+    expect(
+      publications.filter(snapshot => snapshot.latest && !snapshot.older),
+      `Tail-only warm-cache publication escaped before persisted authority: ${JSON.stringify(publications)}`
+    ).toEqual([])
+
+    persistedAuthority.resolve({
+      messages: [
+        { content: 'earlier question before long-context completion', role: 'user', timestamp: 1 },
+        { content: 'earlier answer before long-context completion', role: 'assistant', timestamp: 2 },
+        { content: 'latest question after long-context completion', role: 'user', timestamp: 3 },
+        { content: 'latest answer after long-context completion', role: 'assistant', timestamp: 4 }
+      ],
+      session_id: 'stored-1'
+    })
+    await resumePromise
+
+    expect(publications.some(snapshot => snapshot.latest && snapshot.older)).toBe(true)
+    expect(
+      publications.filter(snapshot => snapshot.latest && !snapshot.older),
+      `Tail-only warm-cache publication escaped: ${JSON.stringify(publications)}`
+    ).toEqual([])
+  })
 })
 
 describe('createBackendSessionForSend workspace target', () => {
@@ -3831,5 +3939,147 @@ describe('removeSession / archiveSession profile routing (#78836)', () => {
     expect(mockSetSessionArchived).not.toHaveBeenCalled()
     expect($messagingSessions.get().map(session => session.id)).toEqual(['tg-arch-unresolved'])
     expect($sessions.get()).toEqual([])
+  })
+})
+
+// A fresh chat created through $newChatRoute must keep the route as its EXACT
+// owner after session.create. The create RPC already rode
+// requestGatewayForAgent(capturedRoute); but the optimistic row was stamped
+// from $activeGatewayProfile (still `default` in All-profiles / Bot routing)
+// and no owner hint was recorded, so the first turn ran on omar while every
+// later session-scoped RPC resolved the row as `default` → "session not
+// found" on the default backend, and the orphaned omar runtime was eventually
+// ws-orphan-reaped.
+describe('routed fresh chat keeps its exact owner across turns', () => {
+  const route: SessionProfileRoute = { connectionId: 'local', mode: 'local', profile: 'omar' }
+  const STORED = 'stored-omar-fresh'
+
+  afterEach(() => {
+    cleanup()
+    $newChatProfile.set(null)
+    $newChatRoute.set(null)
+    $activeGatewayProfile.set('default')
+    $sessionTiles.set([])
+    setSessions([])
+    setCurrentCwd('')
+    setNewChatWorkspaceTarget(undefined)
+    vi.restoreAllMocks()
+  })
+
+  // The SAME sync ladder contrib/wiring's requestGateway runs for every
+  // session-scoped RPC (prompt.submit, session.resume, attach, interrupt,
+  // redirect, recovery): tile route → exact unique hint → row owner.
+  const ownerFor = (storedSessionId: string) =>
+    resolveSessionRpcOwner({
+      routingSessionId: storedSessionId,
+      sessionOwnerHint: id => getSessionOwnerHint(id),
+      sessionRowOwner: (id: string) => knownSessionOwner($sessions.get(), id),
+      tileOwnerRoute: sessionTileOwnerRoute
+    })
+
+  async function createRoutedFreshChat() {
+    // Ambient dispatcher = the DEFAULT backend. It never heard of the session:
+    // any session-scoped RPC landing here is exactly the bug.
+    const ambientRequest = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (typeof params?.session_id === 'string') {
+        throw new Error(`Session not found: ${params.session_id} (ambient/default backend, ${method})`)
+      }
+
+      return {} as never
+    })
+
+    // The owning backend, local::omar. Anything else 4001s.
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (connectionId, profile, method) => {
+      if (connectionId === 'local' && profile === 'omar') {
+        if (method === 'session.create') {
+          return { session_id: RUNTIME_SESSION_ID, stored_session_id: STORED } as never
+        }
+
+        return { ok: true } as never
+      }
+
+      throw new Error(`Session not found (${connectionId}::${profile}, ${method})`)
+    })
+
+    // Ambient profile = default; the draft is routed at local::omar.
+    $activeGatewayProfile.set('default')
+    $newChatProfile.set(route.profile)
+    $newChatRoute.set({ ...route })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    let runtimeId: null | string = null
+
+    await act(async () => {
+      runtimeId = await handle!.createBackendSessionForSend('hello omar')
+    })
+
+    expect(runtimeId).toBe(RUNTIME_SESSION_ID)
+
+    return { ambientRequest, runtimeId: runtimeId as unknown as string }
+  }
+
+  it('unit: an explicitly routed fresh create never resolves its follow-up owner to the ambient default', async () => {
+    await createRoutedFreshChat()
+
+    const followupOwner = ownerFor(STORED)
+    const foregroundScope = registryBackendScopeKey(route.connectionId, route.profile)
+
+    const followupOwnerKey =
+      followupOwner && typeof followupOwner === 'object'
+        ? `${followupOwner.connectionId}::${followupOwner.profile}`
+        : followupOwner
+
+    // The exact failing shape: the foreground socket is omar's, the follow-up
+    // routes to default.
+    expect({ followupOwner: followupOwnerKey, foregroundScope }).not.toEqual({
+      followupOwner: 'default',
+      foregroundScope: 'conn:local::omar'
+    })
+    expect({ followupOwner: followupOwnerKey, foregroundScope }).toEqual({
+      followupOwner: 'local::omar',
+      foregroundScope: 'conn:local::omar'
+    })
+
+    // Both owner records carry the route, and the ambient profile never moved.
+    expect(getSessionOwnerHint(STORED)).toEqual(route)
+    expect($sessions.get().find(session => sessionMatchesStoredId(session, STORED))).toMatchObject({
+      connection_id: 'local',
+      is_default_profile: false,
+      profile: 'omar'
+    })
+    expect($activeGatewayProfile.get()).toBe('default')
+  })
+
+  it('integration: both turns hit local::omar with default ambient — no session-not-found, no orphaned runtime', async () => {
+    const { ambientRequest, runtimeId } = await createRoutedFreshChat()
+
+    const submitTurn = (text: string) =>
+      requestForSessionProfile(ownerFor(STORED), ambientRequest, 'prompt.submit', { session_id: runtimeId, text })
+
+    // First turn on omar.
+    await expect(submitTurn('first turn')).resolves.toEqual({ ok: true })
+
+    // Keep default as the ambient profile (All-profiles / Bot routing never
+    // moved it) and submit the second turn.
+    $activeGatewayProfile.set('default')
+    await expect(submitTurn('second turn')).resolves.toEqual({ ok: true })
+
+    const submits = vi.mocked(requestGatewayForAgent).mock.calls.filter(call => call[2] === 'prompt.submit')
+
+    expect(submits.map(call => [call[0], call[1], (call[3] as { text: string }).text])).toEqual([
+      ['local', 'omar', 'first turn'],
+      ['local', 'omar', 'second turn']
+    ])
+    // No session-not-found: the default backend never saw a session-scoped RPC.
+    expect(ambientRequest).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
+    expect(ambientRequest.mock.calls.filter(call => typeof call[1]?.session_id === 'string')).toEqual([])
+    // No ws_orphan_reap: the client never closed or abandoned the runtime it
+    // minted on omar — no session.close on any route, the binding stands.
+    expect(vi.mocked(requestGatewayForAgent).mock.calls.filter(call => call[2] === 'session.close')).toEqual([])
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.close', expect.anything())
+    expect(getSessionOwnerHint(STORED)).toEqual(route)
   })
 })

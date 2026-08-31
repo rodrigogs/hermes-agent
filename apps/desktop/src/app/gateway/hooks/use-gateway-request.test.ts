@@ -87,6 +87,7 @@ const remoteConnection = {
 
 function installRemoteDesktop() {
   let mintCount = 0
+
   const getConnection = vi.fn(async (profile?: null | string) => ({
     authMode: 'token' as const,
     baseUrl: 'http://127.0.0.1:5151',
@@ -95,15 +96,18 @@ function installRemoteDesktop() {
     token: 'local-token',
     wsUrl: 'ws://127.0.0.1:5151/api/ws?token=local'
   }))
+
   const getConnectionFor = vi.fn(async ({ connectionId, profile }: { connectionId: string; profile: string }) => ({
     ...remoteConnection,
     connectionId,
     profile
   }))
+
   const getGatewayWsUrl = vi.fn(async () => ({
     ok: true as const,
     wsUrl: 'ws://127.0.0.1:5151/api/ws?token=fresh-local'
   }))
+
   const getGatewayWsUrlFor = vi.fn(
     async ({ connectionId, profile }: { connectionId: string; profile: string }): Promise<GatewayWsUrlResult> => {
       mintCount += 1
@@ -132,6 +136,7 @@ function installPrimaryDesktop(authMode: 'oauth' | 'token') {
     token: 'primary-token',
     wsUrl: authMode === 'oauth' ? 'wss://gateway.example.test/api/ws?ticket=stale' : 'ws://127.0.0.1:5151/api/ws'
   }))
+
   const getGatewayWsUrl = vi.fn(async (profile?: null | string) => ({
     ok: true as const,
     wsUrl:
@@ -139,6 +144,7 @@ function installPrimaryDesktop(authMode: 'oauth' | 'token') {
         ? `wss://gateway.example.test/api/ws?profile=${profile ?? 'default'}&ticket=fresh`
         : 'ws://127.0.0.1:5151/api/ws?token=fresh'
   }))
+
   const getConnectionFor = vi.fn()
   const getGatewayWsUrlFor = vi.fn()
 
@@ -183,6 +189,7 @@ async function expectSecondaryRecoveryFailure(
   gateway.connectionState = 'closed'
 
   vi.useFakeTimers()
+
   const retry = request('session.resume').then(
     () => undefined,
     error => error
@@ -350,5 +357,36 @@ describe('useGatewayRequest', () => {
     expect(desktop.getGatewayWsUrl).toHaveBeenCalledWith('default')
     expect(desktop.getConnectionFor).not.toHaveBeenCalled()
     expect(desktop.getGatewayWsUrlFor).not.toHaveBeenCalled()
+  })
+
+  it('rejects instead of hanging forever when the reconnect getConnection() wedges (#93454)', async () => {
+    // Repro: a request lands on a dropped socket, the "not connected" catch
+    // kicks off a reconnect, and the IPC round-trip into main
+    // (desktop.getConnection) never settles — e.g. a wedged revalidation after
+    // a liveness-probe trip. Without an internal timeout on that await,
+    // reconnectingRef never clears and requestGateway hangs forever instead of
+    // surfacing the original transport error.
+    vi.useFakeTimers()
+
+    const dropped = {
+      connectionState: 'closed',
+      request: vi.fn().mockRejectedValue(new Error('connection closed'))
+    } as unknown as HermesGateway
+
+    const getConnection = vi.fn(() => new Promise(() => undefined))
+
+    ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = { getConnection }
+    $gateway.set(dropped)
+
+    const { result } = renderHook(() => useGatewayRequest())
+
+    const pending = expect(result.current.requestGateway('some.method')).rejects.toThrow('connection closed')
+
+    // Advance past the internal reconnect-attempt timeout (20s) — the stalled
+    // getConnection() await must reject so the reconnect gives up and the
+    // original transport error surfaces, instead of requestGateway() never
+    // settling.
+    await vi.advanceTimersByTimeAsync(20_000)
+    await pending
   })
 })

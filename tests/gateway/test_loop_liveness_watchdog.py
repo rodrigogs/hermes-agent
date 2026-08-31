@@ -449,3 +449,24 @@ def test_an_explicit_argument_still_beats_the_environment(monkeypatch):
     assert captured.get("started") is True
     if handle is not None:
         handle.stop()
+
+
+def test_loop_scheduling_witness_is_served_by_the_loop_itself():
+    """The tick socket must be armed on the loop, never in a thread.
+
+    The two-witness contract in ``probe_gateway_loop_liveness`` rests on the
+    socket being answered only while the loop is actually dispatching. If the
+    server ever moved into the heartbeat's executor thread, a wedged loop
+    could keep answering pings (same class of lie as a fire-and-forget file
+    write) and the interlock would be void.
+    """
+    src = pathlib.Path(
+        inspect.getsourcefile(loop_heartbeat_forever) or ""
+    ).read_text()
+    body = src[src.index("async def loop_heartbeat_forever("):]
+    body = body[: body.index("\ndef ") if "\ndef " in body else len(body)]
+    # Awaited directly on the loop task: a coroutine cannot run inside a
+    # thread, so an awaited start_unix_server is structurally loop-owned.
+    assert "await asyncio.start_unix_server(" in body, (
+        "the loop-scheduling witness socket is not armed by the loop task"
+    )

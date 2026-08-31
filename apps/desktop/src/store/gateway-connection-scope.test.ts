@@ -40,14 +40,19 @@ vi.mock('@/store/session', () => ({
 vi.mock('@/store/notify-baseline', () => ({ markNativeNotifyBaseline: vi.fn() }))
 
 const {
+  activeGatewayConnectionId,
   closeLegacySecondaryGateways,
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForAgent,
+  ensureGatewayForProfile,
   openGatewayForAgent,
   pruneSecondaryGateways,
-  setPrimaryGateway
+  setPrimaryGateway,
+  setPrimaryGatewayConnectionId
 } = await import('./gateway')
+
+const { setApiRequestConnection } = await import('@/hermes')
 
 function installDesktop(): void {
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
@@ -83,6 +88,44 @@ afterEach(() => {
   closeSecondaryGateways()
   vi.clearAllMocks()
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+})
+
+describe('primary gateway registry scope', () => {
+  it('publishes a registered primary connection id for ambient API/WebSocket helpers', () => {
+    setPrimaryGateway({ connectionState: 'open' } as never, 'default')
+    setPrimaryGatewayConnectionId(' homelab-ssh ')
+
+    expect(activeGatewayConnectionId()).toBe('homelab-ssh')
+    expect(setApiRequestConnection).toHaveBeenLastCalledWith('homelab-ssh')
+  })
+
+  it('clears primary connection scope when the primary becomes legacy/local again', () => {
+    setPrimaryGateway({ connectionState: 'open' } as never, 'default')
+    setPrimaryGatewayConnectionId('homelab-ssh')
+    setPrimaryGateway({ connectionState: 'open' } as never, 'default')
+
+    expect(activeGatewayConnectionId()).toBeNull()
+    expect(setApiRequestConnection).toHaveBeenLastCalledWith(null)
+  })
+
+  it('ignores primary connection-id writes while a secondary registry scope is active (#95628 hardening)', async () => {
+    setPrimaryGateway({ connectionState: 'open' } as never, 'default')
+    setPrimaryGatewayConnectionId('primary-vps')
+
+    // Foreground Gateway B's composite scope (connectionId 'homelab').
+    await expect(ensureGatewayForAgent('homelab', 'default')).resolves.toBe(true)
+
+    // Presentation-layer write while the secondary is foregrounded: the id
+    // describes the secondary, not the primary. It must be dropped — accepting
+    // it relabels the primary socket and poisons ambient routing.
+    setPrimaryGatewayConnectionId('homelab')
+
+    // Back on the primary route, its registry identity is intact.
+    await ensureGatewayForProfile('default')
+
+    expect(activeGatewayConnectionId()).toBe('primary-vps')
+    expect(setApiRequestConnection).toHaveBeenLastCalledWith('primary-vps')
+  })
 })
 
 describe('pruneSecondaryGateways with registry-scoped entries', () => {
@@ -138,7 +181,7 @@ describe('pruneSecondaryGateways with registry-scoped entries', () => {
     expect(gatewayMocks.closed).toHaveLength(1)
   })
 
-  it("does not let a remote tile keep-set pin a local same-named secondary", async () => {
+  it('does not let a remote tile keep-set pin a local same-named secondary', async () => {
     // Chrome is on another profile so 'default' is a real secondary, not the
     // spared active key. A homelab bot tile keep-set must keep only the
     // composite scope — the local 'default' socket still idles out.

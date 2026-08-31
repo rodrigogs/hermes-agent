@@ -292,6 +292,24 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return base.joinpath(*_HEARTBEAT_RELATIVE)
 
 
+def get_loop_tick_socket_path(
+    home: Optional[Path] = None, pid: Optional[int] = None
+) -> Path:
+    """Return the loop-scheduling witness socket for ``pid``.
+
+    ``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a
+    leftover node from a previous process can never be mistaken for this
+    gateway's witness. Served by the gateway loop itself (see
+    ``_tick_socket_handler``): an answer is direct proof that the loop is
+    dispatching, which is exactly the property the heartbeat file lost when
+    its write moved off-loop (#90502).
+    """
+    base = home if home is not None else _process_hermes_home()
+    return base.joinpath(
+        "state", f"gateway.loop-tick.{int(pid if pid is not None else os.getpid())}.sock"
+    )
+
+
 def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
     """Return the faulthandler / metadata dump path for a fired watchdog."""
     base = home if home is not None else _process_hermes_home()
@@ -497,6 +515,30 @@ def arm_shutdown_watchdog(
     return done
 
 
+async def _tick_socket_handler(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Answer a liveness ping with one byte.
+
+    Runs on the gateway loop: the reply is produced only while the loop is
+    actually dispatching, so a successful read is a witness of loop
+    schedulability that no executor thread and no filesystem stall can
+    refresh. A UNIX-socket write is a socket-buffer copy — no fsync, no
+    disk I/O — so the witness keeps working on the exact filesystem that
+    stalls the heartbeat write. Best-effort; never raises.
+    """
+    try:
+        writer.write(b"1")
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
 async def loop_heartbeat_forever(
     *,
     interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
@@ -525,31 +567,117 @@ async def loop_heartbeat_forever(
     while the loop was wedged, which is exactly the signal the docstring above
     promises. And a single in-flight write at a time, so a 112s stall cannot pile
     up one queued thread per interval behind it.
+
+    Because the write is now off-loop, file freshness is no longer *proof* of
+    loop schedulability: a stalled write or a saturated executor can age the file
+    while the loop runs, and a write that lands after the loop froze can keep it
+    fresh. The file therefore stops being sufficient authority on its own. This
+    task also arms a loop-scheduling witness — a UNIX socket answered by the
+    loop itself (``_tick_socket_handler``) — and records whether it is armed in
+    the heartbeat payload (``loop_tick_socket``). External probes must require
+    the witness to agree with file staleness before classifying a loop as
+    wedged; see ``hermes_cli.gateway.probe_gateway_loop_liveness`` for the
+    two-witness contract.
     """
     try:
         interval = max(float(interval_s), 1.0)
     except (TypeError, ValueError):
         interval = DEFAULT_HEARTBEAT_INTERVAL_S
 
+    # Arm the loop-scheduling witness. Best-effort: a failed bind (permissions,
+    # path length) must not abort the gateway or the file heartbeat — it only
+    # disables the witness, and the payload flag tells probes that staleness is
+    # no longer sufficient authority to escalate.
+    #
+    # Windows: asyncio.start_unix_server raises (no AF_UNIX event-loop
+    # support), so the witness is PERMANENTLY absent there — the payload
+    # records loop_tick_socket=False and every stale-file probe classifies
+    # UNKNOWN, never WEDGED. That is deliberate fail-safe: a wedged native
+    # Windows gateway keeps the graceful-drain backstop instead of an
+    # escalation verdict built on a witness that cannot exist. (WSL2 — the
+    # #90502 incident environment — is Linux and arms the socket normally.)
+    tick_server = None
+    tick_socket_path = None
+    try:
+        tick_socket_path = get_loop_tick_socket_path(home)
+        tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-bind over a leftover node from a dead process (os._exit(75) /
+        # SIGKILL skip the finally-unlink; PID reuse re-lands on this
+        # PID-suffixed path) is handled by asyncio itself:
+        # create_unix_server os.remove()s an existing socket node before
+        # binding — guarded by test_producer_rebinds_over_stale_socket_node.
+        # What asyncio does NOT do is clean up SIBLING nodes from other
+        # dead PIDs, so sweep those to keep state/ from accumulating
+        # gateway.loop-tick.*.sock nodes across crash-restart cycles.
+        # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
+        # Windows os.kill calls TerminateProcess for non-CTRL signals —
+        # and AF_UNIX server nodes are never created there anyway.
+        if os.name == "posix":
+            try:
+                for _stale in tick_socket_path.parent.glob(
+                    "gateway.loop-tick.*.sock"
+                ):
+                    if _stale == tick_socket_path:
+                        continue
+                    try:
+                        _stale_pid = int(_stale.name.split(".")[-2])
+                    except (ValueError, IndexError):
+                        _stale.unlink(missing_ok=True)
+                        continue
+                    try:
+                        os.kill(_stale_pid, 0)  # windows-footgun: ok — inside os.name == "posix" gate
+                    except OSError:
+                        _stale.unlink(missing_ok=True)
+            except Exception:
+                logger.debug(
+                    "stale loop-tick socket sweep failed", exc_info=True
+                )
+        tick_server = await asyncio.start_unix_server(
+            _tick_socket_handler, path=str(tick_socket_path)
+        )
+    except Exception:
+        tick_server = None
+        logger.warning(
+            "Loop tick socket unavailable — liveness probes will have no "
+            "loop-scheduling witness and will not escalate on a stale heartbeat",
+            exc_info=True,
+        )
+
     async def _write_off_loop() -> None:
         # write_loop_heartbeat never raises, so a failure here is an executor
         # problem (shutdown, saturation) and must not kill the heartbeat task.
         try:
             await asyncio.to_thread(
-                write_loop_heartbeat, start_time=start_time, home=home
+                write_loop_heartbeat,
+                start_time=start_time,
+                home=home,
+                extra={"loop_tick_socket": tick_server is not None},
             )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.debug("Loop heartbeat write failed off-loop", exc_info=True)
 
-    # Immediate first write so monitors see a fresh file as soon as the
-    # gateway is running, not after the first interval.
-    await _write_off_loop()
-    while True:
-        if should_continue is not None and not should_continue():
-            return
-        await asyncio.sleep(interval)
-        if should_continue is not None and not should_continue():
-            return
+    try:
+        # Immediate first write so monitors see a fresh file as soon as the
+        # gateway is running, not after the first interval.
         await _write_off_loop()
+        while True:
+            if should_continue is not None and not should_continue():
+                return
+            await asyncio.sleep(interval)
+            if should_continue is not None and not should_continue():
+                return
+            await _write_off_loop()
+    finally:
+        if tick_server is not None:
+            tick_server.close()
+            try:
+                await tick_server.wait_closed()
+            except Exception:
+                pass
+            if tick_socket_path is not None:
+                try:
+                    tick_socket_path.unlink(missing_ok=True)
+                except Exception:
+                    pass

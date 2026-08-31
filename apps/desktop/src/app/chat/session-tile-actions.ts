@@ -22,7 +22,7 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $sessions, knownSessionOwner, sessionMatchesStoredId } from '@/store/session'
+import { $sessions, knownSessionOwner, ownerLookupSessionRows, sessionMatchesStoredId } from '@/store/session'
 import {
   requestForSessionProfile,
   type SessionOwnerScope,
@@ -98,6 +98,7 @@ export function listTileSessionRow(deps: {
 
   const knownOwner =
     sessionTileOwnerRoute(deps.storedSessionId) ?? knownSessionOwner(deps.sessions, deps.storedSessionId)
+
   const ownerRoute: SessionProfileRoute | undefined =
     knownOwner && typeof knownOwner === 'object' ? knownOwner : undefined
 
@@ -177,7 +178,8 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
   const requestSessionGateway = useCallback(
     <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
       const knownOwner: SessionOwnerScope =
-        sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner($sessions.get(), storedIdRef.current)
+        sessionTileOwnerRoute(storedIdRef.current) ?? knownSessionOwner(ownerLookupSessionRows(), storedIdRef.current)
+
       // A bare profile is the legacy/unknown tile shape. Preserve its ambient
       // behavior; only a composite route is strong enough to retarget a tile
       // across same-named sources.

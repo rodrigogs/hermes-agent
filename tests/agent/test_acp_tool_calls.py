@@ -127,7 +127,12 @@ def test_a_whitespace_only_tool_result_also_appears() -> None:
 def test_the_sdk_object_shape_round_trips_too() -> None:
     """An agent loop may replay this module's own return value rather than dicts,
     so the renderer has to read attributes as well as keys."""
-    call = acp._build_openai_tool_call(
+    # Upstream moved this helper into the shared ACP bridge
+    # (agent/acp_openai_bridge.build_openai_tool_call); same keyword-only
+    # signature, so only the reference moves.
+    from agent.acp_openai_bridge import build_openai_tool_call
+
+    call = build_openai_tool_call(
         call_id="c9", name="get_weather", arguments='{"city": "Porto"}',
     )
     messages = [
