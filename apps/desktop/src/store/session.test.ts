@@ -31,10 +31,12 @@ import {
   commitWorkspaceCwdForSelectedSession,
   ensureDefaultWorkspaceCwd,
   forgetSessionOwnerHintsForConnection,
+  forgetSessionOwnerHintsForSession,
   getConfiguredDefaultProjectDir,
   getRememberedRoute,
   getRememberedSessionId,
   getSessionOwnerHint,
+  getSessionOwnerHints,
   hydrateSessionOwnerHints,
   knownSessionOwner,
   knownSessionProfile,
@@ -42,6 +44,7 @@ import {
   rememberedSessionProfile,
   resolveComposerSessionKey,
   sessionBelongsToProfile,
+  sessionOwnerRouteFromRow,
   sessionPinId,
   setCurrentCwd,
   setCurrentCwdTransient,
@@ -175,6 +178,30 @@ describe('session owner hints', () => {
     hydrateSessionOwnerHints()
     expect(getSessionOwnerHint('stored-a')).toBeUndefined()
     expect(getSessionOwnerHint('stored-c')).toEqual({ connectionId: 'local', profile: 'omar' })
+  })
+
+  it('forgets every route for one session without disturbing other sessions', () => {
+    setSessionOwnerHint('poisoned', { connectionId: 'local', mode: 'local', profile: 'default' })
+    setSessionOwnerHint('poisoned', { connectionId: 'remote-a', mode: 'remote', profile: 'default' })
+    setSessionOwnerHint('healthy', { connectionId: 'remote-a', mode: 'remote', profile: 'default' })
+
+    forgetSessionOwnerHintsForSession('poisoned')
+
+    expect(getSessionOwnerHints('poisoned')).toEqual([])
+    expect(getSessionOwnerHint('healthy')).toMatchObject({ connectionId: 'remote-a' })
+
+    _resetSessionOwnerHintsForTests()
+    hydrateSessionOwnerHints()
+    expect(getSessionOwnerHints('poisoned')).toEqual([])
+    expect(getSessionOwnerHint('healthy')).toMatchObject({ connectionId: 'remote-a' })
+  })
+
+  it('pins only connection-tagged rows and leaves primary SSH rows ambient', () => {
+    expect(
+      sessionOwnerRouteFromRow(session({ connection_id: 'source-a', profile: 'worker' }))
+    ).toEqual({ connectionId: 'source-a', profile: 'worker', targetProfile: 'worker' })
+    expect(sessionOwnerRouteFromRow(session({ profile: 'default' }))).toBeUndefined()
+    expect(sessionOwnerRouteFromRow(session({ connection_id: '  ', profile: 'default' }))).toBeUndefined()
   })
 })
 
@@ -326,6 +353,40 @@ describe('mergeSessionPage', () => {
     const incoming = [session({ connection_id: 'local', id: 'same', last_active: 1, profile: 'omar' })]
 
     expect(mergeSessionPage(previous, incoming, [])[0]).toBe(incoming[0])
+  })
+
+  it('never stitches one profile twin onto another: same id in two profiles stays two sessions (#92454)', () => {
+    // Two profiles can hold sessions with the SAME stored id (restored
+    // backups, copied state.dbs). Keyed by bare id these collapsed into one
+    // row whose title/activity carry crossed profiles — the visible seed of
+    // the cross-profile transcript/route mixups.
+    const previous = [session({ id: 'twin', last_active: 50, profile: 'testbot', title: 'Testbot work' })]
+
+    const incoming = [
+      session({ id: 'twin', last_active: 10, profile: 'quietbot' }),
+      session({ id: 'twin', last_active: 50, profile: 'testbot', title: 'Testbot work' })
+    ]
+
+    const merged = mergeSessionPage(previous, incoming, [])
+
+    // Both twins survive as distinct rows…
+    expect(merged.map(s => `${s.profile}:${s.id}`).sort()).toEqual(['quietbot:twin', 'testbot:twin'])
+    // …and testbot's title/activity is NOT stitched onto quietbot's row.
+    const quiet = merged.find(s => s.profile === 'quietbot')
+    expect(quiet?.title ?? null).toBeNull()
+    expect(quiet?.last_active).toBe(10)
+  })
+
+  it('a kept twin in another profile survives the incoming page dedupe (#92454)', () => {
+    // The incoming page carries only ONE profile's copy; the other profile's
+    // twin was in the previous list and pinned via keep. Bare-id dedupe
+    // treated the ids as equal and dropped the kept twin.
+    const previous = [session({ id: 'twin', profile: 'quietbot' })]
+    const incoming = [session({ id: 'twin', message_count: 2, profile: 'testbot' })]
+
+    const merged = mergeSessionPage(previous, incoming, ['twin'])
+
+    expect(merged.map(s => `${s.profile}:${s.id}`).sort()).toEqual(['quietbot:twin', 'testbot:twin'])
   })
 
   it('returns the server page untouched when there is nothing to keep', () => {
