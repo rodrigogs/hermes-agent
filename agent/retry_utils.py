@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
+from urllib.parse import urlsplit as _urlsplit
 
 # Monotonic counter for jitter seed uniqueness within the same process.
 # Protected by a lock to avoid race conditions in concurrent retry paths
@@ -139,24 +140,45 @@ def _error_text(error: Any) -> str:
     return " ".join(str(part) for part in parts if part is not None).lower()
 
 
-def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
-    """Return True for Z.AI Coding Plan transient overload 429s.
+def _is_zai_host(base_url):
+    """True when ``base_url`` names Z.AI's API, on any of its paths.
 
-    The coding-plan endpoint reports overload as HTTP 429 with body code 1305
-    and message "The service may be temporarily overloaded...". Treat only
-    that narrow shape specially so ordinary quota/billing 429s still fail fast
-    through the existing classifier.
+    PARSED, not substring-matched: ``"z.ai" in base_url`` would also accept a
+    lookalike like ``api.z.ai.example.com``, and this decides how long Hermes
+    waits on someone's endpoint. Bare ``host/path`` still resolves.
     """
-    base = (base_url or "").lower()
-    model_name = (model or "").lower()
-    status = getattr(error, "status_code", None)
+    raw = (base_url or "").strip()
+    if not raw:
+        return False
+    host = (_urlsplit(raw).hostname or "").lower()
+    if not host:
+        host = raw.split("/", 1)[0].split(":", 1)[0].lower()
+    return host == "z.ai" or host.endswith(".z.ai")
+
+
+def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
+    """Return True for Z.AI transient overload 429s.
+
+    Z.AI reports overload as HTTP 429 with body code 1305 and message "The
+    service may be temporarily overloaded...". Treat only that narrow shape
+    specially so ordinary quota/billing 429s (e.g. 1310 "Weekly/Monthly Limit
+    Exhausted") still fail fast through the existing classifier.
+
+    The shape that matters is (429, Z.AI host, 1305) — deliberately NOT the
+    model id. Z.AI moves model aliases under users (``glm-4.7`` was retired
+    and redirected), so a gate naming one model silently stops matching the
+    moment the account's primary changes, and the whole long-backoff schedule
+    becomes unreachable while this function still reads as correct.
+
+    ``model`` is kept in the signature for call-site compatibility and is
+    intentionally unused.
+    """
+    if getattr(error, "status_code", None) != 429:
+        return False
+    if not _is_zai_host(base_url):
+        return False
     text = _error_text(error)
-    return (
-        status == 429
-        and "api.z.ai/api/coding/paas/v4" in base
-        and "glm-5.2" in model_name
-        and ("1305" in text or "temporarily overloaded" in text)
-    )
+    return "1305" in text or "temporarily overloaded" in text
 
 
 def adaptive_rate_limit_backoff(

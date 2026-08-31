@@ -208,3 +208,105 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+# ---------------------------------------------------------------------------
+# is_zai_coding_overload_error — which 429s earn the long-backoff schedule
+# ---------------------------------------------------------------------------
+
+
+class TestIsZaiCodingOverloadError:
+    ZAI_CODING = "https://api.z.ai/api/coding/paas/v4"
+
+    def test_production_model_qualifies(self):
+        """A gate keyed to one model id is dead code the moment the id moves.
+
+        z.ai retired the ``glm-4.7`` alias and began redirecting it, so an
+        install whose primary is ``glm-5.3-flash`` got no retry at all while
+        the function still looked correct.
+        """
+        assert is_zai_coding_overload_error(
+            base_url=self.ZAI_CODING, model="glm-5.3-flash", error=_zai_overload_error()
+        )
+
+    def test_any_model_on_a_zai_host_qualifies(self):
+        """1305 is the endpoint's condition, not one model's."""
+        for model in ("glm-5.2", "glm-5.3", "glm-5", "glm-4.5v", "", None):
+            assert is_zai_coding_overload_error(
+                base_url=self.ZAI_CODING, model=model, error=_zai_overload_error()
+            ), model
+
+    def test_host_is_parsed_not_substring_matched(self):
+        """This decides how long Hermes waits on someone's endpoint, so a
+        lookalike hostname must not inherit Z.AI's retry schedule."""
+        for base in (
+            "https://api.z.ai.example.com/v4",
+            "https://z.ai.evil.test/api/coding/paas/v4",
+            "https://notz.ai/v4",
+        ):
+            assert not is_zai_coding_overload_error(
+                base_url=base, model="glm-5.3-flash", error=_zai_overload_error()
+            ), base
+
+    def test_zai_hosts_and_paths_accepted(self):
+        """Any path on a Z.AI host, with or without a scheme."""
+        for base in (
+            "https://api.z.ai/api/coding/paas/v4",
+            "https://api.z.ai/api/paas/v4",
+            "https://z.ai/v4",
+            "api.z.ai/api/coding/paas/v4",
+        ):
+            assert is_zai_coding_overload_error(
+                base_url=base, model="glm-5.3-flash", error=_zai_overload_error()
+            ), base
+
+    def test_non_429_is_not_an_overload(self):
+        err = _zai_overload_error()
+        err.status_code = 500
+        assert not is_zai_coding_overload_error(
+            base_url=self.ZAI_CODING, model="glm-5.3-flash", error=err
+        )
+
+    def test_ordinary_quota_429_still_fails_fast(self):
+        """1310 is a spent subscription: retrying it just delays the fallback."""
+        err = SimpleNamespace(
+            status_code=429,
+            body={"error": {"code": "1310", "message": "Weekly/Monthly Limit Exhausted."}},
+        )
+        assert not is_zai_coding_overload_error(
+            base_url=self.ZAI_CODING, model="glm-5.3-flash", error=err
+        )
+
+    def test_missing_base_url_is_not_an_overload(self):
+        for base in (None, "", "   "):
+            assert not is_zai_coding_overload_error(
+                base_url=base, model="glm-5.3-flash", error=_zai_overload_error()
+            )
+
+    def test_another_provider_with_the_same_text_is_rejected(self):
+        assert not is_zai_coding_overload_error(
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-pro",
+            error=_zai_overload_error(),
+        )
+
+    def test_long_schedule_reachable_for_production_model(self, monkeypatch):
+        """The regression end to end: with the model gate in place the long
+        tier was unreachable for the model actually serving traffic."""
+        monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+        from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+        err = _zai_overload_error()
+        long_waits = []
+        for attempt in range(1, zai_coding_overload_retry_ceiling()):
+            wait, policy = adaptive_rate_limit_backoff(
+                attempt,
+                base_url=self.ZAI_CODING,
+                model="glm-5.3-flash",
+                error=err,
+                default_wait=1.0,
+            )
+            if policy == "zai_coding_overload_long":
+                long_waits.append(wait)
+
+        assert long_waits == [30.0, 60.0, 90.0, 120.0]
