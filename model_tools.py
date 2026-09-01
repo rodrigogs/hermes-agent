@@ -1253,6 +1253,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    agent: Optional[Any] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1283,6 +1284,59 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+
+    # ── Client tool bridge (relayed catalogs) ─────────────────────────
+    # A request that declared a `tools` catalog carries a per-agent bridge
+    # on the CALLING agent instance (agent-level tool paths pass it; the
+    # registry path never sees one).  A call to one of ITS names is
+    # executed client-side and never reaches the process registry.
+    _client_bridge = None
+    if agent is not None:
+        try:
+            from gateway.platforms.api_server_client_tools import bridge_for
+
+            _client_bridge = bridge_for(agent)
+        except Exception:
+            _client_bridge = None
+    if _client_bridge is not None:
+        if _client_bridge.has_tool(function_name):
+            _dispatch_start = time.monotonic()
+            result = _client_bridge.dispatch(
+                function_name, function_args, tool_call_id=tool_call_id or ""
+            )
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=int((time.monotonic() - _dispatch_start) * 1000),
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
+        if agent is not None and function_name not in (agent.valid_tool_names or set()):
+            # Unknown name in a bridge session: the catalog IS the tool
+            # surface the client promised; hint at it instead of implying a
+            # native toolset mismatch.
+            result = tool_error(
+                f"Unknown tool: {function_name}. This session's callable tools "
+                f"are the ones declared in the request's 'tools' catalog."
+            )
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them

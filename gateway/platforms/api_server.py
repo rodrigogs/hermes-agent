@@ -1591,6 +1591,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # the dict holds a strong reference for the life of the turn, so an
         # id() can never be recycled while it is still registered.
         self._shutdown_interruptible_agents: Dict[int, Any] = {}
+        # Client tool bridges (relayed tool catalogs), keyed by session id.
+        # One live bridge per chat request that declared a `tools` catalog:
+        # installed by _run_agent() when the turn starts, resolved by the
+        # /chat/tool-result endpoint, unregistered in the turn's finally
+        # (fail-closed — the bridge's close() wakes every parked thread).
+        self._session_client_tool_bridges: Dict[str, Any] = {}
+        self._session_client_tool_bridges_lock = threading.Lock()
         # Back-reference to the owning GatewayRunner (set by gateway/run.py)
         # so /api/platforms/{platform}/events can resolve sibling adapters.
         # BasePlatformAdapter declares the class-level default of None.
@@ -2243,6 +2250,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            ("POST", "/api/sessions/{session_id}/chat/tool-result", self._handle_session_tool_result),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
@@ -3359,6 +3367,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
+                "session_client_tools": True,
                 "session_fork": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
@@ -3421,6 +3430,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_tool_result": {"method": "POST", "path": "/api/sessions/{session_id}/chat/tool-result"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
                 "browser_control_register": {"method": "POST", "path": "/v1/browser-control/register"},
                 "browser_control_ws": {"method": "GET", "path": "/v1/browser-control/ws"},
@@ -4196,6 +4206,46 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return {key: message.get(key) for key in safe_keys if key in message}
 
+    # ------------------------------------------------------------------
+    # Client tool catalog (relayed tools) — shared helpers
+    # ------------------------------------------------------------------
+
+    def _validate_client_tools_body(self, body: Dict[str, Any]):
+        """Validate the optional `tools` catalog in a chat request body.
+
+        Returns ``(catalog, None)`` — catalog is {} when absent/empty — or
+        ``(None, Response)`` with a stable 400 on any malformed entry.
+        """
+        if "tools" not in body or body.get("tools") in (None, []):
+            return {}, None
+        from gateway.platforms.api_server_client_tools import (
+            ClientToolsError,
+            validate_client_tools,
+        )
+
+        try:
+            return validate_client_tools(body.get("tools")), None
+        except ClientToolsError as exc:
+            return None, web.json_response(
+                _openai_error(str(exc), code="invalid_client_tools"),
+                status=400,
+            )
+
+    def _client_tools_timeout(self) -> float:
+        """Configured wait for a client tool result.
+
+        Read from the platform's ``extra`` dict
+        (``platforms.api_server.extra.client_tools_timeout_seconds`` in
+        config.yaml), default 120 s; values below 1 s clamp to 1 s.
+        """
+        try:
+            extra = getattr(self.config, "extra", None) or {}
+            raw = extra.get("client_tools_timeout_seconds")
+            timeout = float(raw) if raw is not None else 120.0
+        except (TypeError, ValueError, AttributeError):
+            timeout = 120.0
+        return max(1.0, timeout)
+
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
             body = await request.json()
@@ -4617,6 +4667,9 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        client_tools, tools_err = self._validate_client_tools_body(body)
+        if tools_err is not None:
+            return tools_err
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -4683,6 +4736,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            client_tools=client_tools,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -4718,6 +4772,28 @@ class APIServerAdapter(BasePlatformAdapter):
             headers=headers,
         )
 
+    async def _handle_session_tool_result(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/chat/tool-result — deliver a client-executed tool result.
+
+        Resolves a pending client_tool.call emitted by a turn that declared a
+        `tools` catalog.  Unknown / already-resolved / late (turn ended)
+        tool_call_ids return a stable 409 — never a silent drop.
+        """
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+        session_id = request.match_info["session_id"]
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        from gateway.platforms.api_server_client_tools import build_tool_result_response
+
+        payload, status = build_tool_result_response(self, session_id, body, _openai_error)
+        return web.json_response(payload, status=status)
+
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
@@ -4734,6 +4810,9 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        client_tools, tools_err = self._validate_client_tools_body(body)
+        if tools_err is not None:
+            return tools_err
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -4833,6 +4912,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        def _client_tool_emit(call_id: str, name: str, args_json: str) -> None:
+            """SSE sink for relayed tool calls (client executes on its host)."""
+            _enqueue("client_tool.call", {
+                "message_id": message_id,
+                "tool_call_id": call_id,
+                "name": name,
+                "arguments": args_json,
+            })
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {
@@ -4856,6 +4944,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    client_tools=client_tools,
+                    client_tool_emit=_client_tool_emit,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -7265,6 +7355,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        client_tools: Optional[Dict[str, Any]] = None,
+        client_tool_emit=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7321,6 +7413,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                 )
                 agent = None
+                bridge = None
+                bridge_registered = False
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -7337,6 +7431,25 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
                     )
+                    if client_tools:
+                        # Relayed-catalog request (D6): build the per-request
+                        # bridge and register it so /chat/tool-result can
+                        # reach it.  ``client_tool_emit`` (stream path) is
+                        # the SSE sink for client_tool.call frames; the sync
+                        # path leaves it None — pending calls are surfaced
+                        # through the /chat response's tool_calls field.
+                        import gateway.platforms.api_server_client_tools as _ct
+
+                        bridge = _ct.ClientToolBridge(
+                            client_tools,
+                            timeout=self._client_tools_timeout(),
+                        )
+                        bridge.emit = client_tool_emit
+                        _bridge_key = session_id or f"bridge:{uuid.uuid4().hex}"
+                        with self._session_client_tool_bridges_lock:
+                            self._session_client_tool_bridges[_bridge_key] = bridge
+                        bridge_registered = True
+                        _ct.install_bridge(agent, bridge)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
@@ -7484,6 +7597,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     # in gateway/run.py's _run_sync_with_timeout_lifecycle.
                     if active_run_id:
                         self._active_run_agents.pop(active_run_id, None)
+                    if bridge_registered:
+                        # Fail-closed (D2/D5/D6): wake every parked tool call
+                        # and drop the registration so a late /tool-result
+                        # gets the stable 409.
+                        try:
+                            with self._session_client_tool_bridges_lock:
+                                self._session_client_tool_bridges.pop(_bridge_key, None)
+                        except Exception:
+                            pass
+                        if bridge is not None:
+                            try:
+                                bridge.close()
+                            except Exception:
+                                pass
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                         # Symmetric with the registration above: the turn is

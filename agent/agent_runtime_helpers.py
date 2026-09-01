@@ -3449,6 +3449,38 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # ── Client tool bridge (relayed catalogs) ─────────────────────────
+    # Same contract as the handle_function_call interception, but on the
+    # verbose path — a relayed tool must never reach the process registry.
+    try:
+        from gateway.platforms.api_server_client_tools import bridge_for
+
+        _client_bridge = bridge_for(agent)
+    except Exception:
+        _client_bridge = None
+    if _client_bridge is not None and _client_bridge.has_tool(function_name):
+        tool_start_time = time.monotonic()
+        result = _client_bridge.dispatch(
+            function_name, function_args, tool_call_id=tool_call_id or ""
+        )
+        try:
+            from model_tools import _emit_post_tool_call_hook
+
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                duration_ms=int((time.monotonic() - tool_start_time) * 1000),
+            )
+        except Exception:
+            pass
+        return result
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
