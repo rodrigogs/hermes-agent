@@ -49,6 +49,17 @@ class ClientToolsError(ValueError):
     """Raised for an invalid client tool catalog (maps to HTTP 400)."""
 
 
+class ClientToolsChannelActive(RuntimeError):
+    """A live client-tools channel already exists for this session (409).
+
+    Raised by the chat path when a second ``/chat`` request with a
+    ``tools`` catalog arrives while a previous request's bridge is still
+    registered and not closed — registering over it would orphan the first
+    turn's pending calls until their timeout, so the new turn is rejected
+    instead (code ``client_tools_channel_active``).
+    """
+
+
 def _reject(name: str, detail: str) -> None:
     raise ClientToolsError(f"client tool {name!r}: {detail}")
 

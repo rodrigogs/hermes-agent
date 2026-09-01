@@ -35,9 +35,16 @@ no `finally` acorda todas as threads pendentes (fail-closed, sem hang). A
 `_ApprovalEntry` provou o padrão em produção — é reuso, não invenção.
 
 **D3 — A bridge entra no `handle_function_call`, não na borda HTTP.** A tool
-relayada é despachada pelo MESMO funil das tools nativas: pre/post tool-call
-hooks, guardrails, middleware, post_tool_call observability. Um desvio na
-borda HTTP criaria uma segunda classe de tools invisível a hooks/audit.
+relayada é despachada pelo MESMO funil das tools nativas. Em um turno real
+(qualquer executor) o funil do executor — request middleware, pre_tool_call
+hooks, guardrails, post_tool_call terminal — vê a tool relayada normalmente;
+o intercept da bridge acontece DENTRO do dispatcher
+(`handle_function_call`/`invoke_tool`), antes do lookup no registry. Nuance:
+quando o dispatcher é chamado FORA de um turno (chamada direta, sem
+executor), o intercept é a primeira checagem — post_tool_call dispara, mas
+request/execution middleware e pre_tool_call hooks não rodam (o executor é
+quem os executa; uma chamada direta não tem executor). Não há segunda classe
+de tools invisível a hooks/audit no caminho de turno.
 
 **D4 — Injection pattern = context engine** (`agent/agent_init.py:2959-2994`):
 schemas anexados a `agent.tools` + `agent.valid_tool_names` APÓS o snapshot
@@ -91,18 +98,26 @@ que declara o catálogo.
 
 - `client_tool.call` — `{tool_call_id, name, arguments}` — a chamada que o
   cliente deve executar no host.
-- O resultado volta pelo corpo de `/chat` (campo `tool_results`) OU por
-  **POST /api/sessions/{id}/chat/tool-result** `{tool_call_id, output,
-  is_error}` em qualquer um dos dois modos. Idempotente: resposta a
-  `tool_call_id` desconhecido/antigo → 409 estável, nunca corrói o turno.
+- O resultado volta SEMPRE por **POST /api/sessions/{id}/chat/tool-result**
+  `{tool_call_id, output, is_error}` — no modo síncrono e no stream. O turno
+  fica estacionado (até `client_tools_timeout_seconds`, default 120 s)
+  enquanto o resultado não chega; não há campo `tool_results` no corpo do
+  `/chat`. Idempotente: resposta a `tool_call_id` desconhecido/antigo → 409
+  estável (`tool_call_not_pending`), nunca corrói o turno.
+- Um segundo `/chat` com `tools` na MESMA sessão enquanto o canal do turno
+  anterior está vivo → 409 estável `client_tools_channel_active` (o handler
+  síncrono responde HTTP 409; o stream emite evento `error` com o mesmo
+  `code`). Registrar por cima orfaria as chamadas pendentes do turno
+  anterior até o timeout.
 
-**Response do /chat síncrono** — além de `message`, o objeto carrega
-`tool_calls: [{id, name, arguments}]` pendentes quando o término do turno
-exigiu resultados do cliente (o cliente responde chamando /chat novamente com
-`tool_results` — mesma semântica do loop OpenAI que o Trama já fala).
+**Response do /chat síncrono** — forma normal do turno OpenAI: o modelo
+executa a(s) tool(s) dentro do MESMO turno (a thread do agente estaciona na
+bridge até o resultado chegar pelo POST acima, ou o timeout estourar) e a
+resposta carrega o `final_response` já incorporando os outputs relayados.
+Não há término antecipado com `tool_calls` pendentes no corpo.
 
-**`GET /v1/capabilities`** — `features.client_tools` (bool) +
-`endpoints.client_tool_result`.
+**`GET /v1/capabilities`** — `features.session_client_tools` (bool) +
+`endpoints.session_tool_result`.
 
 ## 4. Fluxo (stream)
 
@@ -116,25 +131,25 @@ exigiu resultados do cliente (o cliente responde chamando /chat novamente com
    thread acorda → resultado volta ao loop como tool result normal.
 5. Fim do turno: `unregister` no `finally` (D2/D5/D6).
 
-No modo síncrono, o turno TERMINA quando o modelo pede a tool: a resposta
-carrega as `tool_calls` pendentes e o histórico persiste o assistant message
-com `tool_calls`; o próximo `/chat` com `tool_results` injeta os resultados
-como mensagens `tool` e continua o loop. (Isso evita segurar uma conexão HTTP
-síncrona aberta por tempo não-bounded; o modo stream é o caminho de espera
-longa. Reuso: `_build_assistant_message` já preserva tool_calls no histórico.)
+No modo síncrono o contrato é o MESMO estacionamento: a conexão `/chat`
+permanece aberta enquanto a bridge aguarda o POST do resultado (bounded pelo
+timeout de 120 s; o endpoint responde assim que o turno termina). O
+estacionamento é por THREAD do agente, dentro do turno — nunca um fim
+antecipado do turno com `tool_calls` pendentes no corpo da resposta.
 
 ## 5. Arquivos
 
 | Arquivo | Mudança |
 |---|---|
 | `gateway/platforms/api_server_client_tools.py` | NOVO — módulo da bridge: validação de catálogo, `ClientToolBridge` (Event-based), handlers das rotas, resolução |
-| `gateway/platforms/api_server.py` | campo `tools` em ambos handlers de chat; plumagem `client_tools` em `_run_agent`/`_create_agent`; capabilities; rota `tool-result` |
+| `gateway/platforms/api_server.py` | campo `tools` em ambos handlers de chat; plumagem `client_tools` em `_run_agent`/`_create_agent`; capabilities; rota `tool-result`; 409 `client_tools_channel_active` em `/chat` (HTTP) e `/chat/stream` (evento `error`) |
 | `agent/agent_runtime_helpers.py` | `invoke_tool` consulta a bridge do agente antes do registry |
 | `model_tools.py` | `handle_function_call` idem (mesma checagem, ponto único) |
-| `tests/gateway/test_client_tools_api.py` | NOVO — suite do contrato |
+| `agent/tool_executor.py` | executor sequencial passa `agent=` ao `handle_function_call` — o intercept da bridge é agent-gated; sem isso, o turno com UMA tool call (o caso típico do relaying) nunca estaciona na bridge |
+| `tests/gateway/test_api_server_client_tools.py` | NOVO — suite do contrato |
 
-`agent/` (conversation_loop, tool_executor) NÃO muda: a bridge intercepta
-abaixo deles, no dispatcher.
+`agent/conversation_loop` NÃO muda: a bridge intercepta abaixo dele, no
+dispatcher, e o funil do executor é agnóstico à origem da tool.
 
 ## 6. Testes (contrato, não snapshot)
 
@@ -151,4 +166,4 @@ abaixo deles, no dispatcher.
 8. Regressão de alternation: assistant-with-tool_calls nunca fica sem par de
    resultados no histórico (regra #48879/#52592 mantida).
 
-Execução: `scripts/run_tests.sh tests/gateway/test_client_tools_api.py`.
+Execução: `scripts/run_tests.sh tests/gateway/test_api_server_client_tools.py`.

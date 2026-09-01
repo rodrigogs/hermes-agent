@@ -2534,6 +2534,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            # Relay-bridge intercept is agent-gated: without
+                            # this, a request-declared catalog tool in a
+                            # single-call turn ("Unknown tool") never reaches
+                            # the client.  Post-hook stays suppressed — the
+                            # executor owns the terminal event.
+                            agent=agent,
                         )
 
                 (
@@ -2616,6 +2622,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             tool_request_middleware_trace=list(middleware_trace),
                             enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                            # Relay-bridge intercept is agent-gated (P1): a
+                            # relayed catalog tool must park on the bridge
+                            # even in the single-call sequential path.
+                            agent=agent,
                         )
 
                 (

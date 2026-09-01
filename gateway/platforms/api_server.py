@@ -141,6 +141,9 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms.api_server_client_tools import (
+    ClientToolsChannelActive as _ct_ClientToolsChannelActive,
+)
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -4725,20 +4728,35 @@ class APIServerAdapter(BasePlatformAdapter):
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
         history = await self._conversation_history_for_session(session_id)
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-            route=route,
-            session_model=session_model,
-            requested_runtime=runtime_request.get("requested") or {},
-            route_source=runtime_request.get("route_source") or "global",
-            confirmed_runtime_lock=lock_active,
-            client_tools=client_tools,
-            **agent_overrides,
-        )
+        try:
+            result, usage = await self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+                route=route,
+                session_model=session_model,
+                requested_runtime=runtime_request.get("requested") or {},
+                route_source=runtime_request.get("route_source") or "global",
+                confirmed_runtime_lock=lock_active,
+                client_tools=client_tools,
+                **agent_overrides,
+            )
+        except _ct_ClientToolsChannelActive:
+            # P2: another /chat on this session holds the live client-tools
+            # channel.  Reject THIS request with the stable 409 instead of
+            # registering over the channel and orphaning the in-flight
+            # turn's pending calls until their timeout.
+            return web.json_response(
+                _openai_error(
+                    "session already has an active client-tools channel; "
+                    "resolve or wait for the in-flight chat to finish "
+                    "before sending another 'tools' request",
+                    code="client_tools_channel_active",
+                ),
+                status=409,
+            )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
@@ -5004,6 +5022,31 @@ class APIServerAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
                 raise
+            except _ct_ClientToolsChannelActive as exc:
+                # P2: this /chat/stream declared a `tools` catalog while the
+                # session already has a live client-tools channel.  Emit a
+                # typed error event (not the generic run failure) so the
+                # client can react — e.g. retry after the in-flight turn —
+                # instead of orphaning the previous turn's pending calls.
+                logger.warning(
+                    "Client-tools channel already active for session=%s: %s",
+                    session_id or "",
+                    exc,
+                )
+                self._set_run_status(
+                    run_id,
+                    "failed",
+                    error="client_tools_channel_active",
+                    last_event="run.failed",
+                )
+                await queue.put(_event_payload("error", {
+                    "message": (
+                        "session already has an active client-tools channel; "
+                        "resolve or wait for the in-flight chat to finish "
+                        "before sending another 'tools' request"
+                    ),
+                    "code": "client_tools_channel_active",
+                }))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 self._set_run_status(
@@ -7447,6 +7490,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         bridge.emit = client_tool_emit
                         _bridge_key = session_id or f"bridge:{uuid.uuid4().hex}"
                         with self._session_client_tool_bridges_lock:
+                            _existing = self._session_client_tool_bridges.get(
+                                _bridge_key
+                            )
+                            if (
+                                _existing is not None
+                                and not getattr(_existing, "closed", True)
+                            ):
+                                # P2: never overwrite a live channel — the
+                                # /tool-result resolver only sees the newest
+                                # bridge, so the previous turn's pending
+                                # calls would orphan until their timeout.
+                                # 409 the NEW chat instead; the in-flight
+                                # turn keeps its channel untouched.
+                                raise _ct.ClientToolsChannelActive(
+                                    f"session {session_id or _bridge_key} already "
+                                    "has an active client-tools channel from a "
+                                    "concurrent chat request"
+                                )
                             self._session_client_tool_bridges[_bridge_key] = bridge
                         bridge_registered = True
                         _ct.install_bridge(agent, bridge)
@@ -7562,6 +7623,18 @@ class APIServerAdapter(BasePlatformAdapter):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
                     return result, usage
+                except _ct_ClientToolsChannelActive:
+                    # P2: a concurrent chat on the same session declared a
+                    # `tools` catalog while this session's channel is still
+                    # live.  Re-raise for the caller to render (sync handler
+                    # → HTTP 409; stream handler → SSE error event with the
+                    # stable code) instead of silently overwriting — and
+                    # orphaning — the previous turn's pending calls.  The
+                    # finally below has nothing to unregister: the new
+                    # bridge never reached the registry (bridge_registered
+                    # is still False) and the in-flight turn's channel is
+                    # untouched.
+                    raise
                 except _ProviderAuthResolutionError as exc:
                     # Only _ProviderAuthResolutionError — raised exclusively
                     # where _resolve_runtime_agent_kwargs() is called inside
