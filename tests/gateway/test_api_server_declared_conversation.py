@@ -14,12 +14,20 @@ the durable conversation boundaries already recorded in
 ``sessions.end_reason``, and nothing that does not declare a key changes.
 """
 
+import asyncio
 import types
+from unittest.mock import MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import (
+    APIServerAdapter,
+    cors_middleware,
+    security_headers_middleware,
+)
 from hermes_state import SessionDB
 
 KEY = "agent:main:api_server:room-42:member-7"
@@ -364,3 +372,378 @@ class TestBindFollowsPrecedence:
 
         assert a._declared_conversation_session(KEY) == "sess-A"
         assert a._declared_conversation_session(OTHER_KEY) is None
+
+
+API_KEY = "test-api-key"
+
+
+@pytest.fixture
+def live(tmp_path):
+    """A real adapter behind real routes, with a scratch state.db attached."""
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": 0, "key": API_KEY})
+    )
+    db = SessionDB(tmp_path / "state.db")
+    adapter._session_db = db
+
+    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws)
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_post("/v1/runs", adapter._handle_runs)
+    try:
+        yield adapter, db, app
+    finally:
+        db.close()
+
+
+def _spy_run_agent(adapter, seen):
+    """Stand in for _run_agent, faithful to its bind contract.
+
+    Production records the peer in _run_agent's ``finally`` when the caller
+    opted in; mirroring that here keeps the assertion on the real handler's
+    decision AND on the row it produces, instead of on a gate expression
+    restated inside the test.
+    """
+
+    async def _fake(**kwargs):
+        seen.append(kwargs)
+        # AIAgent._ensure_db_session() creates the row during the turn.
+        sid = kwargs.get("session_id")
+        db = adapter._ensure_session_db()
+        if sid and db is not None and db.get_session(sid) is None:
+            db.create_session(session_id=sid, source=SOURCE, model="m")
+        if kwargs.get("bind_declared_conversation"):
+            adapter._bind_declared_conversation(
+                kwargs.get("session_id"), kwargs.get("gateway_session_key")
+            )
+        return (
+            {"final_response": "ok", "messages": [], "api_calls": 1},
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
+    return _fake
+
+
+def _headers(session_key=None):
+    h = {"Authorization": f"Bearer {API_KEY}"}
+    if session_key:
+        h["X-Hermes-Session-Key"] = session_key
+    return h
+
+
+class TestResponsesHandlerPrecedence:
+    """POST /v1/responses driven end to end, not a restated gate."""
+
+    @pytest.mark.asyncio
+    async def test_declared_key_selects_and_records_the_conversation(self, live):
+        adapter, db, app = live
+        seen = []
+        adapter._run_agent = _spy_run_agent(adapter, seen)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                json={"model": "hermes-agent", "input": "hi"},
+                headers=_headers(KEY),
+            )
+            assert resp.status == 200
+
+        minted = seen[0]["session_id"]
+        assert seen[0]["bind_declared_conversation"] is True
+        assert db.get_session(minted)["session_key"] == KEY
+
+    @pytest.mark.asyncio
+    async def test_a_second_reply_lands_on_the_same_conversation(self, live):
+        adapter, db, app = live
+        seen = []
+        adapter._run_agent = _spy_run_agent(adapter, seen)
+
+        async with TestClient(TestServer(app)) as cli:
+            for _ in range(3):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi"},
+                    headers=_headers(KEY),
+                )
+                assert resp.status == 200
+
+        assert len({k["session_id"] for k in seen}) == 1
+
+    @pytest.mark.asyncio
+    async def test_undeclared_request_keeps_a_per_request_id(self, live):
+        adapter, db, app = live
+        seen = []
+        adapter._run_agent = _spy_run_agent(adapter, seen)
+
+        async with TestClient(TestServer(app)) as cli:
+            for _ in range(2):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi"},
+                    headers=_headers(),
+                )
+                assert resp.status == 200
+
+        assert len({k["session_id"] for k in seen}) == 2
+        assert all(k["bind_declared_conversation"] is False for k in seen)
+
+    @pytest.mark.asyncio
+    async def test_the_response_chain_outranks_the_header_and_records_nothing(self, live):
+        """The blocker: a chained turn carrying a foreign key must not rebind."""
+        adapter, db, app = live
+        seen = []
+        adapter._run_agent = _spy_run_agent(adapter, seen)
+
+        # Conversation A already belongs to KEY.
+        _seed(db, "sess-A", key=KEY)
+        adapter._response_store.put(
+            "resp_A",
+            {
+                "conversation_history": [],
+                "session_id": "sess-A",
+                "instructions": None,
+            },
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                json={
+                    "model": "hermes-agent",
+                    "input": "hi",
+                    "previous_response_id": "resp_A",
+                },
+                headers=_headers(OTHER_KEY),
+            )
+            assert resp.status == 200
+
+        assert seen[0]["session_id"] == "sess-A"
+        assert seen[0]["bind_declared_conversation"] is False
+        # A keeps its own key; the header key cannot recover it.
+        assert db.get_session("sess-A")["session_key"] == KEY
+        assert adapter._declared_conversation_session(KEY) == "sess-A"
+        assert adapter._declared_conversation_session(OTHER_KEY) is None
+
+
+class TestRunsHandlerPrecedence:
+    """POST /v1/runs driven end to end.
+
+    /v1/runs owns its agent lifecycle rather than routing through _run_agent,
+    so the session it settled on is captured where it builds the agent.
+    """
+
+    @staticmethod
+    def _capture_agent(adapter, seen):
+        real = adapter._create_agent
+
+        def _spy(*a, **kw):
+            seen.append(kw)
+            agent = types.SimpleNamespace(
+                session_id=kw.get("session_id"),
+                session_prompt_tokens=0,
+                session_completion_tokens=0,
+                session_total_tokens=0,
+                run_conversation=lambda **_kw: {"final_response": "ok"},
+                interrupt=lambda *_a, **_k: None,
+            )
+            return agent
+
+        adapter._create_agent = _spy
+        return real
+
+    @pytest.mark.asyncio
+    async def test_declared_key_selects_the_conversation(self, live):
+        adapter, db, app = live
+        seen = []
+        self._capture_agent(adapter, seen)
+        _seed(db, "sess-live", key=KEY)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"model": "hermes-agent", "input": "hi"},
+                headers=_headers(KEY),
+            )
+            assert resp.status in (200, 202)
+
+        assert seen and seen[0]["session_id"] == "sess-live"
+
+    @pytest.mark.asyncio
+    async def test_explicit_body_session_outranks_the_header_key(self, live):
+        adapter, db, app = live
+        seen = []
+        self._capture_agent(adapter, seen)
+        _seed(db, "sess-live", key=KEY)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"model": "hermes-agent", "input": "hi",
+                      "session_id": "explicit-session"},
+                headers=_headers(KEY),
+            )
+            assert resp.status in (200, 202)
+
+        assert seen and seen[0]["session_id"] == "explicit-session"
+        # KEY still resolves to its own conversation, never the explicit one.
+        assert adapter._declared_conversation_session(KEY) == "sess-live"
+
+
+async def _await_run(adapter, run_id, timeout=10.0):
+    """Wait for a /v1/runs worker to finish, so settlement has happened."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if run_id not in adapter._active_run_agents:
+            # One more tick so the executor thread's finally can retire.
+            await asyncio.sleep(0.05)
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+def _stub_agent(adapter, session_id, seen):
+    """An agent good enough for the REAL _run_agent to drive end to end.
+
+    Replacing `_run_agent` itself cannot exercise its settlement block, which
+    is where a caller-local name leaked in and raised `NameError` on every
+    opted-in bind while mocked tests stayed green (@andrexibiza on #98811).
+    Stubbing one layer lower — `_create_agent` — leaves that block real.
+    """
+    agent = MagicMock()
+    agent.session_id = session_id
+    agent.session_prompt_tokens = 0
+    agent.session_completion_tokens = 0
+    agent.session_total_tokens = 0
+
+    def _run(**kwargs):
+        seen.append(kwargs)
+        db = adapter._ensure_session_db()
+        # AIAgent._ensure_db_session() creates the row during the turn.
+        if db is not None and db.get_session(session_id) is None:
+            db.create_session(session_id=session_id, source=SOURCE, model="m")
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    agent.run_conversation.side_effect = _run
+    return agent
+
+
+class TestRealRunAgentSettlement:
+    """The real `_run_agent` settlement block, not a stand-in for it."""
+
+    @pytest.mark.asyncio
+    async def test_declared_bind_settles_without_raising(self, live):
+        adapter, db, app = live
+        seen = []
+        created = {}
+
+        def _create(**kw):
+            created.update(kw)
+            return _stub_agent(adapter, kw["session_id"], seen)
+
+        adapter._create_agent = _create
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                json={"model": "hermes-agent", "input": "hi"},
+                headers=_headers(KEY),
+            )
+            assert resp.status == 200
+            body = await resp.json()
+
+        assert body["status"] == "completed"
+        sid = created["session_id"]
+        # Settlement ran for real: the row is bound and recoverable.
+        assert db.get_session(sid)["session_key"] == KEY
+        assert adapter._declared_conversation_session(KEY) == sid
+
+    @pytest.mark.asyncio
+    async def test_two_replies_settle_on_one_conversation(self, live):
+        adapter, db, app = live
+        seen = []
+        ids = []
+
+        def _create(**kw):
+            ids.append(kw["session_id"])
+            return _stub_agent(adapter, kw["session_id"], seen)
+
+        adapter._create_agent = _create
+
+        async with TestClient(TestServer(app)) as cli:
+            for _ in range(2):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi"},
+                    headers=_headers(KEY),
+                )
+                assert resp.status == 200
+
+        assert len(set(ids)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_chained_turn_never_rebinds_through_real_settlement(self, live):
+        adapter, db, app = live
+        seen = []
+
+        def _create(**kw):
+            return _stub_agent(adapter, kw["session_id"], seen)
+
+        adapter._create_agent = _create
+
+        _seed(db, "sess-A", key=KEY)
+        adapter._response_store.put(
+            "resp_A",
+            {"conversation_history": [], "session_id": "sess-A", "instructions": None},
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                json={"model": "hermes-agent", "input": "hi",
+                      "previous_response_id": "resp_A"},
+                headers=_headers(OTHER_KEY),
+            )
+            assert resp.status == 200
+
+        assert db.get_session("sess-A")["session_key"] == KEY
+        assert adapter._declared_conversation_session(OTHER_KEY) is None
+
+    @pytest.mark.asyncio
+    async def test_runs_explicit_unkeyed_session_stays_unbound(self, live):
+        """The reviewer's exact case: an unkeyed explicit row must not be taken.
+
+        `_run_sync` bound unconditionally, so an explicit body session_id that
+        existed with an empty `session_key` was silently adopted by the header
+        key even though the header lost precedence.
+        """
+        adapter, db, app = live
+        seen = []
+
+        def _create(**kw):
+            return _stub_agent(adapter, kw["session_id"], seen)
+
+        adapter._create_agent = _create
+
+        # Explicit session exists and carries NO routing key.
+        db.create_session(session_id="explicit-session", source=SOURCE, model="m")
+        _seed(db, "sess-live", key=KEY)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"model": "hermes-agent", "input": "hi",
+                      "session_id": "explicit-session"},
+                headers=_headers(KEY),
+            )
+            assert resp.status in (200, 202)
+            run_id = (await resp.json()).get("run_id")
+            assert run_id
+            # /v1/runs answers before the turn settles, so the assertion must
+            # wait for the worker's finally to run. Without this the test
+            # passes on timing rather than on the precedence gate.
+            assert await _await_run(adapter, run_id), "run never settled"
+
+        row = db.get_session("explicit-session")
+        assert not (row.get("session_key") or "")
+        assert adapter._declared_conversation_session(KEY) == "sess-live"
