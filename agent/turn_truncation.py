@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.error_classifier import FailoverReason
+from agent._truncation_boost_cap import models_dev_output_limit
 from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence
 from agent.repetition_guard import is_repetition_dominated
@@ -404,8 +405,14 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
             agent._buffer_vprint(f"⚠️  Stream interrupted mid tool-call — retrying ({n}/4)...")
         else:
             agent._buffer_vprint(f"⚠️  Truncated tool call detected — retrying API call ({n}/4)...")
-        agent._ephemeral_max_output_tokens = boosted_output_cap(
-            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), n
+        # Ceiling: the model's real output limit — the anthropic_messages
+        # adapter via boosted_output_cap, models.dev elsewhere (fix #79715).
+        _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+        _tc_boost = boosted_output_cap(agent, _tc_requested_cap, n)
+        _tc_models_dev_cap = models_dev_output_limit(
+            getattr(agent, "provider", None), getattr(agent, "model", None))
+        agent._ephemeral_max_output_tokens = (
+            max(_tc_boost, _tc_models_dev_cap) if _tc_models_dev_cap else _tc_boost
         )
         return st.done("continue")  # don't append the broken response
     agent._flush_status_buffer()

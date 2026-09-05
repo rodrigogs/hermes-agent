@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from agent.display import KawaiiSpinner
+from agent._truncation_boost_cap import models_dev_output_limit
 from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
 from agent.turn_context_compaction import _reanchor
 from agent.turn_truncation import boosted_output_cap
@@ -528,8 +529,16 @@ def apply_retry_restarts(
 
     if _retry.restart_with_length_continuation:
         # Boost the output budget per retry (shared ladder, see boosted_output_cap).
-        agent._ephemeral_max_output_tokens = boosted_output_cap(
-            agent, agent._requested_output_cap_from_api_kwargs(api_kwargs), length_continue_retries
+        # Ceiling: the model's real output limit — the anthropic_messages
+        # adapter via boosted_output_cap, models.dev elsewhere (fix #79715).
+        # The larger of the two wins so a known limit is never lost, and the
+        # ladder's 2×cap growth (#72770) is preserved.
+        _requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+        _boost = boosted_output_cap(agent, _requested_cap, length_continue_retries)
+        _models_dev_cap = models_dev_output_limit(
+            getattr(agent, "provider", None), getattr(agent, "model", None))
+        agent._ephemeral_max_output_tokens = (
+            max(_boost, _models_dev_cap) if _models_dev_cap else _boost
         )
         return _verdict("continue")
 
