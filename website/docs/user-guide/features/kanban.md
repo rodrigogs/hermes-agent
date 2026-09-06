@@ -65,7 +65,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
-  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.** A fresh checkout carries no gitignored files, so a project that needs its `.env` should install a [`worktree-created` hook](#worktree-created-hook).
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
@@ -509,6 +509,23 @@ def register(ctx):
         ctx.dispatch_tool("terminal", {"command": f"notify-send 'kanban blocked: {task_id}'"})
     ctx.register_hook("kanban_task_blocked", on_blocked)
 ```
+
+### Seeding a worktree workspace (`worktree-created`) {#worktree-created-hook}
+
+A linked worktree is a fresh checkout: it holds **tracked files and nothing else**, so everything git ignores is absent by definition — and for most real projects that includes the one file the project cannot start without (`.env`, `.env.dev`, `local.settings.json`). The worker lands in a repo that looks complete and fails at the first command that reads configuration, with an error about the *application* rather than about the *checkout*.
+
+Which secrets a project needs, and where they are kept, is deployment knowledge, so there is a seam for it: right after `git worktree add` succeeds, the dispatcher runs `$HERMES_HOME/hooks/worktree-created` — if a file exists there and is **executable** — as:
+
+```bash
+$HERMES_HOME/hooks/worktree-created <worktree-path> <repo-root> <branch>
+```
+
+with cwd set to the new worktree and the environment inherited. Typical body: symlink or copy the main checkout's gitignored `.env*` files into the worktree, decrypt a secrets bundle, `npm ci`, or warm a build cache.
+
+- **No hook installed → nothing changes.** A file that exists but is not executable is treated as a draft and skipped.
+- **It runs once per creation**, not on every dispatch: re-resolving an existing worktree takes the idempotent path and does not re-run the hook.
+- **A failing hook raises** and the card fails with the hook's stderr in the reason. That is deliberate: the hook only exists because you installed it, so a non-zero exit is a configuration error worth seeing now, instead of handing the worker a checkout missing exactly what the hook was there to provide. Same for a hook that hangs — it is killed after 120s and the card fails.
+- **Unrelated to the `hooks:` block in `config.yaml`** and to the plugin hooks above: those gate tool calls and board transitions. This one is a plain executable in your own Hermes home, which is its own consent — it needs no allowlist entry and never prompts, because it runs unattended.
 
 ### Goal-mode cards (`--goal`)
 
