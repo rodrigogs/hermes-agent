@@ -531,13 +531,55 @@ async def loop_heartbeat_forever(
     except (TypeError, ValueError):
         interval = DEFAULT_HEARTBEAT_INTERVAL_S
 
+    def _write_both() -> None:
+        """Refresh the heartbeat file and re-stamp ``gateway_state.json``.
+
+        The second write exists because ``gateway_state.json`` is otherwise only
+        rewritten on lifecycle transitions (running / draining / stopped) and at
+        in-process turn boundaries, so an IDLE gateway — or one whose only work is
+        spawning kanban workers, which are separate processes rather than gateway
+        turns — stops touching it entirely. Its ``updated_at`` then ages without
+        bound while the gateway is perfectly alive, and every consumer that reads
+        recency off that field concludes the opposite.
+
+        Measured: hermes-webui's cross-container liveness check treats
+        ``updated_at`` as a heartbeat ("the gateway writes it on every tick") with
+        a 120s window, and reported ``gateway_stale_running_state`` — "the
+        gateway is marked as configured, but its health metadata has gone stale",
+        with the Scheduled Jobs panel warning that cron would not tick — against a
+        gateway whose pid 1 was ``hermes gateway run``, with ``updated_at`` 2h16m
+        old and ``active_agents: 0``. Nothing was wrong except the file.
+
+        This loop is the right owner: it already ticks every 30s, well inside that
+        window, and it is already the signal that goes stale when the loop
+        freezes. Both writes therefore keep the same liveness semantics, and a
+        frozen loop still ages both files.
+
+        ``write_runtime_status()`` with no arguments is the same call
+        ``_persist_active_agents`` makes: read-merge-write, so every field except
+        the re-stamped identity and ``updated_at`` is preserved and the lifecycle
+        state cannot be clobbered.
+
+        Skipped when ``home`` is overridden, which only a test does: the runtime
+        status path comes from the ambient HERMES_HOME and has no ``home``
+        parameter, so honouring the override is impossible and ignoring it would
+        write into the developer's real home.
+        """
+        write_loop_heartbeat(start_time=start_time, home=home)
+        if home is not None:
+            return
+        try:
+            from gateway.status import write_runtime_status
+
+            write_runtime_status()
+        except Exception:
+            logger.debug("gateway_state.json re-stamp failed", exc_info=True)
+
     async def _write_off_loop() -> None:
         # write_loop_heartbeat never raises, so a failure here is an executor
         # problem (shutdown, saturation) and must not kill the heartbeat task.
         try:
-            await asyncio.to_thread(
-                write_loop_heartbeat, start_time=start_time, home=home
-            )
+            await asyncio.to_thread(_write_both)
         except asyncio.CancelledError:
             raise
         except Exception:
