@@ -5640,6 +5640,108 @@ def _interpolate_env_vars(value):
     return value
 
 
+# Env refs that survived interpolation, and what to do about them.
+#
+# `_interpolate_env_vars` leaves the literal `${VAR}` in place when VAR is unset, and that placeholder
+# used to be handed to the MCP server as if it were a value. Measured consequence: a Hermes One turn
+# ran in a process without JIRA_URL, and `${JIRA_URL}` reached mcp-atlassian verbatim, which died with
+# `requests.exceptions.MissingSchema: Invalid URL '${JIRA_URL}/rest/api/2/search...'` -- a failure whose
+# message names requests, not the missing variable, and which cost a long debugging session. A second,
+# still-latent instance of the same shape: a config passing `${JIRA_PERSONAL_TOKEN}` when that variable
+# is unset is harmless only because mcp-atlassian ignores personal_token on Cloud; on Server/DC it
+# would authenticate with the literal string.
+#
+# So: never pass a placeholder on. Two severities, because they are genuinely different:
+#
+#   SOME entries of env / headers   -> drop those entries and warn. Optional credentials live here, and
+#                                      a server that ignores an absent token (Cloud, above) keeps
+#                                      working with the rest of its configuration intact.
+#   ALL entries of env / headers    -> do not register. A mapping that was entirely placeholders leaves
+#                                      the server with no configuration at all: measured, the `jira`
+#                                      entry passes exactly JIRA_URL/USERNAME/API_TOKEN/PERSONAL_TOKEN
+#                                      and nothing else, so dropping all four would start mcp-atlassian
+#                                      with no Jira to talk to.
+#   anywhere else unresolved        -> do not register the server at all and warn. `url`, `command` and
+#                                      `args` have no meaning half-filled, and registering is what
+#                                      turns a missing variable into an error from a subprocess.
+#
+# Variable NAMES are logged, never values.
+_PLACEHOLDER_MAPPINGS = ("env", "headers")
+
+
+def _unresolved_env_refs(value) -> List[str]:
+    """Env-var names still in `${...}` form after interpolation, deduped, in encounter order."""
+    found: List[str] = []
+
+    def walk(node):
+        if isinstance(node, str):
+            for m in _ENV_VAR_PATTERN.finditer(node):
+                body = m.group(1).strip()
+                # Context vars (${userHome} and friends) always resolve, so anything left is an env ref.
+                if _context_var_value(body) is not None:
+                    continue
+                name = _env_ref_name(body)
+                if name and name not in found:
+                    found.append(name)
+        elif isinstance(node, dict):
+            for item in node.values():
+                walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(value)
+    return found
+
+
+def _strip_unresolved_placeholders(server: str, cfg: dict) -> Tuple[Optional[dict], List[str]]:
+    """Drop `env`/`headers` entries with unset refs; refuse the server if any other field has one.
+
+    Returns (cfg, dropped_names) or (None, fatal_names) when the server must not be registered.
+    """
+    cleaned = dict(cfg)
+    dropped: List[str] = []
+    for mapping_key in _PLACEHOLDER_MAPPINGS:
+        mapping = cleaned.get(mapping_key)
+        if not isinstance(mapping, dict):
+            continue
+        kept = {}
+        for key, val in mapping.items():
+            refs = _unresolved_env_refs(val)
+            if refs:
+                dropped.extend(r for r in refs if r not in dropped)
+                continue
+            kept[key] = val
+        if kept != mapping:
+            if mapping and not kept:
+                logger.warning(
+                    "MCP server '%s' NOT registered: every entry of its `%s` was an unset placeholder "
+                    "(%s), so it would start with no configuration at all. Set the variables where this "
+                    "process can see them (env_file / <HERMES_HOME>/.env).",
+                    server, mapping_key, ", ".join(_unresolved_env_refs(mapping)),
+                )
+                return None, _unresolved_env_refs(mapping)
+            cleaned[mapping_key] = kept
+
+    rest = {k: v for k, v in cleaned.items() if k not in _PLACEHOLDER_MAPPINGS}
+    fatal = _unresolved_env_refs(rest)
+    if fatal:
+        logger.warning(
+            "MCP server '%s' NOT registered: %s unset in this process, and the placeholder would be "
+            "sent to the server verbatim. Set the variable where this process can see it "
+            "(env_file / <HERMES_HOME>/.env) or remove the reference from the config.",
+            server, ", ".join(fatal),
+        )
+        return None, fatal
+    if dropped:
+        logger.warning(
+            "MCP server '%s': dropped %s from its env/headers -- unset here, and passing the literal "
+            "placeholder is worse than passing nothing.",
+            server, ", ".join(dropped),
+        )
+    return cleaned, dropped
+
+
 # (server_name, dotted key path) pairs already warned about — see
 # _warn_hidden_whitespace(); config loads happen on every discovery pass.
 _whitespace_warned: Set[Tuple[str, str]] = set()
@@ -5749,6 +5851,9 @@ def _load_mcp_config() -> Dict[str, dict]:
         for name, cfg in _filter_suspicious_mcp_servers(servers).items():
             interpolated = _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
+                interpolated, _ = _strip_unresolved_placeholders(name, interpolated)
+                if interpolated is None:
+                    continue
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
         try:
