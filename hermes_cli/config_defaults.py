@@ -1028,9 +1028,25 @@ DEFAULT_CONFIG = {
     # Only used when model.provider is "bedrock".
     "bedrock": {
         "region": "",  # AWS region for Bedrock API calls (empty = AWS_REGION env var → us-east-1)
+        # Model discovery for the /model picker. All three filters default to
+        # upstream's permissive behaviour: discovery on, nothing filtered.
+        #
+        # Why filters exist at all: ListFoundationModels answers "what exists
+        # in this region", not "what this account may invoke". Where an org SCP
+        # or a missing AWS Marketplace agreement trims access, discovery offers
+        # models that fail at call time with AccessDeniedException, and only an
+        # actual `converse` call can tell the two apart.
         "discovery": {
             "enabled": True,           # Auto-discover models via ListFoundationModels
             "provider_filter": [],     # Only show models from these providers (e.g. ["anthropic", "amazon"])
+            # Exact model / inference-profile ids to keep, case-insensitive; []
+            # keeps everything discovery returns. Use this rather than
+            # provider_filter when access varies WITHIN a provider — Bedrock's
+            # OpenAI family serves gpt-oss and refuses gpt-5.6 on the same
+            # account, which a provider-level filter cannot express. No prefix
+            # or glob matching on purpose: a prefix rule would silently admit a
+            # newly-published model nobody has verified access to.
+            "model_allowlist": [],
             "refresh_interval": 3600,  # Cache discovery results for this many seconds
         },
         "guardrail": {
@@ -2916,6 +2932,17 @@ DEFAULT_CONFIG = {
         #     openrouter:
         #       url: https://example.com/my-curation.json
         "providers": {},
+        # Provider slugs to hide from every model picker — `hermes model`,
+        # the gateway /model command, the TUI and `hermes inventory`. Matched
+        # case-insensitively against the slug or any of its aliases. Already
+        # honoured by all of those surfaces; listed here so it is discoverable
+        # and passes schema validation instead of only existing in the readers.
+        #
+        # This hides providers, it does not disable them: a slug named in
+        # config or passed to --provider still resolves. Use it on an install
+        # that holds credentials for one rail, so the picker stops offering
+        # rails that would fail at call time.
+        "excluded_providers": [],
     },
 
     # Per-model metadata overrides — manually declare context_window,

@@ -184,3 +184,71 @@ def provider_catalog() -> list[ProviderDescriptor]:
 def provider_catalog_by_slug() -> dict[str, ProviderDescriptor]:
     """Convenience: the catalog keyed by slug."""
     return {d.slug: d for d in provider_catalog()}
+
+
+# ---------------------------------------------------------------------------
+# Visibility — ``model_catalog.excluded_providers``
+# ---------------------------------------------------------------------------
+# The model pickers (``hermes model``, the gateway ``/model``, the TUI,
+# ``hermes_cli.inventory``) already honour this key; the desktop credential tabs
+# did not, because they derive membership from ``provider_catalog()`` and nothing
+# filtered it. On an install that holds one provider credential that left the
+# GUI offering key/account cards for 45 rails that cannot authenticate.
+#
+# Filtering happens HERE rather than inside ``provider_catalog()`` on purpose:
+# that function's parity contract ("the union of the two tabs equals the
+# CANONICAL_PROVIDERS universe") is locked by tests and is about the universe,
+# not about what one install chooses to show. Membership stays complete;
+# visibility is a separate question with its own function.
+
+
+def _excluded_provider_names() -> frozenset[str]:
+    """Return ``model_catalog.excluded_providers``, lowercased."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return frozenset()
+    raw = (cfg.get("model_catalog") or {}).get("excluded_providers") or []
+    return frozenset(str(p).strip().lower() for p in raw if str(p).strip())
+
+
+def _names_for_slug(slug: str) -> set[str]:
+    """Return a slug plus every alias that resolves to it, lowercased.
+
+    Aliases are part of the match so ``excluded_providers: [aws]`` hides
+    ``bedrock`` — the same behaviour the CLI picker implements, and the reason
+    an exclusion list must never name an alias of a provider it means to keep.
+    """
+    canonical = str(slug or "").strip().lower()
+    names = {canonical}
+    try:
+        from hermes_cli.models import _PROVIDER_ALIASES
+        for alias, canon in _PROVIDER_ALIASES.items():
+            if str(canon or "").strip().lower() == canonical:
+                names.add(str(alias).strip().lower())
+    except Exception:
+        pass
+    return names
+
+
+def provider_is_excluded(slug: str) -> bool:
+    """True when *slug* (or one of its aliases) is in ``excluded_providers``."""
+    excluded = _excluded_provider_names()
+    if not excluded:
+        return False
+    return bool(_names_for_slug(slug) & excluded)
+
+
+def visible_provider_catalog() -> list[ProviderDescriptor]:
+    """``provider_catalog()`` minus ``model_catalog.excluded_providers``.
+
+    Returns the full catalog when the key is unset, so this is a no-op on an
+    install that has not opted in. Hiding is not disabling: an excluded slug
+    named in config or passed to ``--provider`` still resolves, which is what
+    keeps this safe to apply to a running install.
+    """
+    excluded = _excluded_provider_names()
+    if not excluded:
+        return provider_catalog()
+    return [d for d in provider_catalog() if not (_names_for_slug(d.slug) & excluded)]

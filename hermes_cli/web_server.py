@@ -8162,8 +8162,12 @@ def _catalog_provider_env_metadata() -> dict:
     Hand ``OPTIONAL_ENV_VARS`` prose is layered ON TOP of this in the endpoint;
     this only supplies membership + grouping + sensible fallbacks.
     """
+    # visible_ rather than plain provider_catalog: an install that sets
+    # model_catalog.excluded_providers gets the same trimmed list in the Keys
+    # tab that `hermes model` already showed, instead of key cards for rails it
+    # holds no credential for.
     try:
-        from hermes_cli.provider_catalog import provider_catalog
+        from hermes_cli.provider_catalog import visible_provider_catalog as provider_catalog
     except Exception:
         return {}
 
@@ -11159,9 +11163,21 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
     rows: list[Dict[str, Any]] = []
     seen: set[str] = set()
 
+    # model_catalog.excluded_providers applies to BOTH lists below. The explicit
+    # cards need it as much as the catalog-derived ones: they are the hand-tuned
+    # rows for nous, openai-codex and the Anthropic PKCE / claude-code
+    # subscription flows, none of which can authenticate on an install that
+    # excluded them. `provider_is_excluded` matches aliases, so a synthetic id
+    # that is not a catalog provider simply never matches and stays visible.
+    try:
+        from hermes_cli.provider_catalog import provider_is_excluded as _excluded
+    except Exception:
+        def _excluded(_slug: str) -> bool:  # noqa: D401 - defensive fallback
+            return False
+
     # 1. Explicit hand-tuned cards (authoritative metadata + curated order).
     for entry in _OAUTH_PROVIDER_CATALOG:
-        if entry["id"] in seen:
+        if entry["id"] in seen or _excluded(entry["id"]):
             continue
         seen.add(entry["id"])
         rows.append(dict(entry))
@@ -11169,7 +11185,7 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
     # 2. Catalog accounts-providers not already covered — keeps the Accounts tab
     #    in lockstep with the `hermes model` universe (zero-edit for new plugins).
     try:
-        from hermes_cli.provider_catalog import provider_catalog
+        from hermes_cli.provider_catalog import visible_provider_catalog as provider_catalog
         for d in provider_catalog():
             if d.tab != "accounts" or d.slug in seen:
                 continue

@@ -689,22 +689,86 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # unavailable (no boto3, no credentials, or API error).  The agent
     # prefers live discovery via ListFoundationModels + ListInferenceProfiles.
     # Use inference profile IDs (us.*) since most models require them.
+    #
+    # EVERY ID HERE ANSWERED `bedrock-runtime converse` on account
+    # 300094254121 in us-west-2 on 2026-09-04, with maxTokens 16. That matters
+    # because the list this replaced was assembled from catalog listings, and
+    # listing is not access: of its 15 entries, 8 could never have answered —
+    # `deepseek.v3.2` and both `us.meta.llama4-*` are denied by an org service
+    # control policy, `openai.gpt-5.6-{sol,terra,luna}` report
+    # `agreementAvailability: NOT_AVAILABLE` (no AWS Marketplace agreement),
+    # and `openai.gpt-5.5` is not in the region's catalog at all. A fallback
+    # list is what the picker shows when discovery is down, so a wrong entry
+    # here is an offer that fails at call time.
+    #
+    # TEXT ONLY, and streaming-capable, matching what discover_bedrock_models
+    # keeps. The same account also has four Titan embedding models and
+    # `amazon.rerank-v1:0`, which are not chat models and do not belong in a
+    # model picker.
+    #
+    # `global.*` twins of the Anthropic entries are verified too and are left
+    # out on purpose: they route worldwide for better throughput but would
+    # double the length of this list. Add the specific ones you want rather
+    # than all of them. One exception is worth knowing:
+    # `global.anthropic.claude-opus-4-7` returns InternalServerException on
+    # every attempt while the `us.` profile below works.
     "bedrock": [
+        # Anthropic. The first four are this install's router tiers T4..T1.
+        "us.anthropic.claude-opus-5",
+        "us.anthropic.claude-opus-4-8",
         "us.anthropic.claude-sonnet-5",
-        "us.anthropic.claude-sonnet-4-6",
-        "us.anthropic.claude-opus-4-6-v1",
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-fable-5-1",
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-4-6-v1",
+        "us.anthropic.claude-opus-4-5-20251101-v1:0",
+        "us.anthropic.claude-sonnet-4-6",
         "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-        "openai.gpt-5.5",
-        "openai.gpt-5.6-sol",
-        "openai.gpt-5.6-terra",
-        "openai.gpt-5.6-luna",
+        # LEGACY lifecycle, still answering.
+        "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        # Amazon Nova.
         "us.amazon.nova-pro-v1:0",
-        "us.amazon.nova-lite-v1:0",
+        "us.amazon.nova-2-lite-v1:0",
         "us.amazon.nova-micro-v1:0",
-        "deepseek.v3.2",
-        "us.meta.llama4-maverick-17b-instruct-v1:0",
-        "us.meta.llama4-scout-17b-instruct-v1:0",
+        "amazon.nova-lite-v1:0",
+        "us.amazon.nova-premier-v1:0",
+        # Qwen.
+        "qwen.qwen3-coder-480b-a35b-v1:0",
+        "qwen.qwen3-coder-30b-a3b-v1:0",
+        "qwen.qwen3-235b-a22b-2507-v1:0",
+        "qwen.qwen3-vl-235b-a22b",
+        "qwen.qwen3-next-80b-a3b",
+        "qwen.qwen3-32b-v1:0",
+        # OpenAI, open-weight only. The GPT-5.6 family is Marketplace-gated on
+        # this account; gpt-oss is Converse-capable and reachable.
+        "openai.gpt-oss-120b-1:0",
+        "openai.gpt-oss-20b-1:0",
+        "openai.gpt-oss-safeguard-120b",
+        "openai.gpt-oss-safeguard-20b",
+        # NVIDIA Nemotron.
+        "nvidia.nemotron-super-3-120b",
+        "nvidia.nemotron-nano-3-30b",
+        "nvidia.nemotron-nano-12b-v2",
+        "nvidia.nemotron-nano-9b-v2",
+        # Z.AI GLM.
+        "zai.glm-5",
+        "zai.glm-4.7",
+        "zai.glm-4.7-flash",
+        # MiniMax.
+        "minimax.minimax-m2.5",
+        "minimax.minimax-m2.1",
+        "minimax.minimax-m2",
+        # Moonshot Kimi. Note the two different vendor prefixes — both are real.
+        "moonshotai.kimi-k2.5",
+        "moonshot.kimi-k2-thinking",
+        # Google Gemma.
+        "google.gemma-3-27b-it",
+        "google.gemma-3-12b-it",
+        "google.gemma-3-4b-it",
+        # xAI. Rejects maxTokens below 16 with `integer_below_min_value`.
+        "us.xai.grok-4.6",
     ],
     # Azure Foundry: user-provided endpoint and model.
     # Empty list because models depend on the endpoint configuration.

@@ -573,6 +573,59 @@ def resolve_bedrock_runtime_region(config: Optional[Dict[str, Any]] = None) -> s
     return resolve_bedrock_region()
 
 
+# ---------------------------------------------------------------------------
+# Discovery policy — config-driven, because listing is not access
+# ---------------------------------------------------------------------------
+# ListFoundationModels / ListInferenceProfiles answer "what exists in this
+# region", never "what this account may invoke". Where Bedrock access is
+# trimmed by an org service control policy or a missing AWS Marketplace
+# agreement the two sets diverge badly, and every id in the gap is a picker
+# entry that fails at call time with AccessDeniedException. Only invocation
+# proves access, so the operator-verified set has to come from config.
+#
+# ``bedrock.discovery.enabled`` and ``bedrock.discovery.provider_filter`` were
+# already documented in hermes_cli/config_defaults.py and read by nothing;
+# ``discover_bedrock_models`` accepted a ``provider_filter`` argument no caller
+# ever passed. This wires both and adds ``model_allowlist`` for the per-model
+# case, which a provider-level filter cannot express: access varies WITHIN a
+# provider (Bedrock's OpenAI family serves gpt-oss and refuses gpt-5.6).
+#
+# All three default to the permissive upstream behaviour, so an install that
+# sets none of them discovers exactly what it discovered before.
+
+
+def _discovery_policy() -> Tuple[bool, List[str], frozenset]:
+    """Return ``(enabled, provider_filter, model_allowlist)`` from config."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        cfg = {}
+    discovery = ((cfg.get("bedrock") or {}).get("discovery") or {})
+    provider_filter = [
+        str(p).strip() for p in (discovery.get("provider_filter") or []) if str(p).strip()
+    ]
+    allowlist = frozenset(
+        str(m).strip().lower() for m in (discovery.get("model_allowlist") or []) if str(m).strip()
+    )
+    return (bool(discovery.get("enabled", True)), provider_filter, allowlist)
+
+
+def apply_bedrock_model_allowlist(model_ids: List[str]) -> List[str]:
+    """Filter *model_ids* down to ``bedrock.discovery.model_allowlist``.
+
+    Returns the list unchanged when no allowlist is configured, keeping this a
+    no-op on installs that have not opted in. Matching is case-insensitive on
+    the exact id, so an allowlist entry names one concrete model or inference
+    profile — there is no prefix or glob matching, deliberately: a prefix rule
+    would silently re-admit a new model nobody has verified access to.
+    """
+    _enabled, _provider_filter, allowlist = _discovery_policy()
+    if not allowlist:
+        return list(model_ids or [])
+    return [m for m in (model_ids or []) if str(m).strip().lower() in allowlist]
+
+
 def bedrock_model_ids_or_none() -> Optional[List[str]]:
     """Live-discover Bedrock model IDs for the active region.
 
@@ -587,7 +640,17 @@ def bedrock_model_ids_or_none() -> Optional[List[str]]:
     try:
         discovered = discover_bedrock_models(resolve_bedrock_runtime_region())
         if discovered:
-            return merge_bedrock_openai_model_ids([m["id"] for m in discovered])
+            merged = merge_bedrock_openai_model_ids([m["id"] for m in discovered])
+            # Filtered AFTER the merge, not before: merge_bedrock_openai_model_ids
+            # appends the Mantle-only OpenAI ids unconditionally, and those are
+            # exactly the ones an allowlist most often has to drop — the control
+            # plane never enumerates them, so nothing else can filter them.
+            filtered = apply_bedrock_model_allowlist(merged)
+            # An allowlist that matches nothing means the configured set has gone
+            # (region change, ids retired). Returning None hands the caller the
+            # static curated list rather than an empty picker.
+            if filtered:
+                return filtered
     except Exception:
         pass
     return None
@@ -1417,7 +1480,23 @@ def discover_bedrock_models(
     """
     import time
 
-    cache_key = f"{region}:{','.join(sorted(provider_filter or []))}"
+    # Config policy: `enabled` off short-circuits discovery entirely (callers
+    # then use their static curated list), and `provider_filter` from config
+    # applies only when the caller passed none, so an explicit argument still
+    # wins.
+    policy_enabled, policy_provider_filter, policy_allowlist = _discovery_policy()
+    if not policy_enabled:
+        return []
+    if provider_filter is None and policy_provider_filter:
+        provider_filter = policy_provider_filter
+
+    # The allowlist is part of the cache key: editing it in config.yaml has to
+    # invalidate a cached list, or the change appears to do nothing for an hour.
+    cache_key = "{}:{}:{}".format(
+        region,
+        ",".join(sorted(provider_filter or [])),
+        ",".join(sorted(policy_allowlist)),
+    )
     cached = _discovery_cache.get(cache_key)
     if cached and (time.time() - cached["timestamp"]) < _DISCOVERY_CACHE_TTL_SECONDS:
         return cached["models"]
@@ -1514,6 +1593,13 @@ def discover_bedrock_models(
             seen_ids.add(profile_id.lower())
     except Exception as e:
         logger.debug("Skipping inference profile discovery: %s", e)
+
+    # Drop everything outside the operator-verified set, if one is configured.
+    if policy_allowlist:
+        models = [
+            m for m in models
+            if str(m.get("id") or "").strip().lower() in policy_allowlist
+        ]
 
     # Sort: global cross-region profiles first (recommended), then alphabetical
     models.sort(key=lambda m: (
