@@ -7819,6 +7819,57 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _run_worktree_created_hook(repo_root, target, branch_name)
+
+
+def _run_worktree_created_hook(repo_root: Path, target: Path, branch_name: str) -> None:
+    """Run ``$HERMES_HOME/hooks/worktree-created`` if the operator installed one.
+
+    A linked worktree is a fresh checkout, so it contains tracked files and NOTHING ELSE. Anything
+    git ignores is absent by definition -- and for most real projects that includes the file the
+    project cannot run without: a ``.env`` / ``.env.dev`` / ``local.settings.json`` holding the
+    database URL and the API keys. The card's worker then lands in a repository that looks complete,
+    and fails at the first command that needs configuration, with an error about the application
+    rather than about the checkout.
+
+    Nothing in this file can fix that generically -- which secrets a project needs, and where they
+    are kept, is deployment knowledge. So this is the seam for it: argv is
+    ``<worktree-path> <repo-root> <branch>``, the environment is inherited, and the hook is whatever
+    the operator made executable at that path. Absent hook, no behaviour change at all.
+
+    NOT the ``hooks:`` block in config.yaml (agent.shell_hooks): that machinery gates TOOL CALLS and
+    gates itself behind an allowlist with a TTY consent prompt, neither of which fits a path that runs
+    unattended inside a dispatcher. A file the operator placed in their own Hermes home is its own
+    consent.
+
+    A failing hook RAISES, and that is deliberate rather than defensive. The hook exists only because
+    somebody installed it, so its failure is a configuration error they want to see now; the
+    alternative -- log it and carry on -- hands the worker a checkout that is missing exactly what the
+    hook was there to provide, and buys a confusing failure later in place of a clear one here.
+    """
+    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+    hook = home / "hooks" / "worktree-created"
+    if not hook.is_file() or not os.access(hook, os.X_OK):
+        return
+    try:
+        result = subprocess.run(
+            [str(hook), str(target), str(repo_root), branch_name],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"worktree-created hook {hook} could not run: {exc}") from exc
+    out = (result.stdout or "").strip()
+    if out:
+        _log.info("worktree-created hook: %s", out[:2000])
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"worktree-created hook {hook} failed (exit {result.returncode}) for {target}: "
+            f"{stderr[:1000]}"
+        )
 
 
 def _resolve_worktree_workspace(
