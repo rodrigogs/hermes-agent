@@ -44,6 +44,15 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                # Bedrock routing is model-dependent: a Claude id goes through the
+                # AnthropicBedrock SDK (anthropic_messages), anything else through
+                # Converse (bedrock_converse). The resolver already derives that from
+                # ``target_model`` when given one; without it, it falls back to
+                # ``model.default`` in config.yaml — so ``-m zai.glm-4.7-flash`` on a
+                # Claude-default profile went out on the Anthropic wire and Bedrock
+                # answered ``400 Invalid 'tools': missing field 'type'``, after which
+                # the fallback chain quietly replaced the requested model (#50292).
+                target_model=self.model or None,
             )
         except Exception as exc:
             _primary_exc = exc
