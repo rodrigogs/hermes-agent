@@ -8941,7 +8941,51 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+_RUN_START_MARKER = b"\n=== kanban run start ===\n"
+
+
+def _checkpoint_from_worker_log(
+    task_id: str, board: Optional[str] = None, max_bytes: int = 4096
+) -> Optional[str]:
+    """Recover a crash checkpoint from the worker's per-task log.
+
+    Returns the text written after the LAST ``=== kanban run start ===``
+    marker, bounded to ``max_bytes``. The marker is appended by
+    ``_default_spawn`` before every worker starts, so on a crash the tail is
+    exactly the dead run's own activity — never a prior run's summary. Used
+    by ``detect_crashed_workers`` to populate the crashed run's ``summary``,
+    which ``build_worker_context`` already surfaces under "Prior attempts":
+    a retrying worker resumes the reasoning instead of starting from zero.
+
+    Returns ``None`` when there is nothing usable (no log, no marker, or an
+    empty tail) — callers fall back to no summary, the current behaviour.
+    """
+    try:
+        log_path = worker_logs_dir(board=board) / f"{task_id}.log"
+        data = log_path.read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    idx = data.rfind(_RUN_START_MARKER)
+    if idx == -1:
+        # Legacy logs predating the marker have no reliable per-run boundary:
+        # a naive tail could surface a prior run's summary as this run's
+        # checkpoint. Return None to preserve the current no-summary behavior.
+        return None
+    tail = data[idx + len(_RUN_START_MARKER):]
+    if len(tail) > max_bytes:
+        tail = tail[-max_bytes:]
+    # Strip ANSI escapes and blank lines so the summary reads cleanly.
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", tail.decode("utf-8", "replace"))
+    lines = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+    summary = "\n".join(lines).strip()
+    return summary[:max_bytes] or None
+
+
+def detect_crashed_workers(
+    conn: sqlite3.Connection, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -9083,10 +9127,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
                 _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Crash checkpoint: recover what the worker was doing from
+                # its per-task log so the retrying worker resumes instead of
+                # starting from zero. Only for real crashes — a rate-limited
+                # release is clean and needs no checkpoint. protocol_violation
+                # (below-budget) keeps its own accounting but ALSO benefits:
+                # the worker did real work before exiting.
+                checkpoint = (
+                    _checkpoint_from_worker_log(row["id"], board=board)
+                    if _run_outcome == "crashed" else None
+                )
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
+                    summary=checkpoint,
                     metadata=dict(event_payload),
                 )
                 _append_event(
@@ -10043,7 +10098,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -10994,6 +11049,13 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    # Run-start marker: crash checkpointing (detect_crashed_workers) reads
+    # the tail AFTER the last marker to recover what the worker was doing
+    # before it died, without leaking the previous run's summary. Appended
+    # to the shared log so `hermes kanban log` stays a single readable file.
+    # Must be the SAME bytes _checkpoint_from_worker_log searches for.
+    log_f.write(_RUN_START_MARKER)
+    log_f.flush()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
