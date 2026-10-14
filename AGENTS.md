@@ -1782,3 +1782,34 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## This fork (rodrigogs/hermes-agent): branches, worktrees, landing, CI and upstream
+
+Everything above is the upstream's guide and stays as the upstream writes it. This section is the fork's own and sits
+at the end so an upstream sync rarely touches it. The same flow holds in every repository of this account (decided by
+the owner on 2026-10-14, when per-commit and scheduled CI runs had drained the account's Actions budget).
+
+- **`main` is the fork's only long-lived branch**: the upstream's `main` plus the fork's own commits (a few hundred,
+  features the upstream does not carry). Deployments pull it, so it is always releasable; nobody force-pushes it.
+- **Upstream syncs are merges, the one exception to a linear history.** `git fetch upstream && git merge upstream/main`
+  on a branch, conflicts resolved there, the merge committed as `merge: upstream <sha>` (the form every sync here
+  used), then landed on `main` by fast-forward. Rebasing the fork's commits onto a hot upstream is not done.
+  `upstream` is `https://github.com/NousResearch/hermes-agent.git`.
+- **The fork's own work happens on a short-lived branch cut from the tip of `main`**, named `<type>/<slug>` with the
+  Conventional Commits type (`feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `build`, `chore`), in its own git
+  worktree (`git worktree add .worktrees/<slug> -b <type>/<slug> main`; `.worktrees/` is gitignored), never in the
+  main checkout, which stays on `main`, clean, and is only fast-forwarded. The git stash is shared by every worktree:
+  never a bare `git stash`. The worktree and the branch are removed after landing.
+- **Commits follow Conventional Commits** (`type(scope): sentence`, English, small). No AI attribution lines, no
+  co-author tags.
+- **Before landing, the branch is rebased onto `main`** and the upstream's own test suite (CONTRIBUTING.md) passes on
+  the rebased tip for the area touched. **The local gate is the gate.**
+- **Landing is a fast-forward of `main`**: a pull request merged with "Rebase and merge", or a direct
+  `git merge --ff-only` and push when the owner authorized it. No squash merges.
+- **CI on GitHub: none in the fork.** Every one of the upstream's workflows (31 files: CI, lint, docs site, Docker
+  publish, installer e2e, OSV scanner, the scheduled checks and the `workflow_run` chains) is **disabled** at GitHub
+  since 2026-10-14; they ran on every push to the fork's `main` and on the upstream's schedules (more than a hundred
+  runs a month) and proved nothing the upstream's own CI does not. The workflow files are left untouched so a sync
+  never conflicts on them; `gh workflow enable <name>` turns one back on if the fork ever needs it.
+- **Releases: none from the fork.** A tag `vX.Y.Z` here would shadow the upstream's; the fork ships by its `main`.
+- **Scheduled workflows: none.**
